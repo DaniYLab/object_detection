@@ -30,9 +30,8 @@ heatmap_viz.png
 *.png
 !src/**/*.png
 
-# Jupyter
+# Jupyter — ignore checkpoints but allow colab notebook
 .ipynb_checkpoints/
-*.ipynb
 
 # IDE
 .vscode/
