@@ -231,8 +231,11 @@ SPLITS = {
     "test":  ["test_set"],
 }
 
-ORIGINAL_ROOT = Path("./data/FloorPlanCAD_original")
-OUTPUT_ROOT   = Path("./data/FloorPlanCAD_dataset")
+# Cho phép override qua env var (dùng khi build trên Colab để tránh ghi chậm lên Drive)
+# Ví dụ: OUTPUT_ROOT=/content/FloorPlanCAD_dataset python build_dataset.py
+import os as _os
+ORIGINAL_ROOT = Path(_os.environ.get("ORIGINAL_ROOT", "./data/FloorPlanCAD_original"))
+OUTPUT_ROOT   = Path(_os.environ.get("OUTPUT_ROOT",   "./data/FloorPlanCAD_dataset"))
 
 
 def build_dataset() -> None:
