@@ -42,7 +42,7 @@ CUDA_MAJOR=$(echo $CUDA_VERSION | cut -c1-2 | sed 's/^0//')
 CUDA_MINOR=$(echo $CUDA_VERSION | cut -c3)
 
 if   [[ "$CUDA_MAJOR" -ge 13 ]]; then
-    TORCH_CUDA="cu130"
+    TORCH_CUDA="cu132"
 elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 4 ]]; then
     TORCH_CUDA="cu124"
 elif [[ "$CUDA_MAJOR" -eq 12 ]]; then
@@ -55,20 +55,9 @@ else
 fi
 
 log "Installing PyTorch for $TORCH_CUDA..."
-if [[ "$TORCH_CUDA" == "cu130" ]]; then
-    # cu130 có thể chưa có trên PyTorch server → fallback về cu128
-    # (CUDA 13.x backward-compatible với cu128/cu130)
-    pip install torch torchvision \
-        --index-url "https://download.pytorch.org/whl/cu130" -q \
-    || {
-        warn "cu130 wheels not found, falling back to cu128..."
-        pip install torch torchvision \
-            --index-url "https://download.pytorch.org/whl/cu128" -q
-    }
-else
-    pip install torch torchvision \
-        --index-url "https://download.pytorch.org/whl/$TORCH_CUDA" -q
-fi
+pip install torch torchvision \
+    --index-url "https://download.pytorch.org/whl/$TORCH_CUDA" -q
+
 
 # Install gdown trước (cần để download dataset)
 pip install gdown -q
