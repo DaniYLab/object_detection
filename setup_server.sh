@@ -57,7 +57,17 @@ else
 fi
 
 log "Installing PyTorch for $TORCH_CUDA..."
-pip install torch torchvision --index-url "https://download.pytorch.org/whl/$TORCH_CUDA" -q
+if [[ "$TORCH_CUDA" == "cu128" ]]; then
+    # Blackwell cần PyTorch >= 2.6 — dùng --pre để lấy latest stable/preview
+    pip install --pre torch torchvision \
+        --index-url "https://download.pytorch.org/whl/nightly/$TORCH_CUDA" -q
+else
+    pip install torch torchvision \
+        --index-url "https://download.pytorch.org/whl/$TORCH_CUDA" -q
+fi
+
+# Install gdown trước (cần để download dataset)
+pip install gdown -q
 
 # Install remaining dependencies
 pip install -r requirements.txt -q
