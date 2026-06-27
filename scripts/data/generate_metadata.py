@@ -26,9 +26,10 @@ from pathlib import Path
 
 from PIL import Image
 
-# ── Config ────────────────────────────────────────────────────────────────────
-ORIGINAL_ROOT = Path("./data/FloorPlanCAD_original")
-DATASET_ROOT  = Path("./data/FloorPlanCAD_dataset")
+# ── Config (override qua env var khi chạy trên Colab/server) ─────────────────
+import os as _os
+ORIGINAL_ROOT = Path(_os.environ.get("ORIGINAL_ROOT", "./data/FloorPlanCAD_original"))
+DATASET_ROOT  = Path(_os.environ.get("DATASET_ROOT",  "./data/FloorPlanCAD_dataset"))
 
 SPLITS = {
     "train": ["train_set_1", "train_set_2"],
