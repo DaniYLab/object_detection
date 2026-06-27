@@ -1,10 +1,7 @@
-# ─── Core Deep Learning (CUDA 12.4 — RTX 3050, driver 555.99) ────────────────
-# Install with:
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-#
-# DO NOT install plain `torch` from PyPI — it will be CPU-only.
-torch>=2.3.0+cu124
-torchvision>=0.18.0+cu124
+# ─── Core Deep Learning ───────────────────────────────────────────────────────
+# torch + torchvision được cài RIÊNG với CUDA version phù hợp:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# KHÔNG liệt kê ở đây để tránh pip override mất CUDA build.
 
 # ─── Dataset & Data Loading ───────────────────────────────────────────────────
 fiftyone>=1.0.0
