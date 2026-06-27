@@ -58,9 +58,18 @@ fi
 
 log "Installing PyTorch for $TORCH_CUDA..."
 if [[ "$TORCH_CUDA" == "cu128" ]]; then
-    # Blackwell cần PyTorch >= 2.6 — dùng --pre để lấy latest stable/preview
-    pip install --pre torch torchvision \
-        --index-url "https://download.pytorch.org/whl/nightly/$TORCH_CUDA" -q
+    # Blackwell: thử stable cu128 trước (PyTorch 2.7+)
+    # Nếu không có stable thì dùng nightly với --no-deps để tránh conflict
+    log "Trying stable cu128 (PyTorch 2.7+)..."
+    pip install torch torchvision \
+        --index-url "https://download.pytorch.org/whl/cu128" -q \
+    || {
+        warn "Stable cu128 not found, falling back to nightly (--no-deps)..."
+        pip install --pre --no-deps torch torchvision torchaudio \
+            --index-url "https://download.pytorch.org/whl/nightly/cu128" -q
+        # Cài deps của torch/torchvision riêng
+        pip install filelock jinja2 networkx sympy -q
+    }
 else
     pip install torch torchvision \
         --index-url "https://download.pytorch.org/whl/$TORCH_CUDA" -q
