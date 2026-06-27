@@ -37,16 +37,23 @@ source .venv/bin/activate
 pip install --upgrade pip -q
 
 # Install PyTorch với CUDA phù hợp
-CUDA_SHORT=$(echo $CUDA_VERSION | cut -c1-3)
-if [[ "$CUDA_SHORT" == "124" || "$CUDA_SHORT" == "125" ]]; then
+# Parse CUDA major version (e.g. "130" → 13, "124" → 12, "118" → 11)
+CUDA_MAJOR=$(echo $CUDA_VERSION | cut -c1-2 | sed 's/^0//')
+CUDA_MINOR=$(echo $CUDA_VERSION | cut -c3)
+
+if   [[ "$CUDA_MAJOR" -ge 13 ]]; then
+    # CUDA 13.x (Blackwell RTX 5000 series) → dùng cu128 (PyTorch mới nhất)
+    TORCH_CUDA="cu128"
+    warn "CUDA $CUDA_MAJOR.$CUDA_MINOR detected (Blackwell). Using cu128 wheels."
+elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 4 ]]; then
     TORCH_CUDA="cu124"
-elif [[ "$CUDA_SHORT" == "121" || "$CUDA_SHORT" == "122" ]]; then
+elif [[ "$CUDA_MAJOR" -eq 12 ]]; then
     TORCH_CUDA="cu121"
-elif [[ "$CUDA_SHORT" == "118" ]]; then
+elif [[ "$CUDA_MAJOR" -eq 11 && "$CUDA_MINOR" -ge 8 ]]; then
     TORCH_CUDA="cu118"
 else
-    warn "Unknown CUDA version, defaulting to cu121"
-    TORCH_CUDA="cu121"
+    warn "Old CUDA $CUDA_MAJOR.$CUDA_MINOR, defaulting to cu118"
+    TORCH_CUDA="cu118"
 fi
 
 log "Installing PyTorch for $TORCH_CUDA..."
