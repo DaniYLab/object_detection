@@ -42,9 +42,7 @@ CUDA_MAJOR=$(echo $CUDA_VERSION | cut -c1-2 | sed 's/^0//')
 CUDA_MINOR=$(echo $CUDA_VERSION | cut -c3)
 
 if   [[ "$CUDA_MAJOR" -ge 13 ]]; then
-    # CUDA 13.x (Blackwell RTX 5000 series) → dùng cu128 (PyTorch mới nhất)
-    TORCH_CUDA="cu128"
-    warn "CUDA $CUDA_MAJOR.$CUDA_MINOR detected (Blackwell). Using cu128 wheels."
+    TORCH_CUDA="cu130"
 elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 4 ]]; then
     TORCH_CUDA="cu124"
 elif [[ "$CUDA_MAJOR" -eq 12 ]]; then
@@ -57,23 +55,9 @@ else
 fi
 
 log "Installing PyTorch for $TORCH_CUDA..."
-if [[ "$TORCH_CUDA" == "cu128" ]]; then
-    # Blackwell: thử stable cu128 trước (PyTorch 2.7+)
-    # Nếu không có stable thì dùng nightly với --no-deps để tránh conflict
-    log "Trying stable cu128 (PyTorch 2.7+)..."
-    pip install torch torchvision \
-        --index-url "https://download.pytorch.org/whl/cu128" -q \
-    || {
-        warn "Stable cu128 not found, falling back to nightly (--no-deps)..."
-        pip install --pre --no-deps torch torchvision torchaudio \
-            --index-url "https://download.pytorch.org/whl/nightly/cu128" -q
-        # Cài deps của torch/torchvision riêng
-        pip install filelock jinja2 networkx sympy -q
-    }
-else
-    pip install torch torchvision \
-        --index-url "https://download.pytorch.org/whl/$TORCH_CUDA" -q
-fi
+pip install torch torchvision \
+    --index-url "https://download.pytorch.org/whl/$TORCH_CUDA" -q
+
 
 # Install gdown trước (cần để download dataset)
 pip install gdown -q
