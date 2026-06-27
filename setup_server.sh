@@ -55,9 +55,20 @@ else
 fi
 
 log "Installing PyTorch for $TORCH_CUDA..."
-pip install torch torchvision \
-    --index-url "https://download.pytorch.org/whl/$TORCH_CUDA" -q
-
+if [[ "$TORCH_CUDA" == "cu130" ]]; then
+    # cu130 có thể chưa có trên PyTorch server → fallback về cu128
+    # (CUDA 13.x backward-compatible với cu128/cu130)
+    pip install torch torchvision \
+        --index-url "https://download.pytorch.org/whl/cu130" -q \
+    || {
+        warn "cu130 wheels not found, falling back to cu128..."
+        pip install torch torchvision \
+            --index-url "https://download.pytorch.org/whl/cu128" -q
+    }
+else
+    pip install torch torchvision \
+        --index-url "https://download.pytorch.org/whl/$TORCH_CUDA" -q
+fi
 
 # Install gdown trước (cần để download dataset)
 pip install gdown -q
