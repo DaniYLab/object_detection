@@ -109,21 +109,16 @@ def train_one_epoch(
             "size_map": batch["size_map"].to(device),
             "mask_map": batch["mask_map"].to(device),
         }
-        texts_batch = batch["texts"]                  # list[list[str]]
-        class_ids_batch = batch["class_ids"]          # list[list[int]]
+        texts_batch = batch["texts"]           # list[str]
+        class_ids_batch = batch["class_ids"]    # list[int]
 
         B = image.shape[0]
 
-        # For each sample, pick the first class_id as primary conditioning
-        # (full multi-class handled by running all present classes)
-        primary_cls = torch.tensor(
-            [ids[0] if ids else 0 for ids in class_ids_batch],
-            dtype=torch.long, device=device,
-        )
+        # Class conditioning per sample
+        primary_cls = torch.tensor(class_ids_batch, dtype=torch.long, device=device)
 
-        # Tokenize first text per sample
-        first_texts = [t[0] if t else "Find object in this floor plan" for t in texts_batch]
-        text_ids = tokenize_texts(first_texts).to(device)   # [B, 32]
+        # Tokenize text prompts
+        text_ids = tokenize_texts(texts_batch).to(device)   # [B, 32]
 
         # Forward
         optimizer.zero_grad()
@@ -180,12 +175,8 @@ def validate(
         texts_batch = batch["texts"]
         class_ids_batch = batch["class_ids"]
 
-        primary_cls = torch.tensor(
-            [ids[0] if ids else 0 for ids in class_ids_batch],
-            dtype=torch.long, device=device,
-        )
-        first_texts = [t[0] if t else "Find object in this floor plan" for t in texts_batch]
-        text_ids = tokenize_texts(first_texts).to(device)
+        primary_cls = torch.tensor(class_ids_batch, dtype=torch.long, device=device)
+        text_ids = tokenize_texts(texts_batch).to(device)
 
         preds = model(image, text_ids, primary_cls)
         losses = centernet_loss(preds, targets)
