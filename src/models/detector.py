@@ -122,20 +122,37 @@ class HeatmapHead(nn.Module):
 
 # ── Full Model ────────────────────────────────────────────────────────────────
 
+# Fixed text prompts — one per class (built into model, not external input)
+from src.data.dataset import CLASS_NAMES, TEXT_TEMPLATE, NUM_CLASSES
+
+CLASS_TEXTS = [TEXT_TEMPLATE.format(cls=name) for name in CLASS_NAMES]
+
+
+def _tokenize_fixed(texts: list[str], max_len: int = 32, vocab_size: int = 32000) -> torch.Tensor:
+    """Hash-based tokenizer for fixed class texts. Deterministic."""
+    tokens = []
+    for text in texts:
+        ids = [hash(word) % (vocab_size - 1) + 1 for word in text.lower().split()]
+        ids = ids[:max_len] + [0] * max(0, max_len - len(ids))
+        tokens.append(ids)
+    return torch.tensor(tokens, dtype=torch.long)
+
+
 class FloorPlanDetector(nn.Module):
     """
     FloorPlanCAD Multimodal Detection Model.
 
     Architecture (Conditioned Reflex):
-      1. Image  → VAE Encoder    → image tokens [B, H*W, D]
-      2. Text   → Text Encoder   → text tokens  [B, L, D]
-      3. Early Fusion: Cross-Attention(text → image) → fused features
-      4. Route fused features to the DEDICATED class block based on class_id
-         → 35 separate ObjectLearningBlocks, one per class
-      5. CenterNet Head → center_heatmap [B, 1, h, w] + size_map [B, 2, h, w]
+      Input : image [B, 3, H, W]  — chỉ 1 ảnh đầu vào
+      Built-in: 35 fixed text prompts, mỗi text = 1 HEAD (block)
 
-    The text prompt acts as the stimulus (tác nhân kích thích).
-    Each class block is a specialized neural pathway (đường dây thần kinh riêng).
+      1. Image → VAE Encoder → image tokens (encode 1 lần)
+      2. 35 texts → Text Encoder → 35 text token sets
+      3. Mỗi class: EarlyFusion(image, text[c]) → class_blocks[c] → heatmap[c]
+      4. Output: 35 × (center_heatmap + size_map)
+
+    Training: class_ids chọn class nào tính loss.
+    Inference: lấy hết 35 outputs.
     """
 
     def __init__(
@@ -144,7 +161,7 @@ class FloorPlanDetector(nn.Module):
         latent_channels: int = 16,
         model_dim: int = 512,
         num_classes: int = 35,
-        depth_per_class: int = 2,   # number of stacked blocks per class pathway
+        depth_per_class: int = 2,
         num_heads: int = 8,
         dropout: float = 0.1,
     ) -> None:
@@ -162,14 +179,23 @@ class FloorPlanDetector(nn.Module):
         # Project VAE latent → model_dim
         self.img_proj = nn.Linear(latent_channels, model_dim)
 
-        # ── Early Fusion ──────────────────────────────────────────────────────
-        self.early_fusion = EarlyFusion(model_dim, num_heads)
+        # ── Fixed class text tokens (registered as buffer, not parameter) ────
+        # 35 tokenized texts, one per class — part of the model, not input
+        self.register_buffer(
+            "class_text_ids",
+            _tokenize_fixed(CLASS_TEXTS),  # [35, 32]
+        )
+
+        # ── Per-class Early Fusion ────────────────────────────────────────────
+        # Each class has its own fusion layer (text differs per class)
+        self.early_fusions = nn.ModuleList([
+            EarlyFusion(model_dim, num_heads)
+            for _ in range(num_classes)
+        ])
 
         # ── Per-class Object Learning Blocks ──────────────────────────────────
-        # 35 separate pathways, each is a stack of `depth_per_class` blocks.
-        # class_id determines which pathway is activated.
         self.class_blocks = nn.ModuleList([
-            nn.Sequential(*[
+            nn.ModuleList([
                 ObjectLearningBlock(model_dim, num_classes=1, num_heads=num_heads, dropout=dropout)
                 for _ in range(depth_per_class)
             ])
@@ -180,60 +206,85 @@ class FloorPlanDetector(nn.Module):
         self.out_norm = nn.LayerNorm(model_dim)
         self.heatmap_head = HeatmapHead(model_dim, out_channels=3)
 
-    def encode_image(self, image: torch.Tensor) -> torch.Tensor:
+    def encode_image(self, image: torch.Tensor) -> tuple[torch.Tensor, int, int]:
         """image [B,3,H,W] → tokens [B, h*w, D]"""
         lat = self.vae_encoder(image)               # [B, C, h, w]
         B, C, h, w = lat.shape
         lat = lat.flatten(2).transpose(1, 2)        # [B, h*w, C]
         return self.img_proj(lat), h, w             # [B, h*w, D], h, w
 
-    def forward(
+    def _process_class(
         self,
-        image: torch.Tensor,                        # [B, 3, H, W]
-        text_ids: torch.Tensor,                     # [B, L]  tokenized text
-        class_ids: torch.Tensor,                    # [B]     which class block to route to
+        cid: int,
+        img_tokens: torch.Tensor,       # [B, h*w, D]
+        h: int, w: int,
     ) -> dict[str, torch.Tensor]:
-        """
-        Returns:
-            center_heatmap: [B, 1, h, w] (sigmoid applied)
-            size_map:       [B, 2, h, w] (ReLU applied)
-        """
-        B = image.shape[0]
+        """Process one class: early fusion + OLB + head."""
+        # Text encode for this class
+        txt_ids = self.class_text_ids[cid:cid+1]         # [1, 32]
+        txt_ids = txt_ids.expand(img_tokens.shape[0], -1) # [B, 32]
+        txt_tokens = self.text_encoder(txt_ids)            # [B, 32, D]
 
-        # ── 1. Encode ─────────────────────────────────────────────────────────
-        img_tokens, h, w = self.encode_image(image)     # [B, h*w, D]
-        txt_tokens = self.text_encoder(text_ids)         # [B, L, D]
+        # Early fusion (class-specific)
+        fused = self.early_fusions[cid](img_tokens, txt_tokens)  # [B, h*w, D]
 
-        # ── 2. Early Fusion ───────────────────────────────────────────────────
-        fused = self.early_fusion(img_tokens, txt_tokens)  # [B, h*w, D]
+        # Object Learning Blocks
+        dummy_cid = torch.zeros(img_tokens.shape[0], dtype=torch.long, device=img_tokens.device)
+        x = fused
+        for block in self.class_blocks[cid]:
+            x = block(x, dummy_cid)
 
-        # ── 3. Route through per-class blocks ─────────────────────────────────
-        # Each sample in the batch may have a different class_id.
-        # We process each sample through its dedicated class block.
-        outputs = []
-        dummy_cid = torch.zeros(1, dtype=torch.long, device=fused.device)
-        for i in range(B):
-            cid = class_ids[i].item()
-            sample_fused = fused[i:i+1]                  # [1, h*w, D]
-            for block in self.class_blocks[cid]:
-                sample_fused = block(sample_fused, dummy_cid)
-            outputs.append(sample_fused)
-        x = torch.cat(outputs, dim=0)                    # [B, h*w, D]
-
-        # ── 4. Reshape → spatial ──────────────────────────────────────────────
+        # Reshape → spatial → head
+        B = img_tokens.shape[0]
         x = self.out_norm(x)
-        x = x.transpose(1, 2).reshape(B, self.model_dim, h, w)  # [B, D, h, w]
-
-        # ── 5. CenterNet head ─────────────────────────────────────────────────
-        out = self.heatmap_head(x)                       # [B, 3, h, w]
-
-        center_heatmap = torch.sigmoid(out[:, 0:1, :, :])
-        size_map = F.relu(out[:, 1:3, :, :])
+        x = x.transpose(1, 2).reshape(B, self.model_dim, h, w)
+        out = self.heatmap_head(x)
 
         return {
-            "center_heatmap": center_heatmap,
-            "size_map": size_map,
+            "center_heatmap": torch.sigmoid(out[:, 0:1, :, :]),
+            "size_map": F.relu(out[:, 1:3, :, :]),
         }
+
+    def forward(
+        self,
+        image: torch.Tensor,               # [B, 3, H, W]
+        class_ids: torch.Tensor | None = None,  # [B] — training: chọn class tính loss
+    ) -> dict[str, torch.Tensor]:
+        """
+        Training (class_ids provided):
+            Chỉ chạy block của class được chỉ định cho mỗi sample.
+            Returns: center_heatmap [B,1,h,w], size_map [B,2,h,w]
+
+        Inference (class_ids=None):
+            Chạy tất cả 35 blocks.
+            Returns: center_heatmap [B,35,h,w], size_map [B,35*2,h,w]
+        """
+        B = image.shape[0]
+        img_tokens, h, w = self.encode_image(image)  # encode 1 lần
+
+        if class_ids is not None:
+            # ── Training mode: mỗi sample chạy qua block tương ứng ────────
+            hm_list, sz_list = [], []
+            for i in range(B):
+                cid = class_ids[i].item()
+                result = self._process_class(cid, img_tokens[i:i+1], h, w)
+                hm_list.append(result["center_heatmap"])
+                sz_list.append(result["size_map"])
+            return {
+                "center_heatmap": torch.cat(hm_list, dim=0),  # [B, 1, h, w]
+                "size_map": torch.cat(sz_list, dim=0),          # [B, 2, h, w]
+            }
+        else:
+            # ── Inference mode: chạy tất cả 35 blocks ─────────────────────
+            all_hm, all_sz = [], []
+            for cid in range(self.num_classes):
+                result = self._process_class(cid, img_tokens, h, w)
+                all_hm.append(result["center_heatmap"])   # [B, 1, h, w]
+                all_sz.append(result["size_map"])          # [B, 2, h, w]
+            return {
+                "center_heatmap": torch.cat(all_hm, dim=1),  # [B, 35, h, w]
+                "size_map": torch.cat(all_sz, dim=1),         # [B, 70, h, w]
+            }
 
 
 if __name__ == "__main__":
@@ -242,13 +293,21 @@ if __name__ == "__main__":
     )
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Parameters: {n_params:.1f}M")
-    print(f"Per-class blocks: {len(model.class_blocks)} pathways × {model.depth_per_class} depth")
+    print(f"Per-class blocks: {len(model.class_blocks)} × {model.depth_per_class} depth")
 
-    image    = torch.randn(2, 3, 512, 512)
-    text_ids = torch.randint(0, 32000, (2, 16))
-    cls_ids  = torch.tensor([4, 10])   # chair=4, door_single=10
+    image = torch.randn(1, 3, 512, 512)
 
-    out = model(image, text_ids, cls_ids)
-    print(f"center_heatmap: {out['center_heatmap'].shape}")   # [2, 1, 64, 64]
-    print(f"size_map      : {out['size_map'].shape}")         # [2, 2, 64, 64]
+    # Training mode: 1 class per sample
+    cls_ids = torch.tensor([4])
+    out = model(image, class_ids=cls_ids)
+    print(f"\n[Training] class_id=4 (chair)")
+    print(f"  center_heatmap: {out['center_heatmap'].shape}")  # [1, 1, 64, 64]
+    print(f"  size_map      : {out['size_map'].shape}")        # [1, 2, 64, 64]
+
+    # Inference mode: all 35 classes
+    out = model(image)
+    print(f"\n[Inference] all classes")
+    print(f"  center_heatmap: {out['center_heatmap'].shape}")  # [1, 35, 64, 64]
+    print(f"  size_map      : {out['size_map'].shape}")        # [1, 70, 64, 64]
+
 
