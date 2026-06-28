@@ -19,47 +19,10 @@ from pathlib import Path
 
 from PIL import Image
 
-# ─── Class ID → Name mapping (FloorPlanCAD 30-class panoptic) ─────────────────
-# Based on the official paper: "FloorPlanCAD: A Large-Scale CAD Floor Plan Dataset"
-# Stuff classes (semantic regions): wall, parking
-# Thing classes (countable instances): doors, windows, furniture, etc.
-SEMANTIC_ID_TO_NAME = {
-    1:  "wall",
-    2:  "door_single",
-    3:  "door_double",
-    4:  "door_sliding",
-    5:  "window",
-    6:  "door_revolving",
-    7:  "window_bay",
-    8:  "window_blind",
-    9:  "stair",
-    10: "ramp",
-    11: "elevator",
-    12: "escalator",
-    13: "column",
-    14: "toilet",
-    15: "sink",
-    16: "bathtub",
-    17: "shower",
-    18: "washing_machine",
-    19: "refrigerator",
-    20: "oven",
-    21: "bed",
-    22: "sofa",
-    23: "table",
-    24: "chair",
-    25: "room_label",
-    26: "floor_plan_area",
-    27: "parking",
-    28: "plant",
-    29: "counter",
-    30: "cabinet",
-    31: "tv",
-    32: "escalator_stair",
-    33: "dimension_line",
-    34: "symbol_misc",
-    35: "annotation_text",
-}
+# ─── Shared class mappings (single source of truth) ───────────────────────────
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from src.data.constants import SEMANTIC_ID_TO_NAME, CLASS_TO_IDX
 
 
 def get_class_name(semantic_id: int) -> str:
@@ -161,14 +124,8 @@ def process_sample(
     # Save original image
     img.save(out_dir / "original.png")
 
-    # Crop each instance + collect metadata
-    crops_saved = 0
-    class_counters: dict[int, int] = defaultdict(int)
+    # Collect metadata (no crops — dataset.py only uses original.png + metadata)
     instances_meta = []
-
-    # Class name → class index (alphabetical, matches dataset.py CLASS_NAMES)
-    all_class_names = sorted(set(SEMANTIC_ID_TO_NAME.values()))
-    cls_to_idx = {name: i for i, name in enumerate(all_class_names)}
 
     for (sid, iid), bboxes in instance_bboxes.items():
         # Merge all path bboxes for this instance
@@ -177,28 +134,22 @@ def process_sample(
         x_max = max(b[2] for b in bboxes)
         y_max = max(b[3] for b in bboxes)
 
-        # Convert to pixels with padding
+        # Convert to pixels
         px0, py0, px1, py1 = svg_to_pixel((x_min, y_min, x_max, y_max), scale_x, scale_y)
-        px0 = max(0, px0 - padding)
-        py0 = max(0, py0 - padding)
-        px1 = min(img_w, px1 + padding)
-        py1 = min(img_h, py1 + padding)
+        px0 = max(0, px0)
+        py0 = max(0, py0)
+        px1 = min(img_w, px1)
+        py1 = min(img_h, py1)
 
-        # Skip tiny crops
+        # Skip tiny instances
         if (px1 - px0) < min_size or (py1 - py0) < min_size:
             continue
 
-        crop = img.crop((px0, py0, px1, py1))
         class_name = get_class_name(sid)
-        class_counters[sid] += 1
-        n = class_counters[sid]
-        crop.save(out_dir / f"{class_name}_{n:03d}.png")
-        crops_saved += 1
 
-        # Record bbox metadata — iid as original instance id (-1 for stuff)
         instances_meta.append({
             "class":       class_name,
-            "class_id":    cls_to_idx.get(class_name, -1),
+            "class_id":    CLASS_TO_IDX.get(class_name, -1),
             "instance_id": iid if isinstance(iid, int) else -1,
             "bbox_px":     [px0, py0, px1, py1],
         })
@@ -213,7 +164,7 @@ def process_sample(
     with open(out_dir / "metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata, f, separators=(",", ":"))
 
-    return crops_saved
+    return len(instances_meta)
 
 
 

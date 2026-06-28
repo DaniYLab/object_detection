@@ -28,6 +28,10 @@ from PIL import Image
 
 # ── Config (override qua env var khi chạy trên Colab/server) ─────────────────
 import os as _os
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from src.data.constants import SEMANTIC_ID_TO_NAME, CLASS_NAMES, CLASS_TO_IDX
+
 ORIGINAL_ROOT = Path(_os.environ.get("ORIGINAL_ROOT", "./data/FloorPlanCAD_original"))
 DATASET_ROOT  = Path(_os.environ.get("DATASET_ROOT",  "./data/FloorPlanCAD_dataset"))
 
@@ -35,25 +39,6 @@ SPLITS = {
     "train": ["train_set_1", "train_set_2"],
     "test":  ["test_set"],
 }
-
-# Semantic ID → class name (must match dataset.py CLASS_NAMES)
-SEMANTIC_ID_TO_NAME = {
-    1:  "wall",            2:  "door_single",     3:  "door_double",
-    4:  "door_sliding",    5:  "window",           6:  "door_revolving",
-    7:  "window_bay",      8:  "window_blind",     9:  "stair",
-    10: "ramp",            11: "elevator",         12: "escalator",
-    13: "column",          14: "toilet",           15: "sink",
-    16: "bathtub",         17: "shower",           18: "washing_machine",
-    19: "refrigerator",    20: "oven",             21: "bed",
-    22: "sofa",            23: "table",            24: "chair",
-    25: "room_label",      26: "floor_plan_area",  27: "parking",
-    28: "plant",           29: "counter",          30: "cabinet",
-    31: "tv",              32: "escalator_stair",  33: "dimension_line",
-    34: "symbol_misc",     35: "annotation_text",
-}
-
-CLASS_NAMES = sorted(set(SEMANTIC_ID_TO_NAME.values()))
-CLASS_TO_IDX = {name: i for i, name in enumerate(CLASS_NAMES)}
 
 # ── SVG path coordinate extractor ─────────────────────────────────────────────
 from svgpathtools import parse_path
