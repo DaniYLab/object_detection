@@ -1,16 +1,13 @@
 """
 FloorPlanCAD Dataset — PyTorch Dataset class.
 
-Loads:
-  - original.png  → image tensor
-  - {class}_{n}.png → crop tensors grouped by class
-  - Text prompt: "Find {class_name} in this floor plan drawing"
+Text-conditioned, per-class expanded dataset for CenterNet-style detection.
+Each (image, class) pair is a separate sample.
 """
 
 from __future__ import annotations
 
 import json
-import random
 from pathlib import Path
 from typing import Optional
 
@@ -42,13 +39,6 @@ def _default_transform(image_size: int = 512) -> transforms.Compose:
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
 
-
-def _crop_transform(crop_size: int = 128) -> transforms.Compose:
-    return transforms.Compose([
-        transforms.Resize((crop_size, crop_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-    ])
 
 
 class FloorPlanDataset(Dataset):

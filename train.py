@@ -162,7 +162,6 @@ def validate(
 ) -> dict[str, float]:
     model.eval()
     total_loss = 0.0
-    iou_sum = 0.0
     n = 0
 
     for batch in loader:
@@ -198,11 +197,11 @@ def main(args: argparse.Namespace) -> None:
     # ── Data ──────────────────────────────────────────────────────────────────
     train_ds = FloorPlanDataset(
         args.data_root, split="train",
-        image_size=args.image_size, crop_size=args.crop_size,
+        image_size=args.image_size,
     )
     val_ds = FloorPlanDataset(
         args.data_root, split="test",
-        image_size=args.image_size, crop_size=args.crop_size,
+        image_size=args.image_size,
     )
     train_dl = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -220,7 +219,7 @@ def main(args: argparse.Namespace) -> None:
         image_size=args.image_size,
         model_dim=args.model_dim,
         num_classes=NUM_CLASSES,
-        num_blocks=args.num_blocks,
+        depth_per_class=args.depth_per_class,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Model params: {n_params:.1f}M")
@@ -234,7 +233,7 @@ def main(args: argparse.Namespace) -> None:
     )
 
     # ── Training ──────────────────────────────────────────────────────────────
-    best_iou = 0.0
+    best_val_loss = float('inf')
     ckpt_dir = Path(args.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -251,32 +250,31 @@ def main(args: argparse.Namespace) -> None:
         print(
             f"  => Train loss: {train_metrics['loss']:.4f} | "
             f"Val loss: {val_metrics['val_loss']:.4f} | "
-            f"Val IoU: {val_metrics['val_iou']:.4f} | "
             f"LR: {lr_now:.2e}"
         )
 
         # Save best checkpoint
-        if val_metrics["val_iou"] > best_iou:
-            best_iou = val_metrics["val_iou"]
+        if val_metrics["val_loss"] < best_val_loss:
+            best_val_loss = val_metrics["val_loss"]
             ckpt_path = ckpt_dir / "best.pt"
             torch.save({
                 "epoch": epoch,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
-                "val_iou": best_iou,
+                "val_loss": best_val_loss,
                 "args": vars(args),
             }, ckpt_path)
-            print(f"  => Saved best checkpoint (IoU={best_iou:.4f}) → {ckpt_path}")
+            print(f"  => Saved best checkpoint (val_loss={best_val_loss:.4f}) → {ckpt_path}")
 
         # Save latest checkpoint every 5 epochs
         if epoch % 5 == 0:
             torch.save({
                 "epoch": epoch,
                 "model_state": model.state_dict(),
-                "val_iou": val_metrics["val_iou"],
+                "val_loss": val_metrics["val_loss"],
             }, ckpt_dir / f"epoch_{epoch:03d}.pt")
 
-    print(f"\nTraining done! Best Val IoU: {best_iou:.4f}")
+    print(f"\nTraining done! Best val_loss: {best_val_loss:.4f}")
 
 
 if __name__ == "__main__":
@@ -284,11 +282,10 @@ if __name__ == "__main__":
     parser.add_argument("--data_root",    default="./data/FloorPlanCAD_dataset")
     parser.add_argument("--ckpt_dir",     default="./checkpoints")
     parser.add_argument("--image_size",   type=int,   default=512)
-    parser.add_argument("--crop_size",    type=int,   default=128)
     parser.add_argument("--batch_size",   type=int,   default=4)
     parser.add_argument("--num_workers",  type=int,   default=4)
     parser.add_argument("--model_dim",    type=int,   default=512)
-    parser.add_argument("--num_blocks",   type=int,   default=4)
+    parser.add_argument("--depth_per_class", type=int, default=2)
     parser.add_argument("--epochs",       type=int,   default=50)
     parser.add_argument("--lr",           type=float, default=1e-4)
     parser.add_argument("--log_interval", type=int,   default=20)
