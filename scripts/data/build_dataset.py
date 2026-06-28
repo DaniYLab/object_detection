@@ -4,11 +4,15 @@ Build processed FloorPlanCAD dataset.
 Input  : data/FloorPlanCAD_original/{train_set_1, train_set_2, test_set}/
 Output : data/FloorPlanCAD_dataset/{train, test}/
          Each sample -> one subfolder containing:
-           - original.png           : full original image
-           - {class_name}_{n}.png  : cropped patch for each annotated instance
+           - original.png    : full original image
+           - metadata.json   : per-instance bounding boxes + class info
+
+Usage:
+    python scripts/data/build_dataset.py
+    python scripts/data/build_dataset.py --original_root /path/to/raw --output_root /path/to/out
+    ORIGINAL_ROOT=/content/raw OUTPUT_ROOT=/content/out python scripts/data/build_dataset.py
 
 Annotation format: SVG paths with semantic-id + instance-id attributes.
-SVG viewBox: 0 0 100 100  |  PNG size: 1000x1000  => scale = 10x
 """
 
 import json
@@ -66,10 +70,10 @@ def process_sample(
 ) -> int:
     """
     Process one (PNG, SVG) pair:
-    - Copy original.png
-    - Crop each annotated instance and save as {class_name}_{n}.png
+    - Save original.png
+    - Parse SVG annotations → metadata.json with per-instance bboxes
 
-    Returns number of crops saved.
+    Returns number of instances found.
     """
     # Load image
     img = Image.open(png_path).convert("RGB")
@@ -175,33 +179,32 @@ SPLITS = {
     "test":  ["test_set"],
 }
 
-# Cho phép override qua env var (dùng khi build trên Colab để tránh ghi chậm lên Drive)
-# Ví dụ: OUTPUT_ROOT=/content/FloorPlanCAD_dataset python build_dataset.py
-import os as _os
-ORIGINAL_ROOT = Path(_os.environ.get("ORIGINAL_ROOT", "./data/FloorPlanCAD_original"))
-OUTPUT_ROOT   = Path(_os.environ.get("OUTPUT_ROOT",   "./data/FloorPlanCAD_dataset"))
 
-
-def build_dataset() -> None:
+def build_dataset(
+    original_root: Path,
+    output_root: Path,
+    min_size: int = 8,
+) -> None:
     print("=" * 60)
     print("  FloorPlanCAD Dataset Builder")
-    print(f"  Input  : {ORIGINAL_ROOT.resolve()}")
-    print(f"  Output : {OUTPUT_ROOT.resolve()}")
+    print(f"  Input    : {original_root.resolve()}")
+    print(f"  Output   : {output_root.resolve()}")
+    print(f"  min_size : {min_size}px")
     print("=" * 60)
 
     total_samples = 0
-    total_crops = 0
+    total_instances = 0
 
     for split_name, source_dirs in SPLITS.items():
-        split_out = OUTPUT_ROOT / split_name
+        split_out = output_root / split_name
         split_out.mkdir(parents=True, exist_ok=True)
         print(f"\n[{split_name.upper()}] Processing {source_dirs}...")
 
         split_samples = 0
-        split_crops = 0
+        split_instances = 0
 
         for src_dir_name in source_dirs:
-            src_dir = ORIGINAL_ROOT / src_dir_name
+            src_dir = original_root / src_dir_name
             if not src_dir.exists():
                 print(f"  [SKIP] {src_dir} not found")
                 continue
@@ -222,25 +225,50 @@ def build_dataset() -> None:
                 sample_name = png_path.stem
                 out_dir = split_out / sample_name
 
-                crops = process_sample(png_path, svg_path, out_dir)
+                n_inst = process_sample(png_path, svg_path, out_dir, min_size=min_size)
                 split_samples += 1
-                split_crops += crops
+                split_instances += n_inst
 
                 if (i + 1) % 200 == 0:
                     print(f"    [{i+1}/{len(png_files)}] processed — "
-                          f"{split_crops} crops so far")
+                          f"{split_instances} instances so far")
 
-        print(f"  => {split_samples} samples, {split_crops} crops")
+        print(f"  => {split_samples} samples, {split_instances} instances")
         total_samples += split_samples
-        total_crops += split_crops
+        total_instances += split_instances
 
     print(f"\n{'=' * 60}")
     print(f"  DONE!")
-    print(f"  Total samples : {total_samples}")
-    print(f"  Total crops   : {total_crops}")
-    print(f"  Output        : {OUTPUT_ROOT.resolve()}")
+    print(f"  Total samples   : {total_samples}")
+    print(f"  Total instances : {total_instances}")
+    print(f"  Output          : {output_root.resolve()}")
     print(f"{'=' * 60}")
 
 
 if __name__ == "__main__":
-    build_dataset()
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser(description="Build FloorPlanCAD processed dataset")
+    parser.add_argument(
+        "--original_root",
+        default=os.environ.get("ORIGINAL_ROOT", "./data/FloorPlanCAD_original"),
+        help="Path to raw FloorPlanCAD (contains train_set_1/, etc.)",
+    )
+    parser.add_argument(
+        "--output_root",
+        default=os.environ.get("OUTPUT_ROOT", "./data/FloorPlanCAD_dataset"),
+        help="Output path for processed dataset",
+    )
+    parser.add_argument(
+        "--min_size", type=int, default=8,
+        help="Skip bboxes smaller than this (pixels)",
+    )
+    args = parser.parse_args()
+
+    build_dataset(
+        original_root=Path(args.original_root),
+        output_root=Path(args.output_root),
+        min_size=args.min_size,
+    )
+
