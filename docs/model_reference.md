@@ -11,21 +11,31 @@
 
 ### Input / Output
 
-| | Tensor | Shape | Mô tả |
+| Mode | Input | Shape | Mô tả |
 |---|---|---|---|
-| **Input** | `image` | `[B, 3, 512, 512]` | Ảnh bản vẽ mặt bằng (normalized [-1, 1]) |
-| | `text_ids` | `[B, 32]` | Tokenized text, e.g. `"Find chair in this floor plan drawing"` |
-| | `class_ids` | `[B]` | Index class cần tìm (0–34), dùng để route vào đúng block |
-| **Output** | `center_heatmap` | `[B, 1, 64, 64]` | Xác suất tâm vật thể (Gaussian peaks, sigmoid, range [0,1]) |
-| | `size_map` | `[B, 2, 64, 64]` | Kích thước (w, h) tại mỗi pixel (ReLU, đơn vị pixel trên ảnh 512×512) |
+| **Cả hai** | `image` | `[B, 3, 512, 512]` | Ảnh bản vẽ mặt bằng (normalized [-1, 1]) |
+| **Training** | `class_ids` | `[B]` | Index class cần tính loss (0–34) |
+| **Inference** | *(không cần)* | — | `class_ids=None` → chạy tất cả 35 blocks |
+
+| Mode | Output | Shape | Mô tả |
+|---|---|---|---|
+| **Training** | `center_heatmap` | `[B, 1, 64, 64]` | Heatmap cho class được chọn |
+| | `size_map` | `[B, 2, 64, 64]` | Kích thước (w, h) cho class được chọn |
+| **Inference** | `center_heatmap` | `[B, 35, 64, 64]` | Heatmap cho tất cả 35 classes |
+| | `size_map` | `[B, 70, 64, 64]` | Kích thước cho tất cả 35 classes |
+
+> 35 class texts là **built-in** (buffer trong model), không phải input bên ngoài.
 
 ### Inference
 
 ```python
-# Tìm tất cả ghế trong ảnh
-preds = model(image, tokenize("Find chair in this floor plan drawing"), class_id=4)
-# preds["center_heatmap"] → threshold 0.3 → NMS → tâm các ghế
-# preds["size_map"] tại mỗi tâm → bounding box
+# Tìm TẤT CẢ objects trong ảnh (chạy 35 blocks)
+preds = model(image)   # class_ids=None
+# preds["center_heatmap"]: [1, 35, 64, 64] — mỗi channel là 1 class
+# Threshold 0.3 → NMS → tâm các objects → size_map → bounding box
+
+# Training: chỉ chạy block của class cần tính loss
+preds = model(image, class_ids=torch.tensor([4]))  # chair only
 ```
 
 ---
@@ -94,28 +104,31 @@ preds = model(image, tokenize("Find chair in this floor plan drawing"), class_id
 
 ### 3.1 VAEEncoderStub
 
-> File: [detector.py L24-44](file:///e:/Dat/Research/src/models/detector.py#L24-L44)
+> File: [detector.py](file:///e:/Dat/Research/src/models/detector.py) | Config: [config.py VAEConfig](file:///e:/Dat/Research/src/models/config.py)
 
 **Vai trò:** Nén ảnh RGB thành latent representation, giảm spatial resolution 8×.
 
-| Layer | Input → Output | Params |
-|-------|---------------|--------|
-| Conv2d(3→64, k=4, s=2, p=1) | `[B,3,512,512]` → `[B,64,256,256]` | 3,136 |
-| SiLU | — | 0 |
-| Conv2d(64→128, k=4, s=2, p=1) | `[B,64,256,256]` → `[B,128,128,128]` | 131,200 |
-| SiLU | — | 0 |
-| Conv2d(128→256, k=4, s=2, p=1) | `[B,128,128,128]` → `[B,256,64,64]` | 524,544 |
-| SiLU | — | 0 |
-| Conv2d(256→16, k=1) | `[B,256,64,64]` → `[B,16,64,64]` | 4,112 |
+**Config (matching Flux 2 Klein):**
 
-**Tổng:** ~663K params
+| Param | Value |
+|-------|-------|
+| `block_out_channels` | `[128, 256, 512, 512]` |
+| `latent_channels` | 16 |
+| `scaling_factor` | 0.3611 |
+| `downsample` | 8× (3 stride-2 stages) |
 
-**Upgrade path:** Thay bằng `AutoencoderKL` từ `diffusers` (Flux VAE, frozen weights). VAE cung cấp latent space giàu hơn (16 channels, pretrained trên millions of images).
+| Layer | Input → Output |
+|-------|---------|
+| Conv2d(3→128, k=3, s=2, p=1) + SiLU | `[B,3,512,512]` → `[B,128,256,256]` |
+| Conv2d(128→256, k=3, s=2, p=1) + SiLU | → `[B,256,128,128]` |
+| Conv2d(256→512, k=3, s=2, p=1) + SiLU | → `[B,512,64,64]` |
+| Conv2d(512→512, k=3, p=1) + SiLU | → `[B,512,64,64]` |
+| Conv2d(512→16, k=1) | → `[B,16,64,64]` |
 
+**Upgrade path:**
 ```python
-# Khi upgrade:
 from diffusers import AutoencoderKL
-vae = AutoencoderKL.from_pretrained("black-forest-labs/FLUX.1-dev", subfolder="vae")
+vae = AutoencoderKL.from_pretrained("black-forest-labs/FLUX.2-klein-9B", subfolder="vae")
 vae.requires_grad_(False)  # freeze
 latent = vae.encode(image).latent_dist.sample()  # [B, 16, 64, 64]
 ```
@@ -124,19 +137,37 @@ latent = vae.encode(image).latent_dist.sample()  # [B, 16, 64, 64]
 
 ### 3.2 TextEncoderStub
 
-> File: [detector.py L50-67](file:///e:/Dat/Research/src/models/detector.py#L50-L67)
+> File: [detector.py](file:///e:/Dat/Research/src/models/detector.py) | Config: [config.py TextEncoderConfig](file:///e:/Dat/Research/src/models/config.py)
 
-**Vai trò:** Chuyển tokenized text thành embedding vectors.
+**Vai trò:** Chuyển tokenized text thành embedding vectors, project về model_dim.
 
-| Component | Mô tả |
-|-----------|-------|
-| `nn.Embedding(32000, D)` | Word embedding, vocab_size=32000, padding_idx=0 |
-| `nn.Embedding(32, D)` | Positional encoding, max_len=32 tokens |
-| `nn.LayerNorm(D)` | Normalize output |
+**Config (matching T5-v1.1-XXL):**
 
-**Forward:** `embed(ids) + pos(arange(L))` → `LayerNorm` → `[B, L, D]`
+| Param | Value |
+|-------|-------|
+| `model_name` | `google/t5-v1_1-xxl` |
+| `vocab_size` | 32128 |
+| `d_model` | 4096 |
+| `num_heads` | 64 |
+| `num_layers` | 24 |
+| `max_length` | 512 |
 
-**Upgrade path:** Thay bằng T5 Encoder hoặc CLIP Text Model (frozen weights + learnable projection).
+| Component | Shape | Mô tả |
+|-----------|-------|-------|
+| `nn.Embedding(32128, 4096)` | → `[B, L, 4096]` | Word embedding |
+| `nn.Embedding(512, 4096)` | → `[B, L, 4096]` | Positional encoding |
+| `nn.LayerNorm(4096)` | → `[B, L, 4096]` | Normalize |
+| `nn.Linear(4096, model_dim)` | → `[B, L, model_dim]` | Project về internal dim |
+
+**Forward:** `embed(ids) + pos` → `LayerNorm` → `proj` → `[B, L, model_dim]`
+
+**Upgrade path:**
+```python
+from transformers import T5EncoderModel
+t5 = T5EncoderModel.from_pretrained("google/t5-v1_1-xxl")
+t5.requires_grad_(False)  # freeze
+# + nn.Linear(4096, model_dim) trainable projection
+```
 
 ---
 

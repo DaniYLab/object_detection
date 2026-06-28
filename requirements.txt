@@ -4,36 +4,13 @@
 # KHÔNG liệt kê ở đây để tránh pip override mất CUDA build.
 
 # ─── Dataset & Data Loading ───────────────────────────────────────────────────
-fiftyone>=1.0.0
-huggingface_hub>=0.20.0   # Required by fiftyone HuggingFace integration
-datasets>=2.20.0          # HuggingFace datasets (optional fallback)
-
-# ─── Computer Vision ──────────────────────────────────────────────────────────
 Pillow>=10.0.0
-opencv-python>=4.10.0
-albumentations>=1.4.0     # Data augmentation
-
-# ─── CLIP (Multimodal Encoder) ────────────────────────────────────────────────
-openai-clip>=1.0.1
-ftfy>=6.1.0               # Text cleaning (required by CLIP)
-regex>=2024.0.0
+svgpathtools>=1.6.0       # SVG path parsing for build_dataset.py
+gdown>=5.1.0              # Google Drive download
 
 # ─── Scientific Computing ─────────────────────────────────────────────────────
 numpy>=1.26.0
-scipy>=1.13.0
-scikit-learn>=1.5.0
-
-# ─── Config & Experiment Management ──────────────────────────────────────────
-hydra-core>=1.3.0
-omegaconf>=2.3.0
 
 # ─── Logging & Visualization ──────────────────────────────────────────────────
-wandb>=0.17.0             # Experiment tracking (optional)
 matplotlib>=3.9.0
-seaborn>=0.13.0
 tqdm>=4.66.0
-
-# ─── Utilities ────────────────────────────────────────────────────────────────
-h5py>=3.11.0
-pandas>=2.2.0
-gdown>=5.1.0               # Google Drive download

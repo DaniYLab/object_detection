@@ -17,7 +17,7 @@ SESSION="floorplan_train"
 IMAGE_SIZE=512
 BATCH_SIZE=16       # T4 16GB → 8 | A100 40GB → 24 | RTX 4090 24GB → 16
 MODEL_DIM=512
-NUM_BLOCKS=4
+DEPTH_PER_CLASS=2
 EPOCHS=50
 LR=1e-4
 NUM_WORKERS=4
@@ -51,7 +51,7 @@ CMD="python train.py \
     --batch_size   $BATCH_SIZE \
     --num_workers  $NUM_WORKERS \
     --model_dim    $MODEL_DIM \
-    --num_blocks   $NUM_BLOCKS \
+    --depth_per_class $DEPTH_PER_CLASS \
     --epochs       $EPOCHS \
     --lr           $LR \
     --log_interval $LOG_INTERVAL \
