@@ -65,7 +65,6 @@ def process_sample(
     png_path: Path,
     svg_path: Path,
     out_dir: Path,
-    padding: int = 5,
     min_size: int = 8,
 ) -> int:
     """
@@ -98,7 +97,6 @@ def process_sample(
     # instance-id == -1 means "stuff" (wall, etc.) — treat each path as own instance
     instance_bboxes: dict[tuple, list] = defaultdict(list)
 
-    ns = {"svg": "http://www.w3.org/2000/svg"}
     for elem in root.iter():
         d = elem.get("d")
         if d is None:
