@@ -25,54 +25,55 @@ from src.models.detector import FloorPlanDetector
 
 # ── Loss Functions ─────────────────────────────────────────────────────────────
 
-def focal_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    alpha: float = 0.25,
-    gamma: float = 2.0,
-) -> torch.Tensor:
-    """
-    Binary Focal Loss for heatmap prediction.
-    pred, target: [B, C, H, W] in [0, 1]
-    """
-    bce = F.binary_cross_entropy(pred, target, reduction="none")
-    pt = torch.where(target == 1, pred, 1 - pred)
-    focal_weight = alpha * (1 - pt) ** gamma
-    return (focal_weight * bce).mean()
+def focal_loss(pred: torch.Tensor, target: torch.Tensor, alpha: float = 2.0, beta: float = 4.0) -> torch.Tensor:
+    """Penalty-reduced Focal Loss for CenterNet Gaussian heatmaps."""
+    pred = torch.clamp(pred, 1e-4, 1 - 1e-4)
+    pos_inds = target.eq(1).float()
+    neg_inds = target.lt(1).float()
+    
+    neg_weights = torch.pow(1 - target, beta)
+    
+    pos_loss = torch.log(pred) * torch.pow(1 - pred, alpha) * pos_inds
+    neg_loss = torch.log(1 - pred) * torch.pow(pred, alpha) * neg_weights * neg_inds
+    
+    num_pos = pos_inds.sum()
+    if num_pos == 0:
+        return -neg_loss.sum()
+    return -(pos_loss.sum() + neg_loss.sum()) / num_pos
 
 
-def dice_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    smooth: float = 1.0,
-) -> torch.Tensor:
-    """
-    Dice Loss for mask overlap quality.
-    pred, target: [B, C, H, W] in [0, 1]
-    """
-    pred_flat = pred.view(pred.shape[0], pred.shape[1], -1)
-    tgt_flat  = target.view(target.shape[0], target.shape[1], -1)
-    intersection = (pred_flat * tgt_flat).sum(-1)
-    union = pred_flat.sum(-1) + tgt_flat.sum(-1)
-    dice = (2 * intersection + smooth) / (union + smooth)
-    return (1 - dice).mean()
+def l1_loss_masked(pred_size: torch.Tensor, target_size: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """L1 loss for size prediction, only computed at object centers."""
+    mask = mask.expand_as(pred_size)
+    l1 = F.l1_loss(pred_size, target_size, reduction="none")
+    return (l1 * mask).sum() / (mask.sum() + 1e-4)
 
 
-def detection_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
+def centernet_loss(
+    preds: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
     focal_w: float = 1.0,
-    dice_w: float = 0.5,
+    size_w: float = 0.1,
 ) -> dict[str, torch.Tensor]:
-    """Combined Focal + Dice loss."""
-    # Downsample target to match pred spatial size
-    if pred.shape[-2:] != target.shape[-2:]:
-        target = F.interpolate(target, size=pred.shape[-2:], mode="bilinear", align_corners=False)
-
-    fl = focal_loss(pred, target)
-    dl = dice_loss(pred, target)
-    total = focal_w * fl + dice_w * dl
-    return {"total": total, "focal": fl, "dice": dl}
+    """Combined Focal + L1 size loss."""
+    pred_hm = preds["center_heatmap"]
+    pred_sz = preds["size_map"]
+    
+    tgt_hm = targets["center_heatmap"]
+    tgt_sz = targets["size_map"]
+    tgt_mask = targets["mask_map"]
+    
+    # Downsample targets to match pred spatial size
+    if pred_hm.shape[-2:] != tgt_hm.shape[-2:]:
+        tgt_hm = F.interpolate(tgt_hm, size=pred_hm.shape[-2:], mode="bilinear", align_corners=False)
+        tgt_sz = F.interpolate(tgt_sz, size=pred_hm.shape[-2:], mode="nearest")
+        tgt_mask = F.interpolate(tgt_mask, size=pred_hm.shape[-2:], mode="nearest")
+        tgt_mask = (tgt_mask > 0).float()
+    
+    fl = focal_loss(pred_hm, tgt_hm)
+    l1 = l1_loss_masked(pred_sz, tgt_sz, tgt_mask)
+    total = focal_w * fl + size_w * l1
+    return {"total": total, "focal": fl, "size_l1": l1}
 
 
 # ── Fake tokenizer (placeholder until T5 integrated) ──────────────────────────
@@ -98,12 +99,16 @@ def train_one_epoch(
     log_interval: int = 20,
 ) -> dict[str, float]:
     model.train()
-    total_loss = focal_sum = dice_sum = 0.0
+    total_loss = focal_sum = l1_sum = 0.0
     t0 = time.time()
 
     for step, batch in enumerate(loader):
-        image   = batch["image"].to(device)           # [B, 3, H, W]
-        heatmap = batch["heatmap"].to(device)         # [B, 35, H, W]
+        image = batch["image"].to(device)
+        targets = {
+            "center_heatmap": batch["center_heatmap"].to(device),
+            "size_map": batch["size_map"].to(device),
+            "mask_map": batch["mask_map"].to(device),
+        }
         texts_batch = batch["texts"]                  # list[list[str]]
         class_ids_batch = batch["class_ids"]          # list[list[int]]
 
@@ -122,10 +127,10 @@ def train_one_epoch(
 
         # Forward
         optimizer.zero_grad()
-        pred = model(image, text_ids, primary_cls)          # [B, 35, h, w]
+        preds = model(image, text_ids, primary_cls)
 
         # Loss
-        losses = detection_loss(pred, heatmap)
+        losses = centernet_loss(preds, targets)
         losses["total"].backward()
 
         # Gradient clipping
@@ -134,7 +139,7 @@ def train_one_epoch(
 
         total_loss += losses["total"].item()
         focal_sum  += losses["focal"].item()
-        dice_sum   += losses["dice"].item()
+        l1_sum   += losses["size_l1"].item()
 
         if (step + 1) % log_interval == 0:
             elapsed = time.time() - t0
@@ -142,7 +147,7 @@ def train_one_epoch(
             print(
                 f"  Epoch {epoch} | Step {step+1:4d}/{len(loader)} | "
                 f"Loss {avg_loss:.4f} "
-                f"(focal={focal_sum/(step+1):.4f}, dice={dice_sum/(step+1):.4f}) | "
+                f"(focal={focal_sum/(step+1):.4f}, size_l1={l1_sum/(step+1):.4f}) | "
                 f"{elapsed:.1f}s"
             )
 
@@ -150,7 +155,7 @@ def train_one_epoch(
     return {
         "loss":  total_loss / n,
         "focal": focal_sum  / n,
-        "dice":  dice_sum   / n,
+        "size_l1": l1_sum   / n,
     }
 
 
@@ -166,8 +171,12 @@ def validate(
     n = 0
 
     for batch in loader:
-        image   = batch["image"].to(device)
-        heatmap = batch["heatmap"].to(device)
+        image = batch["image"].to(device)
+        targets = {
+            "center_heatmap": batch["center_heatmap"].to(device),
+            "size_map": batch["size_map"].to(device),
+            "mask_map": batch["mask_map"].to(device),
+        }
         texts_batch = batch["texts"]
         class_ids_batch = batch["class_ids"]
 
@@ -178,19 +187,13 @@ def validate(
         first_texts = [t[0] if t else "Find object in this floor plan" for t in texts_batch]
         text_ids = tokenize_texts(first_texts).to(device)
 
-        pred = model(image, text_ids, primary_cls)
-        losses = detection_loss(pred, heatmap)
+        preds = model(image, text_ids, primary_cls)
+        losses = centernet_loss(preds, targets)
         total_loss += losses["total"].item()
 
-        # Binary IoU @ threshold 0.5
-        pred_bin = (pred > 0.5).float()
-        tgt_bin  = F.interpolate(heatmap, size=pred.shape[-2:], mode="nearest")
-        inter = (pred_bin * tgt_bin).sum()
-        union = (pred_bin + tgt_bin).clamp(0, 1).sum()
-        iou_sum += (inter / union.clamp(min=1)).item()
         n += 1
 
-    return {"val_loss": total_loss / n, "val_iou": iou_sum / n}
+    return {"val_loss": total_loss / n}
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────

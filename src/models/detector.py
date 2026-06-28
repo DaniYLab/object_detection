@@ -105,7 +105,7 @@ class HeatmapHead(nn.Module):
     Output: [B, num_classes, H_out, W_out]
     """
 
-    def __init__(self, in_dim: int, num_classes: int = 35) -> None:
+    def __init__(self, in_dim: int, out_channels: int = 3) -> None:
         super().__init__()
         self.head = nn.Sequential(
             nn.Conv2d(in_dim, 256, 3, padding=1),
@@ -113,7 +113,7 @@ class HeatmapHead(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(256, 128, 3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, num_classes, 1),
+            nn.Conv2d(128, out_channels, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -140,7 +140,7 @@ class FloorPlanDetector(nn.Module):
         image_size: int = 512,
         latent_channels: int = 16,
         model_dim: int = 512,
-        num_classes: int = 35,
+        num_classes: int = 1,  # Only 1 class for class-agnostic
         num_blocks: int = 4,
         num_heads: int = 8,
         dropout: float = 0.1,
@@ -171,8 +171,8 @@ class FloorPlanDetector(nn.Module):
         # After blocks: project each class pass separately
         self.class_proj = nn.Linear(model_dim, model_dim)
 
-        # ── Heatmap Head ──────────────────────────────────────────────────────
-        self.heatmap_head = HeatmapHead(model_dim, num_classes)
+        # ── Heatmap Head (1 for center, 2 for size) ───────────────────────────
+        self.heatmap_head = HeatmapHead(model_dim, out_channels=3)
 
         # ── Spatial reshape helper ────────────────────────────────────────────
         self.out_norm = nn.LayerNorm(model_dim)
@@ -189,10 +189,11 @@ class FloorPlanDetector(nn.Module):
         image: torch.Tensor,                        # [B, 3, H, W]
         text_ids: torch.Tensor,                     # [B, L]  tokenized text
         class_ids: torch.Tensor,                    # [B]     active class per sample
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
         """
         Returns:
-            heatmap: [B, num_classes, h, w]  (sigmoid applied → [0,1])
+            center_heatmap: [B, 1, h, w] (sigmoid applied)
+            size_map:       [B, 2, h, w] (ReLU applied)
         """
         B = image.shape[0]
 
@@ -213,18 +214,26 @@ class FloorPlanDetector(nn.Module):
         x = x.transpose(1, 2).reshape(B, self.model_dim, h, w)  # [B, D, h, w]
 
         # ── 5. Heatmap head ───────────────────────────────────────────────────
-        heatmap = self.heatmap_head(x)                   # [B, 35, h, w]
-        return torch.sigmoid(heatmap)
+        out = self.heatmap_head(x)                       # [B, 3, h, w]
+        
+        center_heatmap = torch.sigmoid(out[:, 0:1, :, :])
+        size_map = F.relu(out[:, 1:3, :, :])
+        
+        return {
+            "center_heatmap": center_heatmap,
+            "size_map": size_map,
+        }
 
 
 if __name__ == "__main__":
-    model = FloorPlanDetector(image_size=512, model_dim=512, num_blocks=4)
+    model = FloorPlanDetector(image_size=512, model_dim=512, num_classes=1, num_blocks=4)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Parameters: {n_params:.1f}M")
 
     image    = torch.randn(2, 3, 512, 512)
     text_ids = torch.randint(0, 32000, (2, 16))
-    cls_ids  = torch.tensor([3, 10])
+    cls_ids  = torch.tensor([0, 0])
 
     out = model(image, text_ids, cls_ids)
-    print(f"Output heatmap: {out.shape}")   # [2, 35, 64, 64]
+    print(f"center_heatmap: {out['center_heatmap'].shape}")   # [2, 1, 64, 64]
+    print(f"size_map      : {out['size_map'].shape}")         # [2, 2, 64, 64]

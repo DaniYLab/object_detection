@@ -113,8 +113,14 @@ class FloorPlanDataset(Dataset):
         present_classes = sorted(crop_files.keys())
         class_ids = [CLASS_TO_IDX[c] for c in present_classes if c in CLASS_TO_IDX]
 
-        # ── Build heatmap [NUM_CLASSES, H, W] from metadata.json ─────────────
-        heatmap = torch.zeros(NUM_CLASSES, self.image_size, self.image_size)
+        # ── Build CenterNet Targets ───────────────────────────────────────────
+        # center_heatmap [1, H, W] : Gaussian peaks at object centers
+        # size_map [2, H, W]       : (w, h) of the object at the center location
+        # mask_map [1, H, W]       : 1 at object centers, 0 elsewhere (for L1 loss)
+        center_heatmap = torch.zeros(1, self.image_size, self.image_size)
+        size_map = torch.zeros(2, self.image_size, self.image_size)
+        mask_map = torch.zeros(1, self.image_size, self.image_size)
+
         meta_path = sample_dir / "metadata.json"
 
         if meta_path.exists():
@@ -126,50 +132,57 @@ class FloorPlanDataset(Dataset):
             sy = self.image_size / orig_h
 
             for inst in meta.get("instances", []):
-                cid = inst.get("class_id", -1)
-                if cid < 0 or cid >= NUM_CLASSES:
-                    continue
                 x0, y0, x1, y1 = inst["bbox_px"]
-                # Scale to heatmap resolution
-                hx0 = max(0, int(x0 * sx))
-                hy0 = max(0, int(y0 * sy))
-                hx1 = min(self.image_size, int(x1 * sx))
-                hy1 = min(self.image_size, int(y1 * sy))
-                if hx1 > hx0 and hy1 > hy0:
-                    heatmap[cid, hy0:hy1, hx0:hx1] = 1.0
-        else:
-            # Fallback: binary presence (no spatial info) until metadata is ready
-            for cls in present_classes:
-                if cls in CLASS_TO_IDX:
-                    heatmap[CLASS_TO_IDX[cls]] = 0.1   # low signal, not misleading
+                
+                # Scale to output resolution
+                hx0 = max(0, min(self.image_size - 1, x0 * sx))
+                hy0 = max(0, min(self.image_size - 1, y0 * sy))
+                hx1 = max(0, min(self.image_size - 1, x1 * sx))
+                hy1 = max(0, min(self.image_size - 1, y1 * sy))
+                
+                h, w = hy1 - hy0, hx1 - hx0
+                if h > 0 and w > 0:
+                    cx = int(hx0 + w / 2)
+                    cy = int(hy0 + h / 2)
+                    
+                    # Ensure center is within bounds
+                    if 0 <= cx < self.image_size and 0 <= cy < self.image_size:
+                        # Draw Gaussian bump (radius proportional to size)
+                        radius = max(1, int(min(h, w) / 6))
+                        vec = torch.arange(-radius, radius + 1, dtype=torch.float32)
+                        y, x = torch.meshgrid(vec, vec, indexing='ij')
+                        sigma = radius / 3.0
+                        gaussian = torch.exp(-(x**2 + y**2) / (2 * sigma**2))
+                        
+                        # Bounding box for the gaussian on the heatmap
+                        left, right = min(cx, radius), min(self.image_size - cx, radius + 1)
+                        top, bottom = min(cy, radius), min(self.image_size - cy, radius + 1)
+                        
+                        # Assign maximum value (in case of overlapping bumps)
+                        center_heatmap[0, cy - top : cy + bottom, cx - left : cx + right] = torch.maximum(
+                            center_heatmap[0, cy - top : cy + bottom, cx - left : cx + right],
+                            gaussian[radius - top : radius + bottom, radius - left : radius + right]
+                        )
+                        
+                        # Set size and mask at the exact center point
+                        size_map[0, cy, cx] = w
+                        size_map[1, cy, cx] = h
+                        mask_map[0, cy, cx] = 1.0
 
-
-
-        # ── Sample one representative crop per class ───────────────────────────
-        class_crops: dict[str, torch.Tensor] = {}
-        for cls, files in crop_files.items():
-            if cls not in CLASS_TO_IDX:
-                continue
-            chosen = random.sample(files, min(self.max_crops, len(files)))
-            crops = []
-            for f in chosen:
-                try:
-                    c = Image.open(f).convert("RGB")
-                    crops.append(self.crop_transform(c))
-                except Exception:
-                    continue
-            if crops:
-                # Stack and mean-pool → single representative tensor [3, crop_H, crop_W]
-                class_crops[cls] = torch.stack(crops).mean(0)
+        # We skip crops for class-agnostic phase
+        class_crops = {}
 
         # ── Text prompts ───────────────────────────────────────────────────────
-        texts = [TEXT_TEMPLATE.format(cls=cls) for cls in present_classes
-                 if cls in CLASS_TO_IDX]
+        # A single dummy prompt for class-agnostic object detection
+        texts = ["Find object in this floor plan drawing"]
+        class_ids = [0]
 
         return {
             "image": image_tensor,          # [3, H, W]
-            "heatmap": heatmap,             # [35, H, W]
-            "class_crops": class_crops,     # dict[str, Tensor[3, cH, cW]]
+            "center_heatmap": center_heatmap, # [1, H, W]
+            "size_map": size_map,           # [2, H, W]
+            "mask_map": mask_map,           # [1, H, W]
+            "class_crops": class_crops,     # empty dict
             "texts": texts,                 # list[str]
             "class_ids": class_ids,         # list[int]
             "sample_id": sample_dir.name,
@@ -188,7 +201,9 @@ def collate_fn(batch: list[dict]) -> dict:
     """Custom collate: handle variable-length class_ids and texts."""
     return {
         "image": torch.stack([b["image"] for b in batch]),
-        "heatmap": torch.stack([b["heatmap"] for b in batch]),
+        "center_heatmap": torch.stack([b["center_heatmap"] for b in batch]),
+        "size_map": torch.stack([b["size_map"] for b in batch]),
+        "mask_map": torch.stack([b["mask_map"] for b in batch]),
         "texts": [b["texts"] for b in batch],
         "class_ids": [b["class_ids"] for b in batch],
         "sample_ids": [b["sample_id"] for b in batch],
@@ -208,7 +223,9 @@ if __name__ == "__main__":
     print(f"Dataset size: {len(ds)}")
     sample = ds[0]
     print(f"  image shape  : {sample['image'].shape}")
-    print(f"  heatmap shape: {sample['heatmap'].shape}")
-    print(f"  classes      : {[CLASS_NAMES[i] for i in sample['class_ids']]}")
+    print(f"  center_heatmap shape: {sample['center_heatmap'].shape}")
+    print(f"  size_map shape : {sample['size_map'].shape}")
+    print(f"  mask_map shape : {sample['mask_map'].shape}")
+    print(f"  classes      : {sample['class_ids']}")
     print(f"  texts        : {sample['texts'][:3]}")
-    print(f"  crops        : {list(sample['class_crops'].keys())}")
+
