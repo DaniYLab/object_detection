@@ -16,20 +16,10 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-# ── Class mapping (id → name, ordered for index assignment) ───────────────────
-CLASS_NAMES = [
-    "annotation_text", "bathtub", "bed", "cabinet", "chair",
-    "column", "counter", "dimension_line", "door_double", "door_revolving",
-    "door_single", "door_sliding", "elevator", "escalator", "escalator_stair",
-    "floor_plan_area", "oven", "parking", "plant", "ramp",
-    "refrigerator", "room_label", "shower", "sink", "sofa",
-    "stair", "symbol_misc", "table", "toilet", "tv",
-    "wall", "washing_machine", "window", "window_bay", "window_blind",
-]
-CLASS_TO_IDX = {name: i for i, name in enumerate(CLASS_NAMES)}
-NUM_CLASSES = len(CLASS_NAMES)  # 35
-
-TEXT_TEMPLATE = "Find {cls} in this floor plan drawing"
+# ── Class mapping (from shared constants) ─────────────────────────────────────
+from src.data.constants import (
+    CLASS_NAMES, CLASS_TO_IDX, NUM_CLASSES, TEXT_TEMPLATE, SEMANTIC_ID_TO_NAME,
+)
 
 
 def _default_transform(image_size: int = 512) -> transforms.Compose:

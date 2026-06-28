@@ -73,9 +73,8 @@ log "Downloading FloorPlanCAD dataset..."
 mkdir -p data
 python scripts/data/download_gdrive.py
 
-log "Building processed dataset (crops + metadata)..."
+log "Building processed dataset (images + metadata)..."
 python scripts/data/build_dataset.py
-python scripts/data/generate_metadata.py
 
 # ── 5. Verify ─────────────────────────────────────────────────────────────────
 log "Verifying dataset..."
