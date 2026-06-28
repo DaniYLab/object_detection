@@ -113,13 +113,12 @@ class FloorPlanDataset(Dataset):
         present_classes = sorted(crop_files.keys())
         class_ids = [CLASS_TO_IDX[c] for c in present_classes if c in CLASS_TO_IDX]
 
-        # ── Build CenterNet Targets ───────────────────────────────────────────
-        # center_heatmap [1, H, W] : Gaussian peaks at object centers
-        # size_map [2, H, W]       : (w, h) of the object at the center location
-        # mask_map [1, H, W]       : 1 at object centers, 0 elsewhere (for L1 loss)
-        center_heatmap = torch.zeros(1, self.image_size, self.image_size)
-        size_map = torch.zeros(2, self.image_size, self.image_size)
-        mask_map = torch.zeros(1, self.image_size, self.image_size)
+        # ── Build per-class CenterNet Targets ─────────────────────────────────
+        # For each class present in this sample, build separate targets:
+        #   center_heatmap [1, H, W] : Gaussian peaks at centers of THAT class
+        #   size_map [2, H, W]       : (w, h) at the center locations
+        #   mask_map [1, H, W]       : 1 at centers, 0 elsewhere
+        per_class_targets: list[dict] = []
 
         meta_path = sample_dir / "metadata.json"
 
@@ -131,66 +130,86 @@ class FloorPlanDataset(Dataset):
             sx = self.image_size / orig_w
             sy = self.image_size / orig_h
 
+            # Group instances by class
+            class_instances: dict[str, list] = {}
             for inst in meta.get("instances", []):
-                x0, y0, x1, y1 = inst["bbox_px"]
-                
-                # Scale to output resolution
-                hx0 = max(0, min(self.image_size - 1, x0 * sx))
-                hy0 = max(0, min(self.image_size - 1, y0 * sy))
-                hx1 = max(0, min(self.image_size - 1, x1 * sx))
-                hy1 = max(0, min(self.image_size - 1, y1 * sy))
-                
-                h, w = hy1 - hy0, hx1 - hx0
-                if h > 0 and w > 0:
-                    cx = int(hx0 + w / 2)
-                    cy = int(hy0 + h / 2)
-                    
-                    # Ensure center is within bounds
-                    if 0 <= cx < self.image_size and 0 <= cy < self.image_size:
-                        # Draw Gaussian bump (radius proportional to size)
-                        radius = max(1, int(min(h, w) / 6))
-                        vec = torch.arange(-radius, radius + 1, dtype=torch.float32)
-                        y, x = torch.meshgrid(vec, vec, indexing='ij')
-                        sigma = radius / 3.0
-                        gaussian = torch.exp(-(x**2 + y**2) / (2 * sigma**2))
-                        
-                        # Bounding box for the gaussian on the heatmap
-                        left, right = min(cx, radius), min(self.image_size - cx, radius + 1)
-                        top, bottom = min(cy, radius), min(self.image_size - cy, radius + 1)
-                        
-                        # Assign maximum value (in case of overlapping bumps)
-                        center_heatmap[0, cy - top : cy + bottom, cx - left : cx + right] = torch.maximum(
-                            center_heatmap[0, cy - top : cy + bottom, cx - left : cx + right],
-                            gaussian[radius - top : radius + bottom, radius - left : radius + right]
-                        )
-                        
-                        # Set size and mask at the exact center point
-                        size_map[0, cy, cx] = w
-                        size_map[1, cy, cx] = h
-                        mask_map[0, cy, cx] = 1.0
+                cls_name = inst.get("class", "")
+                if cls_name in CLASS_TO_IDX:
+                    class_instances.setdefault(cls_name, []).append(inst)
 
-        # We skip crops for class-agnostic phase
-        class_crops = {}
+            # Build targets for each class
+            for cls_name, instances in class_instances.items():
+                center_hm = torch.zeros(1, self.image_size, self.image_size)
+                sz_map = torch.zeros(2, self.image_size, self.image_size)
+                mk_map = torch.zeros(1, self.image_size, self.image_size)
 
-        # ── Text prompts ───────────────────────────────────────────────────────
-        # A single dummy prompt for class-agnostic object detection
-        texts = ["Find object in this floor plan drawing"]
-        class_ids = [0]
+                for inst in instances:
+                    x0, y0, x1, y1 = inst["bbox_px"]
+
+                    hx0 = max(0, min(self.image_size - 1, x0 * sx))
+                    hy0 = max(0, min(self.image_size - 1, y0 * sy))
+                    hx1 = max(0, min(self.image_size - 1, x1 * sx))
+                    hy1 = max(0, min(self.image_size - 1, y1 * sy))
+
+                    h, w = hy1 - hy0, hx1 - hx0
+                    if h > 0 and w > 0:
+                        cx = int(hx0 + w / 2)
+                        cy = int(hy0 + h / 2)
+
+                        if 0 <= cx < self.image_size and 0 <= cy < self.image_size:
+                            radius = max(1, int(min(h, w) / 6))
+                            vec = torch.arange(-radius, radius + 1, dtype=torch.float32)
+                            gy, gx = torch.meshgrid(vec, vec, indexing='ij')
+                            sigma = max(radius / 3.0, 0.5)
+                            gaussian = torch.exp(-(gx**2 + gy**2) / (2 * sigma**2))
+
+                            left = min(cx, radius)
+                            right = min(self.image_size - cx, radius + 1)
+                            top = min(cy, radius)
+                            bottom = min(self.image_size - cy, radius + 1)
+
+                            center_hm[0, cy - top : cy + bottom, cx - left : cx + right] = torch.maximum(
+                                center_hm[0, cy - top : cy + bottom, cx - left : cx + right],
+                                gaussian[radius - top : radius + bottom, radius - left : radius + right]
+                            )
+
+                            sz_map[0, cy, cx] = w
+                            sz_map[1, cy, cx] = h
+                            mk_map[0, cy, cx] = 1.0
+
+                per_class_targets.append({
+                    "text": TEXT_TEMPLATE.format(cls=cls_name),
+                    "class_id": CLASS_TO_IDX[cls_name],
+                    "center_heatmap": center_hm,
+                    "size_map": sz_map,
+                    "mask_map": mk_map,
+                })
+
+        # Fallback: if no metadata, create a dummy entry
+        if not per_class_targets:
+            per_class_targets.append({
+                "text": TEXT_TEMPLATE.format(cls="object"),
+                "class_id": 0,
+                "center_heatmap": torch.zeros(1, self.image_size, self.image_size),
+                "size_map": torch.zeros(2, self.image_size, self.image_size),
+                "mask_map": torch.zeros(1, self.image_size, self.image_size),
+            })
+
+        # ── Pick one class at random for this training step ────────────────────
+        chosen = random.choice(per_class_targets)
 
         return {
-            "image": image_tensor,          # [3, H, W]
-            "center_heatmap": center_heatmap, # [1, H, W]
-            "size_map": size_map,           # [2, H, W]
-            "mask_map": mask_map,           # [1, H, W]
-            "class_crops": class_crops,     # empty dict
-            "texts": texts,                 # list[str]
-            "class_ids": class_ids,         # list[int]
+            "image": image_tensor,                  # [3, H, W]
+            "center_heatmap": chosen["center_heatmap"],  # [1, H, W]
+            "size_map": chosen["size_map"],         # [2, H, W]
+            "mask_map": chosen["mask_map"],          # [1, H, W]
+            "text": chosen["text"],                 # str
+            "class_id": chosen["class_id"],         # int
             "sample_id": sample_dir.name,
         }
 
     def _parse_class(self, stem: str) -> str | None:
         """Extract class name from filename stem like 'door_double_003'."""
-        # Try longest matching class name first
         for cls in sorted(CLASS_NAMES, key=len, reverse=True):
             if stem.startswith(cls + "_") or stem == cls:
                 return cls
@@ -198,34 +217,31 @@ class FloorPlanDataset(Dataset):
 
 
 def collate_fn(batch: list[dict]) -> dict:
-    """Custom collate: handle variable-length class_ids and texts."""
+    """Custom collate for text-conditioned CenterNet."""
     return {
         "image": torch.stack([b["image"] for b in batch]),
         "center_heatmap": torch.stack([b["center_heatmap"] for b in batch]),
         "size_map": torch.stack([b["size_map"] for b in batch]),
         "mask_map": torch.stack([b["mask_map"] for b in batch]),
-        "texts": [b["texts"] for b in batch],
-        "class_ids": [b["class_ids"] for b in batch],
+        "texts": [b["text"] for b in batch],          # list[str]
+        "class_ids": [b["class_id"] for b in batch],   # list[int]
         "sample_ids": [b["sample_id"] for b in batch],
-        # class_crops: list of dicts (variable per sample, don't stack)
-        "class_crops": [b["class_crops"] for b in batch],
     }
 
 
 if __name__ == "__main__":
-    # Quick sanity check
     ds = FloorPlanDataset(
         root="./data/FloorPlanCAD_dataset",
         split="train",
         image_size=512,
-        crop_size=128,
     )
     print(f"Dataset size: {len(ds)}")
     sample = ds[0]
-    print(f"  image shape  : {sample['image'].shape}")
-    print(f"  center_heatmap shape: {sample['center_heatmap'].shape}")
-    print(f"  size_map shape : {sample['size_map'].shape}")
-    print(f"  mask_map shape : {sample['mask_map'].shape}")
-    print(f"  classes      : {sample['class_ids']}")
-    print(f"  texts        : {sample['texts'][:3]}")
+    print(f"  image shape       : {sample['image'].shape}")
+    print(f"  center_heatmap    : {sample['center_heatmap'].shape}")
+    print(f"  size_map          : {sample['size_map'].shape}")
+    print(f"  mask_map          : {sample['mask_map'].shape}")
+    print(f"  text              : {sample['text']}")
+    print(f"  class_id          : {sample['class_id']}")
+    print(f"  num object centers: {sample['mask_map'].sum().int().item()}")
 
