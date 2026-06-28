@@ -1,12 +1,12 @@
 """
-Full FloorPlanCAD Detection Model.
+FloorPlanCAD Detection Model — Conditioned Reflex Architecture.
 
 Pipeline:
   1. Image  → VAE Encoder    → image tokens [B, H*W, D]
   2. Text   → Text Encoder   → text tokens  [B, L, D]
   3. Early Fusion: Cross-Attention(text query → image key/value)
-  4. Per-class pass through ObjectLearningBlock (class-conditioned)
-  5. Aggregate all class features → Heatmap head [B, 35, H, W]
+  4. Route through DEDICATED per-class ObjectLearningBlock (35 pathways)
+  5. CenterNet Head → center_heatmap [B, 1, h, w] + size_map [B, 2, h, w]
 """
 
 from __future__ import annotations
