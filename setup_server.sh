@@ -59,10 +59,7 @@ pip install torch torchvision \
     --index-url "https://download.pytorch.org/whl/$TORCH_CUDA" -q
 
 
-# Install gdown trước (cần để download dataset)
-pip install gdown -q
-
-# Install remaining dependencies
+# Install dependencies (includes gdown for dataset download)
 pip install -r requirements.txt -q
 
 log "Python environment ready!"

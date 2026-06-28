@@ -15,7 +15,7 @@ SESSION="floorplan_train"
 
 # GPU config — tự chỉnh theo server
 IMAGE_SIZE=512
-BATCH_SIZE=16       # T4 16GB → 8 | A100 40GB → 24 | RTX 4090 24GB → 16
+BATCH_SIZE=4        # Auto-adjusted by VRAM below; safe default if nvidia-smi fails
 MODEL_DIM=512
 DEPTH_PER_CLASS=2
 EPOCHS=50
