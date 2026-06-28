@@ -56,18 +56,17 @@ CLASS_NAMES = sorted(set(SEMANTIC_ID_TO_NAME.values()))
 CLASS_TO_IDX = {name: i for i, name in enumerate(CLASS_NAMES)}
 
 # ── SVG path coordinate extractor ─────────────────────────────────────────────
-COORD_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
-
+from svgpathtools import parse_path
 
 def path_bbox(d: str) -> tuple[float, float, float, float] | None:
-    nums = [float(x) for x in COORD_RE.findall(d)]
-    if len(nums) < 2:
+    try:
+        path = parse_path(d)
+        if not path:
+            return None
+        xmin, xmax, ymin, ymax = path.bbox()
+        return xmin, ymin, xmax, ymax
+    except Exception:
         return None
-    xs = nums[0::2]
-    ys = nums[1::2]
-    if not xs or not ys:
-        return None
-    return min(xs), min(ys), max(xs), max(ys)
 
 
 def merge_bboxes(bboxes: list[tuple]) -> tuple[float, float, float, float]:
