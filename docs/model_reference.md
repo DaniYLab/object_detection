@@ -269,7 +269,7 @@ Output: [B, 3, 64, 64]
 
 ## 4. Per-Class Routing (Forward Pass)
 
-Đây là phần quan trọng nhất — cơ chế phản xạ có điều kiện:
+Mỗi forward pass nhận 1 cặp `(ảnh, text, class_id)` và route vào đúng block:
 
 ```python
 # Trong forward():
@@ -283,10 +283,9 @@ for i in range(B):
 x = torch.cat(outputs, dim=0)              # [B, 4096, D]
 ```
 
-**Đặc điểm:**
-- Batch processing: mỗi sample có thể đi qua block khác nhau
-- Chỉ 1 pathway active per sample → gradients chỉ cập nhật block tương ứng
-- Các block khác **hoàn toàn không bị ảnh hưởng** trong step này
+**Training:** Dataset expand mỗi ảnh × N classes = N samples riêng biệt. Mỗi epoch xử lý hết 44,229 cặp → tất cả 35 blocks đều được train đầy đủ.
+
+**Inference:** Chạy 35 forward passes trên cùng 1 ảnh, mỗi lần với 1 text class khác nhau → 35 kết quả detection → gộp lại thành bounding boxes cho tất cả objects.
 
 ---
 
