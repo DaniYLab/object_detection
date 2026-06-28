@@ -126,13 +126,16 @@ class FloorPlanDetector(nn.Module):
     """
     FloorPlanCAD Multimodal Detection Model.
 
-    Args:
-        image_size      : input image size (square)
-        latent_channels : VAE latent channels (16 for Flux VAE)
-        model_dim       : internal feature dimension
-        num_classes     : number of object classes (35)
-        num_blocks      : depth of ObjectLearning stack
-        num_heads       : attention heads
+    Architecture (Conditioned Reflex):
+      1. Image  → VAE Encoder    → image tokens [B, H*W, D]
+      2. Text   → Text Encoder   → text tokens  [B, L, D]
+      3. Early Fusion: Cross-Attention(text → image) → fused features
+      4. Route fused features to the DEDICATED class block based on class_id
+         → 35 separate ObjectLearningBlocks, one per class
+      5. CenterNet Head → center_heatmap [B, 1, h, w] + size_map [B, 2, h, w]
+
+    The text prompt acts as the stimulus (tác nhân kích thích).
+    Each class block is a specialized neural pathway (đường dây thần kinh riêng).
     """
 
     def __init__(
@@ -140,16 +143,17 @@ class FloorPlanDetector(nn.Module):
         image_size: int = 512,
         latent_channels: int = 16,
         model_dim: int = 512,
-        num_classes: int = 1,  # Only 1 class for class-agnostic
-        num_blocks: int = 4,
+        num_classes: int = 35,
+        depth_per_class: int = 2,   # number of stacked blocks per class pathway
         num_heads: int = 8,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.image_size = image_size
-        self.latent_size = image_size // 8       # VAE 8x downsampling
+        self.latent_size = image_size // 8
         self.model_dim = model_dim
         self.num_classes = num_classes
+        self.depth_per_class = depth_per_class
 
         # ── Encoders ─────────────────────────────────────────────────────────
         self.vae_encoder = VAEEncoderStub(3, latent_channels)
@@ -161,21 +165,20 @@ class FloorPlanDetector(nn.Module):
         # ── Early Fusion ──────────────────────────────────────────────────────
         self.early_fusion = EarlyFusion(model_dim, num_heads)
 
-        # ── Object Learning Blocks (shared, class-conditioned) ────────────────
-        self.blocks = nn.ModuleList([
-            ObjectLearningBlock(model_dim, num_classes, num_heads, dropout)
-            for _ in range(num_blocks)
+        # ── Per-class Object Learning Blocks ──────────────────────────────────
+        # 35 separate pathways, each is a stack of `depth_per_class` blocks.
+        # class_id determines which pathway is activated.
+        self.class_blocks = nn.ModuleList([
+            nn.Sequential(*[
+                ObjectLearningBlock(model_dim, num_classes=1, num_heads=num_heads, dropout=dropout)
+                for _ in range(depth_per_class)
+            ])
+            for _ in range(num_classes)
         ])
 
-        # ── Per-class feature projection ──────────────────────────────────────
-        # After blocks: project each class pass separately
-        self.class_proj = nn.Linear(model_dim, model_dim)
-
-        # ── Heatmap Head (1 for center, 2 for size) ───────────────────────────
-        self.heatmap_head = HeatmapHead(model_dim, out_channels=3)
-
-        # ── Spatial reshape helper ────────────────────────────────────────────
+        # ── Spatial reshape + CenterNet Head ──────────────────────────────────
         self.out_norm = nn.LayerNorm(model_dim)
+        self.heatmap_head = HeatmapHead(model_dim, out_channels=3)
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
         """image [B,3,H,W] → tokens [B, h*w, D]"""
@@ -188,7 +191,7 @@ class FloorPlanDetector(nn.Module):
         self,
         image: torch.Tensor,                        # [B, 3, H, W]
         text_ids: torch.Tensor,                     # [B, L]  tokenized text
-        class_ids: torch.Tensor,                    # [B]     active class per sample
+        class_ids: torch.Tensor,                    # [B]     which class block to route to
     ) -> dict[str, torch.Tensor]:
         """
         Returns:
@@ -204,21 +207,29 @@ class FloorPlanDetector(nn.Module):
         # ── 2. Early Fusion ───────────────────────────────────────────────────
         fused = self.early_fusion(img_tokens, txt_tokens)  # [B, h*w, D]
 
-        # ── 3. Object Learning (class-conditioned) ────────────────────────────
-        x = fused
-        for block in self.blocks:
-            x = block(x, class_ids)                      # [B, h*w, D]
+        # ── 3. Route through per-class blocks ─────────────────────────────────
+        # Each sample in the batch may have a different class_id.
+        # We process each sample through its dedicated class block.
+        outputs = []
+        dummy_cid = torch.zeros(1, dtype=torch.long, device=fused.device)
+        for i in range(B):
+            cid = class_ids[i].item()
+            sample_fused = fused[i:i+1]                  # [1, h*w, D]
+            for block in self.class_blocks[cid]:
+                sample_fused = block(sample_fused, dummy_cid)
+            outputs.append(sample_fused)
+        x = torch.cat(outputs, dim=0)                    # [B, h*w, D]
 
         # ── 4. Reshape → spatial ──────────────────────────────────────────────
         x = self.out_norm(x)
         x = x.transpose(1, 2).reshape(B, self.model_dim, h, w)  # [B, D, h, w]
 
-        # ── 5. Heatmap head ───────────────────────────────────────────────────
+        # ── 5. CenterNet head ─────────────────────────────────────────────────
         out = self.heatmap_head(x)                       # [B, 3, h, w]
-        
+
         center_heatmap = torch.sigmoid(out[:, 0:1, :, :])
         size_map = F.relu(out[:, 1:3, :, :])
-        
+
         return {
             "center_heatmap": center_heatmap,
             "size_map": size_map,
@@ -226,14 +237,18 @@ class FloorPlanDetector(nn.Module):
 
 
 if __name__ == "__main__":
-    model = FloorPlanDetector(image_size=512, model_dim=512, num_classes=1, num_blocks=4)
+    model = FloorPlanDetector(
+        image_size=512, model_dim=256, num_classes=35, depth_per_class=2
+    )
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Parameters: {n_params:.1f}M")
+    print(f"Per-class blocks: {len(model.class_blocks)} pathways × {model.depth_per_class} depth")
 
     image    = torch.randn(2, 3, 512, 512)
     text_ids = torch.randint(0, 32000, (2, 16))
-    cls_ids  = torch.tensor([0, 0])
+    cls_ids  = torch.tensor([4, 10])   # chair=4, door_single=10
 
     out = model(image, text_ids, cls_ids)
     print(f"center_heatmap: {out['center_heatmap'].shape}")   # [2, 1, 64, 64]
     print(f"size_map      : {out['size_map'].shape}")         # [2, 2, 64, 64]
+
