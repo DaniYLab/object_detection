@@ -76,17 +76,6 @@ def centernet_loss(
     return {"total": total, "focal": fl, "size_l1": l1}
 
 
-# ── Fake tokenizer (placeholder until T5 integrated) ──────────────────────────
-
-def tokenize_texts(texts: list[str], max_len: int = 32, vocab_size: int = 32000) -> torch.Tensor:
-    """Stub tokenizer — replace with real T5/CLIP tokenizer."""
-    tokens = []
-    for text in texts:
-        ids = [hash(word) % (vocab_size - 1) + 1 for word in text.lower().split()]
-        ids = ids[:max_len] + [0] * max(0, max_len - len(ids))
-        tokens.append(ids)
-    return torch.tensor(tokens, dtype=torch.long)
-
 
 # ── Training Loop ──────────────────────────────────────────────────────────────
 
@@ -109,20 +98,11 @@ def train_one_epoch(
             "size_map": batch["size_map"].to(device),
             "mask_map": batch["mask_map"].to(device),
         }
-        texts_batch = batch["texts"]           # list[str]
-        class_ids_batch = batch["class_ids"]    # list[int]
+        class_ids = torch.tensor(batch["class_ids"], dtype=torch.long, device=device)
 
-        B = image.shape[0]
-
-        # Class conditioning per sample
-        primary_cls = torch.tensor(class_ids_batch, dtype=torch.long, device=device)
-
-        # Tokenize text prompts
-        text_ids = tokenize_texts(texts_batch).to(device)   # [B, 32]
-
-        # Forward
+        # Forward — model has texts built-in, only needs image + class_ids
         optimizer.zero_grad()
-        preds = model(image, text_ids, primary_cls)
+        preds = model(image, class_ids=class_ids)
 
         # Loss
         losses = centernet_loss(preds, targets)
@@ -171,13 +151,9 @@ def validate(
             "size_map": batch["size_map"].to(device),
             "mask_map": batch["mask_map"].to(device),
         }
-        texts_batch = batch["texts"]
-        class_ids_batch = batch["class_ids"]
+        class_ids = torch.tensor(batch["class_ids"], dtype=torch.long, device=device)
 
-        primary_cls = torch.tensor(class_ids_batch, dtype=torch.long, device=device)
-        text_ids = tokenize_texts(texts_batch).to(device)
-
-        preds = model(image, text_ids, primary_cls)
+        preds = model(image, class_ids=class_ids)
         losses = centernet_loss(preds, targets)
         total_loss += losses["total"].item()
 
