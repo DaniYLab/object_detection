@@ -2,11 +2,10 @@
 FloorPlanCAD Detection Model — Conditioned Reflex Architecture.
 
 Pipeline:
-  1. Image  → VAE Encoder    → image tokens [B, H*W, D]
-  2. Text   → Text Encoder   → text tokens  [B, L, D]
-  3. Early Fusion: Cross-Attention(text query → image key/value)
-  4. Route through DEDICATED per-class ObjectLearningBlock (35 pathways)
-  5. CenterNet Head → center_heatmap [B, 1, h, w] + size_map [B, 2, h, w]
+  1. Image  → VAE Encoder    → latent [B, 16, H/8, W/8] → img_tokens [B, h*w, D]
+  2. 35 fixed texts → Text Encoder → txt_tokens [35, L, D]
+  3. Per-class: EarlyFusion(image, text[c]) → class_blocks[c] → heatmap[c]
+  4. CenterNet Head → center_heatmap + size_map
 """
 
 from __future__ import annotations
@@ -16,55 +15,84 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .blocks.object_learning_block import ObjectLearningBlock
+from .config import VAEConfig, TextEncoderConfig
 
 
-# ── Lightweight VAE Encoder stub ──────────────────────────────────────────────
-# Replace with: from diffusers import AutoencoderKL
+# ── VAE Encoder ───────────────────────────────────────────────────────────────
+# Stub matches Flux VAE output: [B, 16, H/8, W/8]
+# Swap with: AutoencoderKL.from_pretrained("black-forest-labs/FLUX.2-klein-9B", subfolder="vae")
 
 class VAEEncoderStub(nn.Module):
     """
-    Placeholder VAE encoder.
-    Replace with Flux VAE (AutoencoderKL) for production.
-    Output: latent [B, latent_channels, H/8, W/8]
+    Trainable VAE encoder stub — matches Flux VAE dimensions.
+
+    Config (from FLUX.2-klein):
+      block_out_channels: [128, 256, 512, 512]
+      latent_channels:    16
+      downsample:         8× (3 stride-2 stages)
+      act_fn:             silu
+
+    Output: [B, 16, H/8, W/8]
     """
 
-    def __init__(self, in_channels: int = 3, latent_channels: int = 16) -> None:
+    def __init__(self, cfg: VAEConfig | None = None) -> None:
         super().__init__()
+        cfg = cfg or VAEConfig()
+        ch = cfg.block_out_channels  # [128, 256, 512, 512]
+
         self.encoder = nn.Sequential(
-            nn.Conv2d(in_channels, 64, 4, stride=2, padding=1),   # /2
+            # Stage 1: 3 → 128, /2
+            nn.Conv2d(cfg.in_channels, ch[0], 3, stride=2, padding=1),
             nn.SiLU(),
-            nn.Conv2d(64, 128, 4, stride=2, padding=1),           # /4
+            # Stage 2: 128 → 256, /4
+            nn.Conv2d(ch[0], ch[1], 3, stride=2, padding=1),
             nn.SiLU(),
-            nn.Conv2d(128, 256, 4, stride=2, padding=1),          # /8
+            # Stage 3: 256 → 512, /8
+            nn.Conv2d(ch[1], ch[2], 3, stride=2, padding=1),
             nn.SiLU(),
-            nn.Conv2d(256, latent_channels, 1),
+            # Stage 4: 512 → 512 (no stride, matches Flux 4th block)
+            nn.Conv2d(ch[2], ch[3], 3, padding=1),
+            nn.SiLU(),
+            # Project → latent channels
+            nn.Conv2d(ch[3], cfg.latent_channels, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encoder(x)
+        return self.encoder(x)  # [B, 16, H/8, W/8]
 
 
-# ── Lightweight Text Encoder stub ─────────────────────────────────────────────
-# Replace with: from transformers import T5EncoderModel / CLIPTextModel
+# ── Text Encoder ──────────────────────────────────────────────────────────────
+# Stub matches T5-v1.1-XXL output: [B, L, 4096] → projected to model_dim
+# Swap with: T5EncoderModel.from_pretrained("google/t5-v1_1-xxl")
 
 class TextEncoderStub(nn.Module):
     """
-    Placeholder text encoder — maps tokenized text to embeddings.
-    Replace with T5EncoderModel for production.
+    Trainable text encoder stub — matches T5-v1.1-XXL dimensions.
+
+    Config (from google/t5-v1_1-xxl):
+      vocab_size: 32128
+      d_model:    4096
+      num_heads:  64
+      num_layers: 24
+
+    Stub: Embedding + Positional + LayerNorm → project 4096 → model_dim.
     """
 
-    def __init__(self, vocab_size: int = 32000, embed_dim: int = 512, max_len: int = 32) -> None:
+    def __init__(self, cfg: TextEncoderConfig | None = None, model_dim: int = 512) -> None:
         super().__init__()
-        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.pos = nn.Embedding(max_len, embed_dim)
-        self.norm = nn.LayerNorm(embed_dim)
+        cfg = cfg or TextEncoderConfig()
+
+        self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model, padding_idx=0)
+        self.pos = nn.Embedding(cfg.max_length, cfg.d_model)
+        self.norm = nn.LayerNorm(cfg.d_model)
+        self.proj = nn.Linear(cfg.d_model, model_dim, bias=False)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # input_ids: [B, L]
         B, L = input_ids.shape
         pos = torch.arange(L, device=input_ids.device).unsqueeze(0)
         x = self.embed(input_ids) + self.pos(pos)
-        return self.norm(x)                             # [B, L, D]
+        x = self.norm(x)              # [B, L, 4096]
+        return self.proj(x)           # [B, L, model_dim]
 
 
 # ── Early Fusion: Cross-Attention (text → image) ──────────────────────────────
@@ -158,12 +186,13 @@ class FloorPlanDetector(nn.Module):
     def __init__(
         self,
         image_size: int = 512,
-        latent_channels: int = 16,
         model_dim: int = 512,
         num_classes: int = 35,
         depth_per_class: int = 2,
         num_heads: int = 8,
         dropout: float = 0.1,
+        vae_cfg: VAEConfig | None = None,
+        text_cfg: TextEncoderConfig | None = None,
     ) -> None:
         super().__init__()
         self.image_size = image_size
@@ -172,12 +201,15 @@ class FloorPlanDetector(nn.Module):
         self.num_classes = num_classes
         self.depth_per_class = depth_per_class
 
+        vae_cfg = vae_cfg or VAEConfig()
+        text_cfg = text_cfg or TextEncoderConfig()
+
         # ── Encoders ─────────────────────────────────────────────────────────
-        self.vae_encoder = VAEEncoderStub(3, latent_channels)
-        self.text_encoder = TextEncoderStub(embed_dim=model_dim)
+        self.vae_encoder = VAEEncoderStub(vae_cfg)
+        self.text_encoder = TextEncoderStub(text_cfg, model_dim=model_dim)
 
         # Project VAE latent → model_dim
-        self.img_proj = nn.Linear(latent_channels, model_dim)
+        self.img_proj = nn.Linear(vae_cfg.latent_channels, model_dim)
 
         # ── Fixed class text tokens (registered as buffer, not parameter) ────
         # 35 tokenized texts, one per class — part of the model, not input
