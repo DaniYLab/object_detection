@@ -8,7 +8,7 @@
 source .venv/bin/activate
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DATA_ROOT="./data/FloorPlanCAD_dataset"
+DATA_ROOT="./data/FloorPlanCAD_original"
 CKPT_DIR="./checkpoints"
 LOG_DIR="./logs"
 SESSION="floorplan_train"

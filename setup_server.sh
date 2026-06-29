@@ -70,16 +70,16 @@ log "Downloading FloorPlanCAD dataset..."
 mkdir -p data
 python scripts/data/download_gdrive.py
 
-log "Building processed dataset (images + metadata)..."
-python scripts/data/build_dataset.py
+log "Building metadata (writes *_meta.json alongside PNGs)..."
+python scripts/data/build_dataset.py --data_root ./data/FloorPlanCAD_original
 
 # ── 5. Verify ─────────────────────────────────────────────────────────────────
 log "Verifying dataset..."
 python - <<'EOF'
 import sys; sys.path.insert(0, '.')
 from src.data.dataset import FloorPlanDataset, NUM_CLASSES
-train_ds = FloorPlanDataset('./data/FloorPlanCAD_dataset', split='train')
-val_ds   = FloorPlanDataset('./data/FloorPlanCAD_dataset', split='test')
+train_ds = FloorPlanDataset('./data/FloorPlanCAD_original', split='train')
+val_ds   = FloorPlanDataset('./data/FloorPlanCAD_original', split='test')
 print(f'  Train: {len(train_ds):,} | Val: {len(val_ds):,} | Classes: {NUM_CLASSES}')
 EOF
 
