@@ -3,6 +3,11 @@ Download FloorPlanCAD dataset goc tu Google Drive.
 Source: https://floorplancad.github.io/
 - 15,663 CAD drawings voi day du annotations
 - License: CC-BY-SA 4.0
+
+Usage:
+    python scripts/data/download_gdrive.py
+    python scripts/data/download_gdrive.py --output_dir /content/FloorPlanCAD_orig
+    OUTPUT_DIR=/content/FloorPlanCAD_orig python scripts/data/download_gdrive.py
 """
 
 import os
@@ -27,8 +32,6 @@ GDRIVE_FILES = [
         "desc": "Test set",
     },
 ]
-
-OUTPUT_DIR = Path("./data/FloorPlanCAD_original")
 
 
 def download_from_gdrive(file_id: str, output_path: Path) -> bool:
@@ -64,7 +67,7 @@ def extract_archive(archive_path: Path, extract_to: Path) -> None:
 
     fmt = detect_format(archive_path)
     print(f"  Format detected: {fmt}")
-    extract_to.mkdir(parents=True, exist_ok=True)
+    os.makedirs(extract_to, exist_ok=True)
 
     if fmt == "zip":
         import zipfile
@@ -90,14 +93,16 @@ def extract_archive(archive_path: Path, extract_to: Path) -> None:
             raise
 
 
-def main() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    zip_dir = OUTPUT_DIR / "zips"
-    zip_dir.mkdir(exist_ok=True)
+def main(output_dir: Path) -> None:
+    # Use os.makedirs — safe with symlinks (unlike Path.mkdir on Python 3.12+)
+    os.makedirs(output_dir, exist_ok=True)
+    zip_dir = output_dir / "zips"
+    os.makedirs(zip_dir, exist_ok=True)
 
     print("=" * 60)
     print("  FloorPlanCAD - Google Drive Download")
     print("  Source: https://floorplancad.github.io/")
+    print(f"  Output : {output_dir.resolve()}")
     print("  Total: ~15,663 CAD drawings with annotations")
     print("=" * 60)
 
@@ -116,7 +121,7 @@ def main() -> None:
                 continue
 
         # Extract
-        extract_to = OUTPUT_DIR / file_info["name"].replace(".zip", "")
+        extract_to = output_dir / file_info["name"].replace(".zip", "")
         if extract_to.exists() and any(extract_to.iterdir()):
             print(f"  Already extracted to: {extract_to} - skipping")
         else:
@@ -126,19 +131,30 @@ def main() -> None:
     # Summary
     print(f"\n{'=' * 60}")
     print("  DONE! Dataset structure:")
-    for d in sorted(OUTPUT_DIR.iterdir()):
+    for d in sorted(output_dir.iterdir()):
         if d.is_dir() and d.name != "zips":
             n_files = sum(1 for _ in d.rglob("*") if _.is_file())
             print(f"  {d.name}/  ({n_files} files)")
     print(f"{'=' * 60}")
-    print(f"\n  Full path: {OUTPUT_DIR.resolve()}")
+    print(f"\n  Full path: {output_dir.resolve()}")
 
 
 if __name__ == "__main__":
+    import argparse
+
     try:
         import gdown  # noqa: F401
     except ImportError:
         print("[ERROR] Run: pip install gdown")
         raise
 
-    main()
+    parser = argparse.ArgumentParser(description="Download FloorPlanCAD from Google Drive")
+    parser.add_argument(
+        "--output_dir",
+        default=os.environ.get("OUTPUT_DIR", "./data/FloorPlanCAD_original"),
+        help="Directory to save downloaded data (default: ./data/FloorPlanCAD_original)",
+    )
+    args = parser.parse_args()
+
+    main(output_dir=Path(args.output_dir))
+
