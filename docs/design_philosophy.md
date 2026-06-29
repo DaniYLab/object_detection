@@ -70,6 +70,7 @@ Do đó, input duy nhất hợp lệ cho model là: **Ảnh gốc + Text**.
                     ┌─────────────┐
                     │ CenterNet   │  center_heatmap [1, H, W]
                     │   Head      │  size_map       [2, H, W]
+                    │             │  offset_map     [2, H, W]
                     └─────────────┘
 ```
 

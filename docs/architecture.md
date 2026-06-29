@@ -17,9 +17,10 @@ Image [B, 3, 512, 512]
   ├──► Route by class_id ──► class_blocks[cid] ──► x [B, 4096, D]
   │    (35 separate Mamba+Attention stacks)
   │
-  └──► HeatmapHead ──► [B, 3, 64, 64]
+  └──► HeatmapHead ──► [B, 5, 64, 64]
          ├── channel 0: sigmoid → center_heatmap [B, 1, 64, 64]
-         └── channel 1-2: ReLU  → size_map       [B, 2, 64, 64]
+         ├── channel 1-2: ReLU  → size_map       [B, 2, 64, 64]
+         └── channel 3-4: sigmoid → offset_map   [B, 2, 64, 64]
 ```
 
 ## Các Module
@@ -49,9 +50,10 @@ Image [B, 3, 512, 512]
 
 ### 5. HeatmapHead (`detector.py`)
 - **Vai trò:** Chuyển feature map thành CenterNet output
-- **Output:** 3 channels:
+- **Output:** 5 channels:
   - Channel 0: Center heatmap (Gaussian peaks tại tâm vật thể)
-  - Channel 1-2: Size map (width, height tại tâm)
+  - Channel 1-2: Size map (width, height tại tâm, theo output-grid units)
+  - Channel 3-4: Offset map (fractional dx, dy trong cell output)
 
 ## Thông Số Mô Hình
 
@@ -78,4 +80,5 @@ Image [B, 3, 512, 512]
 | Loss | Áp dụng cho | Mô tả |
 |------|-------------|-------|
 | Penalty-reduced Focal Loss | `center_heatmap` | Phạt nặng khi đoán sai tâm, giảm nhẹ tại vùng lân cận Gaussian |
-| Masked L1 Loss | `size_map` | Chỉ tính loss kích thước tại đúng pixel tâm (dùng `mask_map`) |
+| Masked Smooth L1 Loss | `size_map` | Chỉ tính loss kích thước tại đúng pixel tâm (dùng `mask_map`) |
+| Masked Smooth L1 Loss | `offset_map` | Học offset fractional `(dx, dy)` để sửa lỗi lượng tử hoá stride 8 |

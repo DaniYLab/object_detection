@@ -4,11 +4,13 @@ FloorPlanCAD Detection Model — Conditioned Reflex Architecture.
 Pipeline:
   1. Image  → VAE Encoder    → latent [B, 16, H/8, W/8] → img_tokens [B, h*w, D]
   2. 35 fixed texts → Text Encoder → txt_tokens [35, L, D]
-  3. Per-class: EarlyFusion(image, text[c]) → class_blocks[c] → heatmap[c]
-  4. CenterNet Head → center_heatmap + size_map
+  3. Per-class: EarlyFusion(image, text[c]) → class_blocks[c] → features[c]
+  4. CenterNet Head → center_heatmap + size_map + offset_map
 """
 
 from __future__ import annotations
+
+import hashlib
 
 import torch
 import torch.nn as nn
@@ -99,16 +101,29 @@ class TextEncoderStub(nn.Module):
 
 class EarlyFusion(nn.Module):
     """
-    Cross-attention: text tokens as query, image tokens as key/value.
-    Output: enriched image tokens [B, img_len, D].
+    Text-conditioned image fusion.
+
+    Modes:
+      - current: text queries image, mean-pooled text-aware vector is broadcast.
+      - film: text summary predicts channel-wise scale/shift for image tokens.
+      - film_cross_attn: FiLM + image tokens query text tokens.
     """
 
-    def __init__(self, dim: int, num_heads: int = 8) -> None:
+    def __init__(self, dim: int, num_heads: int = 8, mode: str = "film") -> None:
         super().__init__()
+        if mode not in {"current", "film", "film_cross_attn"}:
+            raise ValueError(f"Unknown fusion mode: {mode}")
+        self.mode = mode
         self.norm_img = nn.LayerNorm(dim)
         self.norm_txt = nn.LayerNorm(dim)
         self.cross_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
         self.proj = nn.Linear(dim, dim)
+        self.film = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.SiLU(),
+            nn.Linear(dim * 2, dim * 2),
+        )
+        self.out_norm = nn.LayerNorm(dim)
 
     def forward(
         self,
@@ -117,11 +132,23 @@ class EarlyFusion(nn.Module):
     ) -> torch.Tensor:
         img = self.norm_img(img_tokens)
         txt = self.norm_txt(txt_tokens)
-        # Query=text, Key/Value=image → text attends to image
-        fused, _ = self.cross_attn(query=txt, key=img, value=img)
-        # Project back to image space via mean pooling text output + residual
-        fused_mean = fused.mean(dim=1, keepdim=True).expand_as(img_tokens)
-        return img_tokens + self.proj(fused_mean)
+
+        if self.mode == "current":
+            # Query=text, Key/Value=image → global text-aware image summary.
+            fused, _ = self.cross_attn(query=txt, key=img, value=img)
+            fused_mean = fused.mean(dim=1, keepdim=True).expand_as(img_tokens)
+            return img_tokens + self.proj(fused_mean)
+
+        txt_summary = txt.mean(dim=1)  # [B, D]
+        gamma, beta = self.film(txt_summary).chunk(2, dim=-1)
+        x = img_tokens * (1 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+
+        if self.mode == "film_cross_attn":
+            # Query=image, Key/Value=text → every spatial token asks the prompt.
+            attn_out, _ = self.cross_attn(query=self.norm_img(x), key=txt, value=txt)
+            x = x + self.proj(attn_out)
+
+        return self.out_norm(x)
 
 
 # ── Heatmap Prediction Head ───────────────────────────────────────────────────
@@ -133,7 +160,7 @@ class HeatmapHead(nn.Module):
     Output: [B, num_classes, H_out, W_out]
     """
 
-    def __init__(self, in_dim: int, out_channels: int = 3) -> None:
+    def __init__(self, in_dim: int, out_channels: int = 5) -> None:
         super().__init__()
         self.head = nn.Sequential(
             nn.Conv2d(in_dim, 256, 3, padding=1),
@@ -157,10 +184,13 @@ CLASS_TEXTS = [TEXT_TEMPLATE.format(cls=name) for name in CLASS_NAMES]
 
 
 def _tokenize_fixed(texts: list[str], max_len: int = 32, vocab_size: int = 32000) -> torch.Tensor:
-    """Hash-based tokenizer for fixed class texts. Deterministic."""
+    """Stable hash-based tokenizer for fixed class texts."""
     tokens = []
     for text in texts:
-        ids = [hash(word) % (vocab_size - 1) + 1 for word in text.lower().split()]
+        ids = []
+        for word in text.lower().split():
+            digest = hashlib.md5(word.encode("utf-8")).hexdigest()
+            ids.append(int(digest, 16) % (vocab_size - 1) + 1)
         ids = ids[:max_len] + [0] * max(0, max_len - len(ids))
         tokens.append(ids)
     return torch.tensor(tokens, dtype=torch.long)
@@ -177,7 +207,7 @@ class FloorPlanDetector(nn.Module):
       1. Image → VAE Encoder → image tokens (encode 1 lần)
       2. 35 texts → Text Encoder → 35 text token sets
       3. Mỗi class: EarlyFusion(image, text[c]) → class_blocks[c] → heatmap[c]
-      4. Output: 35 × (center_heatmap + size_map)
+      4. Output: 35 × (center_heatmap + size_map + offset_map)
 
     Training: class_ids chọn class nào tính loss.
     Inference: lấy hết 35 outputs.
@@ -191,6 +221,7 @@ class FloorPlanDetector(nn.Module):
         depth_per_class: int = 2,
         num_heads: int = 8,
         dropout: float = 0.1,
+        fusion_mode: str = "film",
         vae_cfg: VAEConfig | None = None,
         text_cfg: TextEncoderConfig | None = None,
     ) -> None:
@@ -200,6 +231,7 @@ class FloorPlanDetector(nn.Module):
         self.model_dim = model_dim
         self.num_classes = num_classes
         self.depth_per_class = depth_per_class
+        self.fusion_mode = fusion_mode
 
         vae_cfg = vae_cfg or VAEConfig()
         text_cfg = text_cfg or TextEncoderConfig()
@@ -210,6 +242,10 @@ class FloorPlanDetector(nn.Module):
 
         # Project VAE latent → model_dim
         self.img_proj = nn.Linear(vae_cfg.latent_channels, model_dim)
+        self.image_pos_embed = nn.Parameter(
+            torch.zeros(1, self.latent_size * self.latent_size, model_dim)
+        )
+        nn.init.trunc_normal_(self.image_pos_embed, std=0.02)
 
         # ── Fixed class text tokens (registered as buffer, not parameter) ────
         # 35 tokenized texts, one per class — part of the model, not input
@@ -221,7 +257,7 @@ class FloorPlanDetector(nn.Module):
         # ── Per-class Early Fusion ────────────────────────────────────────────
         # Each class has its own fusion layer (text differs per class)
         self.early_fusions = nn.ModuleList([
-            EarlyFusion(model_dim, num_heads)
+            EarlyFusion(model_dim, num_heads, mode=fusion_mode)
             for _ in range(num_classes)
         ])
 
@@ -236,14 +272,25 @@ class FloorPlanDetector(nn.Module):
 
         # ── Spatial reshape + CenterNet Head ──────────────────────────────────
         self.out_norm = nn.LayerNorm(model_dim)
-        self.heatmap_head = HeatmapHead(model_dim, out_channels=3)
+        self.heatmap_head = HeatmapHead(model_dim, out_channels=5)
 
     def encode_image(self, image: torch.Tensor) -> tuple[torch.Tensor, int, int]:
         """image [B,3,H,W] → tokens [B, h*w, D]"""
         lat = self.vae_encoder(image)               # [B, C, h, w]
         B, C, h, w = lat.shape
         lat = lat.flatten(2).transpose(1, 2)        # [B, h*w, C]
-        return self.img_proj(lat), h, w             # [B, h*w, D], h, w
+        tokens = self.img_proj(lat)                 # [B, h*w, D]
+
+        if h == self.latent_size and w == self.latent_size:
+            pos = self.image_pos_embed
+        else:
+            pos = self.image_pos_embed.transpose(1, 2).reshape(
+                1, self.model_dim, self.latent_size, self.latent_size
+            )
+            pos = F.interpolate(pos, size=(h, w), mode="bilinear", align_corners=False)
+            pos = pos.flatten(2).transpose(1, 2)
+
+        return tokens + pos, h, w
 
     def _process_class(
         self,
@@ -275,6 +322,7 @@ class FloorPlanDetector(nn.Module):
         return {
             "center_heatmap": torch.sigmoid(out[:, 0:1, :, :]),
             "size_map": F.relu(out[:, 1:3, :, :]),
+            "offset_map": torch.sigmoid(out[:, 3:5, :, :]),
         }
 
     def forward(
@@ -285,37 +333,41 @@ class FloorPlanDetector(nn.Module):
         """
         Training (class_ids provided):
             Chỉ chạy block của class được chỉ định cho mỗi sample.
-            Returns: center_heatmap [B,1,h,w], size_map [B,2,h,w]
+            Returns: center_heatmap [B,1,h,w], size_map [B,2,h,w], offset_map [B,2,h,w]
 
         Inference (class_ids=None):
             Chạy tất cả 35 blocks.
-            Returns: center_heatmap [B,35,h,w], size_map [B,35*2,h,w]
+            Returns: center_heatmap [B,35,h,w], size_map [B,35*2,h,w], offset_map [B,35*2,h,w]
         """
         B = image.shape[0]
         img_tokens, h, w = self.encode_image(image)  # encode 1 lần
 
         if class_ids is not None:
             # ── Training mode: mỗi sample chạy qua block tương ứng ────────
-            hm_list, sz_list = [], []
+            hm_list, sz_list, off_list = [], [], []
             for i in range(B):
                 cid = class_ids[i].item()
                 result = self._process_class(cid, img_tokens[i:i+1], h, w)
                 hm_list.append(result["center_heatmap"])
                 sz_list.append(result["size_map"])
+                off_list.append(result["offset_map"])
             return {
                 "center_heatmap": torch.cat(hm_list, dim=0),  # [B, 1, h, w]
                 "size_map": torch.cat(sz_list, dim=0),          # [B, 2, h, w]
+                "offset_map": torch.cat(off_list, dim=0),       # [B, 2, h, w]
             }
         else:
             # ── Inference mode: chạy tất cả 35 blocks ─────────────────────
-            all_hm, all_sz = [], []
+            all_hm, all_sz, all_off = [], [], []
             for cid in range(self.num_classes):
                 result = self._process_class(cid, img_tokens, h, w)
                 all_hm.append(result["center_heatmap"])   # [B, 1, h, w]
                 all_sz.append(result["size_map"])          # [B, 2, h, w]
+                all_off.append(result["offset_map"])       # [B, 2, h, w]
             return {
                 "center_heatmap": torch.cat(all_hm, dim=1),  # [B, 35, h, w]
                 "size_map": torch.cat(all_sz, dim=1),         # [B, 70, h, w]
+                "offset_map": torch.cat(all_off, dim=1),      # [B, 70, h, w]
             }
 
 
@@ -335,11 +387,13 @@ if __name__ == "__main__":
     print(f"\n[Training] class_id=4 (chair)")
     print(f"  center_heatmap: {out['center_heatmap'].shape}")  # [1, 1, 64, 64]
     print(f"  size_map      : {out['size_map'].shape}")        # [1, 2, 64, 64]
+    print(f"  offset_map    : {out['offset_map'].shape}")      # [1, 2, 64, 64]
 
     # Inference mode: all 35 classes
     out = model(image)
     print(f"\n[Inference] all classes")
     print(f"  center_heatmap: {out['center_heatmap'].shape}")  # [1, 35, 64, 64]
     print(f"  size_map      : {out['size_map'].shape}")        # [1, 70, 64, 64]
+    print(f"  offset_map    : {out['offset_map'].shape}")      # [1, 70, 64, 64]
 
 

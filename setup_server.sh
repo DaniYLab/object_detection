@@ -80,7 +80,10 @@ import sys; sys.path.insert(0, '.')
 from src.data.dataset import FloorPlanDataset, NUM_CLASSES
 train_ds = FloorPlanDataset('./data/FloorPlanCAD_original', split='train')
 val_ds   = FloorPlanDataset('./data/FloorPlanCAD_original', split='test')
+s = train_ds[0]
 print(f'  Train: {len(train_ds):,} | Val: {len(val_ds):,} | Classes: {NUM_CLASSES}')
+print(f'  Target: heatmap={tuple(s["center_heatmap"].shape)}, size={tuple(s["size_map"].shape)}, offset={tuple(s["offset_map"].shape)}')
+print(f'  Centers: {int(s["mask_map"].sum().item())}')
 EOF
 
 echo ""

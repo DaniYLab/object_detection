@@ -21,8 +21,10 @@
 |---|---|---|---|
 | **Training** | `center_heatmap` | `[B, 1, 64, 64]` | Heatmap cho class được chọn |
 | | `size_map` | `[B, 2, 64, 64]` | Kích thước (w, h) cho class được chọn |
+| | `offset_map` | `[B, 2, 64, 64]` | Offset fractional `(dx, dy)` tại center cell |
 | **Inference** | `center_heatmap` | `[B, 35, 64, 64]` | Heatmap cho tất cả 35 classes |
 | | `size_map` | `[B, 70, 64, 64]` | Kích thước cho tất cả 35 classes |
+| | `offset_map` | `[B, 70, 64, 64]` | Offset cho tất cả 35 classes |
 
 > 35 class texts là **built-in** (buffer trong model), không phải input bên ngoài.
 

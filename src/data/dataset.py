@@ -21,6 +21,8 @@ Data layout:
 from __future__ import annotations
 
 import json
+import math
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -31,7 +33,7 @@ from torchvision import transforms
 
 # ── Class mapping (from shared constants) ─────────────────────────────────────
 from src.data.constants import (
-    CLASS_NAMES, CLASS_TO_IDX, NUM_CLASSES, TEXT_TEMPLATE, SEMANTIC_ID_TO_NAME,
+    CLASS_NAMES, CLASS_TO_IDX, NUM_CLASSES, TEXT_TEMPLATE,
 )
 
 # Split → source subfolders mapping
@@ -49,21 +51,54 @@ def _default_transform(image_size: int = 512) -> transforms.Compose:
     ])
 
 
+def _draw_gaussian(
+    heatmap: torch.Tensor,
+    cx: int,
+    cy: int,
+    radius: int,
+) -> None:
+    """Draw an in-place 2D Gaussian with exact peak 1.0 at (cx, cy)."""
+    radius = max(0, int(radius))
+    if radius == 0:
+        heatmap[cy, cx] = 1.0
+        return
+
+    vec = torch.arange(-radius, radius + 1, dtype=torch.float32)
+    gy, gx = torch.meshgrid(vec, vec, indexing="ij")
+    sigma = max(radius / 3.0, 0.5)
+    gaussian = torch.exp(-(gx**2 + gy**2) / (2 * sigma**2))
+    gaussian[radius, radius] = 1.0
+
+    height, width = heatmap.shape
+    left = min(cx, radius)
+    right = min(width - cx, radius + 1)
+    top = min(cy, radius)
+    bottom = min(height - cy, radius + 1)
+
+    heatmap[cy - top : cy + bottom, cx - left : cx + right] = torch.maximum(
+        heatmap[cy - top : cy + bottom, cx - left : cx + right],
+        gaussian[radius - top : radius + bottom, radius - left : radius + right],
+    )
+
+
 class FloorPlanDataset(Dataset):
     """
     FloorPlanCAD dataset — text-conditioned, per-class expanded.
 
     Reads directly from original flat folder (no image copying).
     Each (image, class) pair is a separate sample.
-    Every epoch trains ALL classes of ALL images.
+    Every epoch trains all present classes of all images.
 
     Each sample returns:
-      image          : Tensor [3, H, W]
-      center_heatmap : Tensor [1, H, W]  — Gaussian peaks for THIS class only
-      size_map       : Tensor [2, H, W]  — (w, h) at object centers
-      mask_map       : Tensor [1, H, W]  — 1 at centers, 0 elsewhere
-      text           : str               — "Find {class} in this floor plan drawing"
-      class_id       : int               — class index
+      image          : Tensor [3, image_size, image_size]
+      center_heatmap : Tensor [1, image_size/stride, image_size/stride]
+      size_map       : Tensor [2, image_size/stride, image_size/stride]
+                       (w, h) in output-grid units at object centers
+      offset_map     : Tensor [2, image_size/stride, image_size/stride]
+                       fractional center offset (dx, dy) in [0, 1)
+      mask_map       : Tensor [1, image_size/stride, image_size/stride]
+      text           : str — "Find {class} in this floor plan drawing"
+      class_id       : int — alphabetic class index
     """
 
     def __init__(
@@ -71,18 +106,29 @@ class FloorPlanDataset(Dataset):
         root: str | Path,
         split: str = "train",
         image_size: int = 512,
+        output_stride: int = 8,
         transform: Optional[transforms.Compose] = None,
     ) -> None:
         self.root = Path(root)
+        self.split = split
         self.image_size = image_size
+        self.output_stride = output_stride
+        self.output_size = image_size // output_stride
         self.transform = transform or _default_transform(image_size)
+
+        if image_size % output_stride != 0:
+            raise ValueError(
+                f"image_size ({image_size}) must be divisible by output_stride ({output_stride})"
+            )
 
         src_dirs = SPLIT_DIRS.get(split)
         if src_dirs is None:
             raise ValueError(f"Unknown split '{split}'. Expected: {list(SPLIT_DIRS)}")
 
-        # ── Build expanded index: (png_path, meta_path, class_name) ──────────
+        # Build expanded index: (png_path, meta_path, class_name)
         self.index: list[tuple[Path, Path, str]] = []
+        self.sample_class_ids: list[int] = []
+        class_counter: Counter[int] = Counter()
 
         for src_dir_name in src_dirs:
             src_dir = self.root / src_dir_name
@@ -104,7 +150,12 @@ class FloorPlanDataset(Dataset):
                         classes_in_sample.add(cls_name)
 
                 for cls_name in sorted(classes_in_sample):
+                    class_id = CLASS_TO_IDX[cls_name]
                     self.index.append((png_path, meta_path, cls_name))
+                    self.sample_class_ids.append(class_id)
+                    class_counter[class_id] += 1
+
+        self.class_counts = dict(class_counter)
 
         if not self.index:
             raise RuntimeError(
@@ -116,18 +167,31 @@ class FloorPlanDataset(Dataset):
     def __len__(self) -> int:
         return len(self.index)
 
+    def get_sample_weights(self, balance_power: float = 0.5) -> torch.Tensor:
+        """Return per-sample weights for inverse-frequency class-balanced sampling."""
+        weights = []
+        for class_id in self.sample_class_ids:
+            count = max(1, self.class_counts.get(class_id, 1))
+            weights.append(count ** (-balance_power))
+        return torch.tensor(weights, dtype=torch.double)
+
     def __getitem__(self, idx: int) -> dict:
         png_path, meta_path, target_class = self.index[idx]
 
-        # ── Load original image ────────────────────────────────────────────────
+        # Load original image
         img = Image.open(png_path).convert("RGB")
         img_w, img_h = img.size
         image_tensor = self.transform(img)
 
-        # ── Build CenterNet targets for target_class only ──────────────────────
-        center_heatmap = torch.zeros(1, self.image_size, self.image_size)
-        size_map = torch.zeros(2, self.image_size, self.image_size)
-        mask_map = torch.zeros(1, self.image_size, self.image_size)
+        out_h = out_w = self.output_size
+
+        # Build CenterNet targets for target_class only at output resolution
+        center_heatmap = torch.zeros(1, out_h, out_w)
+        size_map = torch.zeros(2, out_h, out_w)
+        offset_map = torch.zeros(2, out_h, out_w)
+        mask_map = torch.zeros(1, out_h, out_w)
+        area_map = torch.zeros(out_h, out_w)
+        boxes: list[list[float]] = []
 
         with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f)
@@ -135,6 +199,8 @@ class FloorPlanDataset(Dataset):
         orig_w, orig_h = meta.get("image_size", [img_w, img_h])
         sx = self.image_size / orig_w
         sy = self.image_size / orig_h
+        ox = out_w / self.image_size
+        oy = out_h / self.image_size
 
         for inst in meta.get("instances", []):
             if inst.get("class", "") != target_class:
@@ -142,45 +208,61 @@ class FloorPlanDataset(Dataset):
 
             x0, y0, x1, y1 = inst["bbox_px"]
 
-            hx0 = max(0, min(self.image_size - 1, x0 * sx))
-            hy0 = max(0, min(self.image_size - 1, y0 * sy))
-            hx1 = max(0, min(self.image_size - 1, x1 * sx))
-            hy1 = max(0, min(self.image_size - 1, y1 * sy))
+            # Original metadata pixels → resized input pixels
+            ix0 = max(0.0, min(float(self.image_size - 1), x0 * sx))
+            iy0 = max(0.0, min(float(self.image_size - 1), y0 * sy))
+            ix1 = max(0.0, min(float(self.image_size - 1), x1 * sx))
+            iy1 = max(0.0, min(float(self.image_size - 1), y1 * sy))
 
-            h, w = hy1 - hy0, hx1 - hx0
-            if h > 0 and w > 0:
-                cx = int(hx0 + w / 2)
-                cy = int(hy0 + h / 2)
+            in_w = ix1 - ix0
+            in_h = iy1 - iy0
+            if in_w <= 0 or in_h <= 0:
+                continue
 
-                if 0 <= cx < self.image_size and 0 <= cy < self.image_size:
-                    radius = max(1, int(min(h, w) / 6))
-                    vec = torch.arange(-radius, radius + 1, dtype=torch.float32)
-                    gy, gx = torch.meshgrid(vec, vec, indexing='ij')
-                    sigma = max(radius / 3.0, 0.5)
-                    gaussian = torch.exp(-(gx**2 + gy**2) / (2 * sigma**2))
+            # Resized input pixels → output grid units
+            ox0 = ix0 * ox
+            oy0 = iy0 * oy
+            ox1 = ix1 * ox
+            oy1 = iy1 * oy
+            w = ox1 - ox0
+            h = oy1 - oy0
+            if w <= 0 or h <= 0:
+                continue
 
-                    left = min(cx, radius)
-                    right = min(self.image_size - cx, radius + 1)
-                    top = min(cy, radius)
-                    bottom = min(self.image_size - cy, radius + 1)
+            cx_f = (ox0 + ox1) / 2.0
+            cy_f = (oy0 + oy1) / 2.0
+            cx = int(math.floor(cx_f))
+            cy = int(math.floor(cy_f))
 
-                    center_heatmap[0, cy - top : cy + bottom, cx - left : cx + right] = torch.maximum(
-                        center_heatmap[0, cy - top : cy + bottom, cx - left : cx + right],
-                        gaussian[radius - top : radius + bottom, radius - left : radius + right]
-                    )
+            if not (0 <= cx < out_w and 0 <= cy < out_h):
+                continue
 
-                    size_map[0, cy, cx] = w
-                    size_map[1, cy, cx] = h
-                    mask_map[0, cy, cx] = 1.0
+            radius = max(1, int(min(w, h) / 2.5))
+            _draw_gaussian(center_heatmap[0], cx, cy, radius)
+
+            area = float(w * h)
+            # If multiple centers collide in one cell, keep the larger instance for size/offset.
+            if mask_map[0, cy, cx] == 0 or area >= area_map[cy, cx]:
+                size_map[0, cy, cx] = float(w)
+                size_map[1, cy, cx] = float(h)
+                offset_map[0, cy, cx] = float(cx_f - cx)
+                offset_map[1, cy, cx] = float(cy_f - cy)
+                mask_map[0, cy, cx] = 1.0
+                area_map[cy, cx] = area
+
+            boxes.append([ix0, iy0, ix1, iy1])
 
         return {
-            "image": image_tensor,              # [3, H, W]
-            "center_heatmap": center_heatmap,   # [1, H, W]
-            "size_map": size_map,               # [2, H, W]
-            "mask_map": mask_map,               # [1, H, W]
+            "image": image_tensor,
+            "center_heatmap": center_heatmap,
+            "size_map": size_map,
+            "offset_map": offset_map,
+            "mask_map": mask_map,
             "text": TEXT_TEMPLATE.format(cls=target_class),
             "class_id": CLASS_TO_IDX[target_class],
+            "class_name": target_class,
             "sample_id": png_path.stem,
+            "boxes": torch.tensor(boxes, dtype=torch.float32),  # resized input-space boxes
         }
 
 
@@ -190,10 +272,13 @@ def collate_fn(batch: list[dict]) -> dict:
         "image": torch.stack([b["image"] for b in batch]),
         "center_heatmap": torch.stack([b["center_heatmap"] for b in batch]),
         "size_map": torch.stack([b["size_map"] for b in batch]),
+        "offset_map": torch.stack([b["offset_map"] for b in batch]),
         "mask_map": torch.stack([b["mask_map"] for b in batch]),
         "texts": [b["text"] for b in batch],
         "class_ids": [b["class_id"] for b in batch],
+        "class_names": [b["class_name"] for b in batch],
         "sample_ids": [b["sample_id"] for b in batch],
+        "boxes": [b["boxes"] for b in batch],
     }
 
 
@@ -202,10 +287,22 @@ if __name__ == "__main__":
         root="./data/FloorPlanCAD_original",
         split="train",
         image_size=512,
+        output_stride=8,
     )
     print(f"Dataset size: {len(ds)}  (expanded: each image×class = 1 entry)")
+    print(f"Target size : {ds.output_size}×{ds.output_size}")
+    print(f"Class counts: min={min(ds.class_counts.values())}, max={max(ds.class_counts.values())}")
 
     for i in [0, 1, 2, len(ds) // 2]:
         sample = ds[i]
-        n_centers = sample['mask_map'].sum().int().item()
-        print(f"  [{i}] {sample['sample_id']} | {sample['text']} | centers={n_centers}")
+        n_centers = sample["mask_map"].sum().int().item()
+        off_ok = True
+        if n_centers > 0:
+            mask = sample["mask_map"].expand_as(sample["offset_map"]) > 0
+            offsets = sample["offset_map"][mask]
+            off_ok = bool(((offsets >= 0) & (offsets < 1)).all().item())
+        print(
+            f"  [{i}] {sample['sample_id']} | {sample['text']} | "
+            f"centers={n_centers} | heatmap={tuple(sample['center_heatmap'].shape)} | "
+            f"offset_ok={off_ok}"
+        )

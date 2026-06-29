@@ -53,7 +53,7 @@
 
 ## Phase 5: Training & Evaluation (TODO)
 - [ ] Setup training trên server (GPU)
-- [ ] Train baseline: 50 epochs, lr=1e-4
+- [ ] Train baseline: 50 epochs, lr=1e-5, focal_weight=10.0, warmup=500 steps
 - [ ] Implement inference script: text query → bounding boxes trên ảnh mới
 - [ ] Visualize predictions vs ground truth
 - [ ] Thay stub encoders bằng pretrained (Flux VAE, T5)

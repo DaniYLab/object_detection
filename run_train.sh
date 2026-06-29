@@ -19,7 +19,15 @@ BATCH_SIZE=4        # Auto-adjusted by VRAM below; safe default if nvidia-smi fa
 MODEL_DIM=512
 DEPTH_PER_CLASS=2
 EPOCHS=50
-LR=1e-4
+LR=1e-5
+FOCAL_WEIGHT=10.0
+SIZE_WEIGHT=1.0
+OFFSET_WEIGHT=1.0
+WARMUP_STEPS=500
+GRAD_CLIP=1.0
+SAMPLER="balanced"
+BALANCE_POWER=0.5
+FUSION_MODE="film"
 NUM_WORKERS=4
 LOG_INTERVAL=50
 
@@ -54,6 +62,14 @@ CMD="python train.py \
     --depth_per_class $DEPTH_PER_CLASS \
     --epochs       $EPOCHS \
     --lr           $LR \
+    --focal_weight $FOCAL_WEIGHT \
+    --size_weight  $SIZE_WEIGHT \
+    --offset_weight $OFFSET_WEIGHT \
+    --warmup_steps $WARMUP_STEPS \
+    --grad_clip    $GRAD_CLIP \
+    --sampler      $SAMPLER \
+    --balance_power $BALANCE_POWER \
+    --fusion_mode  $FUSION_MODE \
     --log_interval $LOG_INTERVAL \
     2>&1 | tee $LOG_FILE"
 
