@@ -15,6 +15,7 @@ SESSION="floorplan_train"
 
 # GPU config — tự chỉnh theo server
 IMAGE_SIZE=512
+OUTPUT_STRIDE=8     # target_size = IMAGE_SIZE / OUTPUT_STRIDE (e.g. 512/8 = 64)
 BATCH_SIZE=4        # Auto-adjusted by VRAM below; safe default if nvidia-smi fails
 MODEL_DIM=512
 DEPTH_PER_CLASS=2
@@ -56,6 +57,7 @@ CMD="python train.py \
     --data_root    $DATA_ROOT \
     --ckpt_dir     $CKPT_DIR \
     --image_size   $IMAGE_SIZE \
+    --output_stride $OUTPUT_STRIDE \
     --batch_size   $BATCH_SIZE \
     --num_workers  $NUM_WORKERS \
     --model_dim    $MODEL_DIM \
