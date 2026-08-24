@@ -1,190 +1,149 @@
-"""
-FloorPlanCAD Detection Model — Conditioned Reflex Architecture.
-
-Pipeline:
-  1. Image  → VAE Encoder    → latent [B, 16, H/8, W/8] → img_tokens [B, h*w, D]
-  2. 35 fixed texts → Text Encoder → txt_tokens [35, L, D]
-  3. Per-class: EarlyFusion(image, text[c]) → class_blocks[c] → features[c]
-  4. CenterNet Head → center_heatmap + size_map + offset_map
-"""
+"""Conditioned stride-8 floor-plan detector and reusable CenterNet heads."""
 
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .blocks.object_learning_block import ObjectLearningBlock
-from .config import VAEConfig, TextEncoderConfig
+from .blocks import ObjectLearningBlock
+from .conditioning import ConditioningOutput, build_conditioner, masked_mean
+from .config import ConditionerConfig, ModelConfig, TextEncoderConfig, VAEConfig
+
+# Alphabetical FloorPlanCAD names mirror src.data.constants without importing the
+# data package (whose optional image dependencies should not be required by models).
+_PROJECT_CLASS_NAMES = [
+    "annotation_text",
+    "bathtub",
+    "bed",
+    "cabinet",
+    "chair",
+    "column",
+    "counter",
+    "dimension_line",
+    "door_double",
+    "door_revolving",
+    "door_single",
+    "door_sliding",
+    "elevator",
+    "escalator",
+    "escalator_stair",
+    "floor_plan_area",
+    "oven",
+    "parking",
+    "plant",
+    "ramp",
+    "refrigerator",
+    "room_label",
+    "shower",
+    "sink",
+    "sofa",
+    "stair",
+    "symbol_misc",
+    "table",
+    "toilet",
+    "tv",
+    "wall",
+    "washing_machine",
+    "window",
+    "window_bay",
+    "window_blind",
+]
+_PROJECT_TEXT_TEMPLATE = "Find {cls} in this floor plan drawing"
 
 
-# ── VAE Encoder ───────────────────────────────────────────────────────────────
-# Stub matches Flux VAE output: [B, 16, H/8, W/8]
-# Swap with: AutoencoderKL.from_pretrained("black-forest-labs/FLUX.2-klein-9B", subfolder="vae")
+def _default_class_texts(num_classes: int) -> list[str]:
+    names = list(_PROJECT_CLASS_NAMES[:num_classes])
+    names.extend(f"class_{index}" for index in range(len(names), num_classes))
+    return [_PROJECT_TEXT_TEMPLATE.format(cls=name) for name in names]
 
-class VAEEncoderStub(nn.Module):
-    """
-    Trainable VAE encoder stub — matches Flux VAE dimensions.
 
-    Config (from FLUX.2-klein):
-      block_out_channels: [128, 256, 512, 512]
-      latent_channels:    16
-      downsample:         8× (3 stride-2 stages)
-      act_fn:             silu
+CLASS_TEXTS = _default_class_texts(max(35, len(_PROJECT_CLASS_NAMES)))
 
-    Output: [B, 16, H/8, W/8]
-    """
+
+def _group_count(channels: int, max_groups: int = 32) -> int:
+    """Choose a GroupNorm count with at least two channels per group."""
+    upper = min(max_groups, max(1, channels // 2))
+    for groups in range(upper, 0, -1):
+        if channels % groups == 0:
+            return groups
+    return 1
+
+
+class ConvImageEncoder(nn.Module):
+    """Project-native convolutional image encoder with a fixed stride of eight."""
+
+    output_stride = 8
 
     def __init__(self, cfg: VAEConfig | None = None) -> None:
         super().__init__()
         cfg = cfg or VAEConfig()
-        ch = cfg.block_out_channels  # [128, 256, 512, 512]
+        if cfg.downsample_factor != self.output_stride:
+            raise ValueError("ConvImageEncoder supports downsample_factor=8 only")
+        layers: list[nn.Module] = []
+        in_channels = cfg.in_channels
+        for index, out_channels in enumerate(cfg.block_out_channels):
+            layers.extend(
+                [
+                    nn.Conv2d(
+                        in_channels,
+                        out_channels,
+                        kernel_size=3,
+                        stride=2 if index < 3 else 1,
+                        padding=1,
+                        bias=False,
+                    ),
+                    nn.GroupNorm(_group_count(out_channels, cfg.norm_num_groups), out_channels),
+                    nn.SiLU(),
+                ]
+            )
+            in_channels = out_channels
+        layers.append(nn.Conv2d(in_channels, cfg.latent_channels, kernel_size=1))
+        self.encoder = nn.Sequential(*layers)
+        self.config = cfg
 
-        self.encoder = nn.Sequential(
-            # Stage 1: 3 → 128, /2
-            nn.Conv2d(cfg.in_channels, ch[0], 3, stride=2, padding=1),
-            nn.SiLU(),
-            # Stage 2: 128 → 256, /4
-            nn.Conv2d(ch[0], ch[1], 3, stride=2, padding=1),
-            nn.SiLU(),
-            # Stage 3: 256 → 512, /8
-            nn.Conv2d(ch[1], ch[2], 3, stride=2, padding=1),
-            nn.SiLU(),
-            # Stage 4: 512 → 512 (no stride, matches Flux 4th block)
-            nn.Conv2d(ch[2], ch[3], 3, padding=1),
-            nn.SiLU(),
-            # Project → latent channels
-            nn.Conv2d(ch[3], cfg.latent_channels, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encoder(x)  # [B, 16, H/8, W/8]
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        return self.encoder(image)
 
 
-# ── Text Encoder ──────────────────────────────────────────────────────────────
-# Stub matches T5-v1.1-XXL output: [B, L, 4096] → projected to model_dim
-# Swap with: T5EncoderModel.from_pretrained("google/t5-v1_1-xxl")
+# Historical name retained for compatibility; the implementation is explicitly
+# a convolutional encoder and does not claim to be a pretrained VAE.
+VAEEncoderStub = ConvImageEncoder
+
 
 class TextEncoderStub(nn.Module):
-    """
-    Trainable text encoder stub — matches T5-v1.1-XXL dimensions.
+    """Compatibility token-ID encoder without the former multi-gigabyte stub."""
 
-    Config (from google/t5-v1_1-xxl):
-      vocab_size: 32128
-      d_model:    4096
-      num_heads:  64
-      num_layers: 24
-
-    Stub: Embedding + Positional + LayerNorm → project 4096 → model_dim.
-    """
-
-    def __init__(self, cfg: TextEncoderConfig | None = None, model_dim: int = 512) -> None:
+    def __init__(self, cfg: TextEncoderConfig | None = None, model_dim: int = 256) -> None:
         super().__init__()
         cfg = cfg or TextEncoderConfig()
-
-        self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model, padding_idx=0)
-        self.pos = nn.Embedding(cfg.max_length, cfg.d_model)
-        self.norm = nn.LayerNorm(cfg.d_model)
-        self.proj = nn.Linear(cfg.d_model, model_dim, bias=False)
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        B, L = input_ids.shape
-        pos = torch.arange(L, device=input_ids.device).unsqueeze(0)
-        x = self.embed(input_ids) + self.pos(pos)
-        x = self.norm(x)              # [B, L, 4096]
-        return self.proj(x)           # [B, L, model_dim]
-
-
-# ── Early Fusion: Cross-Attention (text → image) ──────────────────────────────
-
-class EarlyFusion(nn.Module):
-    """
-    Text-conditioned image fusion.
-
-    Modes:
-      - current: text queries image, mean-pooled text-aware vector is broadcast.
-      - film: text summary predicts channel-wise scale/shift for image tokens.
-      - film_cross_attn: FiLM + image tokens query text tokens.
-    """
-
-    def __init__(self, dim: int, num_heads: int = 8, mode: str = "film") -> None:
-        super().__init__()
-        if mode not in {"current", "film", "film_cross_attn"}:
-            raise ValueError(f"Unknown fusion mode: {mode}")
-        self.mode = mode
-        self.norm_img = nn.LayerNorm(dim)
-        self.norm_txt = nn.LayerNorm(dim)
-        self.cross_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-        self.proj = nn.Linear(dim, dim)
-        self.film = nn.Sequential(
-            nn.Linear(dim, dim * 2),
-            nn.SiLU(),
-            nn.Linear(dim * 2, dim * 2),
-        )
-        self.out_norm = nn.LayerNorm(dim)
+        hidden_dim = cfg.embedding_dim
+        self.max_length = cfg.max_length
+        self.embedding = nn.Embedding(cfg.vocab_size, hidden_dim, padding_idx=0)
+        self.position = nn.Embedding(cfg.max_length, hidden_dim)
+        self.projection = nn.Linear(hidden_dim, model_dim)
+        self.norm = nn.LayerNorm(model_dim)
 
     def forward(
         self,
-        img_tokens: torch.Tensor,   # [B, img_len, D]
-        txt_tokens: torch.Tensor,   # [B, txt_len, D]
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        img = self.norm_img(img_tokens)
-        txt = self.norm_txt(txt_tokens)
-
-        if self.mode == "current":
-            # Query=text, Key/Value=image → global text-aware image summary.
-            fused, _ = self.cross_attn(query=txt, key=img, value=img)
-            fused_mean = fused.mean(dim=1, keepdim=True).expand_as(img_tokens)
-            return img_tokens + self.proj(fused_mean)
-
-        txt_summary = txt.mean(dim=1)  # [B, D]
-        gamma, beta = self.film(txt_summary).chunk(2, dim=-1)
-        x = img_tokens * (1 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
-
-        if self.mode == "film_cross_attn":
-            # Query=image, Key/Value=text → every spatial token asks the prompt.
-            attn_out, _ = self.cross_attn(query=self.norm_img(x), key=txt, value=txt)
-            x = x + self.proj(attn_out)
-
-        return self.out_norm(x)
-
-
-# ── Heatmap Prediction Head ───────────────────────────────────────────────────
-
-class HeatmapHead(nn.Module):
-    """
-    Converts feature map to per-class heatmap.
-    Input : [B, D, H, W]
-    Output: [B, num_classes, H_out, W_out]
-    """
-
-    def __init__(self, in_dim: int, out_channels: int = 5) -> None:
-        super().__init__()
-        self.head = nn.Sequential(
-            nn.Conv2d(in_dim, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 128, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, out_channels, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(x)             # [B, 35, H, W]
-
-
-# ── Full Model ────────────────────────────────────────────────────────────────
-
-# Fixed text prompts — one per class (built into model, not external input)
-from src.data.dataset import CLASS_NAMES, TEXT_TEMPLATE, NUM_CLASSES
-
-CLASS_TEXTS = [TEXT_TEMPLATE.format(cls=name) for name in CLASS_NAMES]
+        if input_ids.ndim != 2 or input_ids.shape[1] > self.max_length:
+            raise ValueError("input_ids must have shape [B,L] with L <= max_length")
+        if attention_mask is None:
+            attention_mask = input_ids.ne(0)
+        positions = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
+        hidden = self.embedding(input_ids) + self.position(positions)
+        tokens = self.norm(self.projection(hidden))
+        return tokens * attention_mask.unsqueeze(-1).to(tokens.dtype)
 
 
 def _tokenize_fixed(texts: list[str], max_len: int = 32, vocab_size: int = 32000) -> torch.Tensor:
-    """Stable hash-based tokenizer for fixed class texts."""
+    """Stable compatibility tokenizer for callers using ``TextEncoderStub``."""
     tokens = []
     for text in texts:
         ids = []
@@ -196,27 +155,200 @@ def _tokenize_fixed(texts: list[str], max_len: int = 32, vocab_size: int = 32000
     return torch.tensor(tokens, dtype=torch.long)
 
 
-class FloorPlanDetector(nn.Module):
+class EarlyFusion(nn.Module):
+    """Fuse image tokens with pooled and token-level conditioning.
+
+    Supported modes are ``none``, ``add``, ``film``, ``cross_attention``,
+    ``film_cross_attention``, and the legacy ``current`` mode. Legacy short
+    spellings such as ``film_cross_attn`` remain accepted.
     """
-    FloorPlanCAD Multimodal Detection Model.
 
-    Architecture (Conditioned Reflex):
-      Input : image [B, 3, H, W]  — chỉ 1 ảnh đầu vào
-      Built-in: 35 fixed text prompts, mỗi text = 1 HEAD (block)
+    _ALIASES = {
+        "identity": "none",
+        "additive": "add",
+        "cross_attn": "cross_attention",
+        "film_cross_attn": "film_cross_attention",
+    }
 
-      1. Image → VAE Encoder → image tokens (encode 1 lần)
-      2. 35 texts → Text Encoder → 35 text token sets
-      3. Mỗi class: EarlyFusion(image, text[c]) → class_blocks[c] → heatmap[c]
-      4. Output: 35 × (center_heatmap + size_map + offset_map)
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        mode: str = "film",
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        mode = self._ALIASES.get(mode, mode)
+        valid_modes = {"none", "add", "film", "cross_attention", "film_cross_attention", "current"}
+        if mode not in valid_modes:
+            raise ValueError(f"unknown fusion mode '{mode}'. Expected one of {sorted(valid_modes)}")
+        if dim % num_heads != 0:
+            raise ValueError("fusion dim must be divisible by num_heads")
+        self.mode = mode
+        self.dim = dim
 
-    Training: class_ids chọn class nào tính loss.
-    Inference: lấy hết 35 outputs.
+        if mode in {"add"}:
+            self.condition_projection = nn.Linear(dim, dim)
+        if mode in {"film", "film_cross_attention"}:
+            self.film = nn.Sequential(
+                nn.Linear(dim, dim * 2),
+                nn.SiLU(),
+                nn.Linear(dim * 2, dim * 2),
+            )
+        if mode in {"cross_attention", "film_cross_attention", "current"}:
+            self.image_norm = nn.LayerNorm(dim)
+            self.condition_norm = nn.LayerNorm(dim)
+            self.cross_attention = nn.MultiheadAttention(
+                dim,
+                num_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.attention_projection = nn.Linear(dim, dim)
+        if mode != "none":
+            self.output_norm = nn.LayerNorm(dim)
+
+    @staticmethod
+    def _validate_conditioning(
+        image_tokens: torch.Tensor,
+        conditioning: ConditioningOutput,
+    ) -> None:
+        if conditioning.tokens.ndim != 3 or conditioning.pooled.ndim != 2:
+            raise ValueError("conditioning tokens/pooled tensors must have shapes [B,L,D] and [B,D]")
+        if conditioning.tokens.shape[0] != image_tokens.shape[0]:
+            raise ValueError("conditioning and image batch sizes must match")
+        if conditioning.tokens.shape[-1] != image_tokens.shape[-1]:
+            raise ValueError("conditioning and image dimensions must match")
+        if conditioning.attention_mask.shape != conditioning.tokens.shape[:2]:
+            raise ValueError("conditioning attention_mask must have shape [B,L]")
+
+    @staticmethod
+    def _safe_condition_mask(
+        tokens: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        valid_rows = attention_mask.any(dim=1)
+        safe_mask = attention_mask.clone()
+        safe_tokens = tokens
+        if not torch.all(valid_rows):
+            safe_mask[~valid_rows, 0] = True
+            safe_tokens = tokens.clone()
+            safe_tokens[~valid_rows, 0] = 0
+        return safe_tokens, safe_mask, valid_rows
+
+    def forward(
+        self,
+        image_tokens: torch.Tensor,
+        conditioning: ConditioningOutput | torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Tensor input preserves the former EarlyFusion(img, txt_tokens) API.
+        if isinstance(conditioning, torch.Tensor):
+            if attention_mask is None:
+                attention_mask = torch.ones(
+                    conditioning.shape[:2], device=conditioning.device, dtype=torch.bool
+                )
+            conditioning = ConditioningOutput(
+                tokens=conditioning,
+                attention_mask=attention_mask.to(dtype=torch.bool),
+                pooled=masked_mean(conditioning, attention_mask.to(dtype=torch.bool)),
+            )
+        self._validate_conditioning(image_tokens, conditioning)
+        if self.mode == "none":
+            return image_tokens
+
+        valid_rows = conditioning.attention_mask.any(dim=1).to(image_tokens.dtype)
+        if self.mode == "add":
+            delta = self.condition_projection(conditioning.pooled) * valid_rows.unsqueeze(-1)
+            fused = image_tokens + delta.unsqueeze(1)
+            return self.output_norm(fused)
+
+        if self.mode in {"film", "film_cross_attention"}:
+            gamma, beta = self.film(conditioning.pooled).chunk(2, dim=-1)
+            gamma = gamma * valid_rows.unsqueeze(-1)
+            beta = beta * valid_rows.unsqueeze(-1)
+            fused = image_tokens * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+        else:
+            fused = image_tokens
+
+        if self.mode in {"cross_attention", "film_cross_attention"}:
+            condition_tokens, safe_mask, valid_rows = self._safe_condition_mask(
+                self.condition_norm(conditioning.tokens),
+                conditioning.attention_mask,
+            )
+            attended, _ = self.cross_attention(
+                query=self.image_norm(fused),
+                key=condition_tokens,
+                value=condition_tokens,
+                key_padding_mask=~safe_mask,
+                need_weights=False,
+            )
+            attended = attended * valid_rows[:, None, None].to(attended.dtype)
+            fused = fused + self.attention_projection(attended)
+        elif self.mode == "current":
+            attended, _ = self.cross_attention(
+                query=self.condition_norm(conditioning.tokens),
+                key=self.image_norm(image_tokens),
+                value=self.image_norm(image_tokens),
+                need_weights=False,
+            )
+            summary = masked_mean(attended, conditioning.attention_mask)
+            fused = image_tokens + self.attention_projection(summary).unsqueeze(1)
+
+        return self.output_norm(fused)
+
+
+class HeatmapHead(nn.Module):
+    """GroupNorm/SiLU class-conditioned CenterNet head producing five channels.
+
+    The final Conv2d has no activation; raw center logits are returned alongside
+    the sigmoid probability so the loss can use the numerically stable
+    ``logsigmoid`` path instead of ``log(p.clamp(...))``.
     """
 
     def __init__(
         self,
-        image_size: int = 512,
-        model_dim: int = 512,
+        in_dim: int,
+        out_channels: int = 5,
+        hidden_dim: int = 128,
+        center_prior: float = 0.01,
+    ) -> None:
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(in_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(hidden_dim), hidden_dim),
+            nn.SiLU(),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(hidden_dim), hidden_dim),
+            nn.SiLU(),
+            nn.Conv2d(hidden_dim, out_channels, kernel_size=1),
+        )
+        # P1-D: CenterNet-style negative prior bias. Initialise the center
+        # channel bias so sigmoid(bias) ≈ center_prior to avoid large focal
+        # losses at the start of training with a large 64×64 heatmap.
+        import math as _math
+        final_conv: nn.Conv2d = self.head[-1]  # type: ignore[assignment]
+        if final_conv.bias is not None:
+            with torch.no_grad():
+                bias_val = _math.log(center_prior / (1.0 - center_prior))
+                final_conv.bias[0].fill_(bias_val)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.head(features)
+
+
+class FloorPlanDetector(nn.Module):
+    """Conditioned CenterNet detector with shared or per-class pathways.
+
+    ``class_ids`` selects one output per image and is routed in class groups.
+    Omitting it computes all classes in bounded class chunks. Runtime ``texts``
+    override the built-in class prompts; fixed prompts are the fallback.
+    """
+
+    def __init__(
+        self,
+        image_size: int | ModelConfig = 512,
+        model_dim: int = 256,
         num_classes: int = 35,
         depth_per_class: int = 2,
         num_heads: int = 8,
@@ -224,176 +356,523 @@ class FloorPlanDetector(nn.Module):
         fusion_mode: str = "film",
         vae_cfg: VAEConfig | None = None,
         text_cfg: TextEncoderConfig | None = None,
+        *,
+        output_stride: int = 8,
+        pathway_mode: str = "shared",
+        conditioner: str | ConditionerConfig | nn.Module | None = None,
+        conditioner_cfg: ConditionerConfig | None = None,
+        class_texts: Sequence[str] | None = None,
+        class_chunk_size: int = 8,
+        attention_chunk_size: int | None = None,
+        head_channels: int = 128,
+        config: ModelConfig | None = None,
     ) -> None:
         super().__init__()
-        self.image_size = image_size
-        self.latent_size = image_size // 8
-        self.model_dim = model_dim
-        self.num_classes = num_classes
-        self.depth_per_class = depth_per_class
-        self.fusion_mode = fusion_mode
+        if isinstance(image_size, ModelConfig):
+            if config is not None:
+                raise ValueError("pass ModelConfig either positionally or with config=, not both")
+            config = image_size
 
-        vae_cfg = vae_cfg or VAEConfig()
-        text_cfg = text_cfg or TextEncoderConfig()
+        custom_conditioner = conditioner if isinstance(conditioner, nn.Module) else None
+        if conditioner_cfg is not None and conditioner is not None:
+            raise ValueError("pass conditioner or conditioner_cfg, not both")
+        if config is None:
+            resolved_text_config = text_cfg or TextEncoderConfig()
+            if conditioner_cfg is not None:
+                cond_config = conditioner_cfg
+            elif isinstance(conditioner, ConditionerConfig):
+                cond_config = conditioner
+            elif isinstance(conditioner, str):
+                cond_config = ConditionerConfig(
+                    kind=conditioner,
+                    max_length=resolved_text_config.max_length,
+                    embedding_dim=resolved_text_config.embedding_dim,
+                )
+            else:
+                cond_config = ConditionerConfig(kind="class_embedding")
+            config = ModelConfig(
+                image_size=int(image_size),
+                output_stride=output_stride,
+                model_dim=model_dim,
+                num_classes=num_classes,
+                class_texts=tuple(class_texts) if class_texts is not None else None,
+                depth_per_class=depth_per_class,
+                num_heads=num_heads,
+                dropout=dropout,
+                fusion_mode=fusion_mode,
+                pathway_mode=pathway_mode,
+                class_chunk_size=class_chunk_size,
+                attention_chunk_size=attention_chunk_size,
+                head_channels=head_channels,
+                vae=vae_cfg or VAEConfig(),
+                text_encoder=resolved_text_config,
+                conditioner=cond_config,
+            )
+        else:
+            # Round-trip to detach mutable caller-owned nested configs and validate.
+            config = ModelConfig.from_dict(config.to_dict())
+        if conditioner_cfg is not None:
+            config = config.with_overrides(conditioner=conditioner_cfg)
+        elif isinstance(conditioner, ConditionerConfig):
+            config = config.with_overrides(conditioner=conditioner)
+        elif isinstance(conditioner, str):
+            config = config.with_overrides(
+                conditioner=ConditionerConfig(
+                    kind=conditioner,
+                    max_length=config.text_encoder.max_length,
+                    embedding_dim=config.text_encoder.embedding_dim,
+                )
+            )
+        if class_texts is not None and tuple(class_texts) != config.class_texts:
+            config = config.with_overrides(class_texts=tuple(class_texts))
 
-        # ── Encoders ─────────────────────────────────────────────────────────
-        self.vae_encoder = VAEEncoderStub(vae_cfg)
-        self.text_encoder = TextEncoderStub(text_cfg, model_dim=model_dim)
+        if config.architecture != "floorplan_detector":
+            raise ValueError(
+                "FloorPlanDetector requires architecture='floorplan_detector'; use build_model() "
+                "for architecture-dispatched construction"
+            )
+        fixed_texts = (
+            tuple(config.class_texts)
+            if config.class_texts is not None
+            else tuple(_default_class_texts(config.num_classes))
+        )
+        if len(fixed_texts) != config.num_classes or not all(
+            isinstance(text, str) for text in fixed_texts
+        ):
+            raise ValueError(f"class_texts must contain exactly {config.num_classes} strings")
+        if config.class_texts is None:
+            config = config.with_overrides(class_texts=fixed_texts)
 
-        # Project VAE latent → model_dim
-        self.img_proj = nn.Linear(vae_cfg.latent_channels, model_dim)
+        self.config = config
+        self.image_size = config.image_size
+        self.output_stride = config.output_stride
+        self.latent_size = config.latent_size
+        self.model_dim = config.model_dim
+        self.num_classes = config.num_classes
+        self.depth_per_class = config.depth_per_class
+        self.fusion_mode = EarlyFusion._ALIASES.get(config.fusion_mode, config.fusion_mode)
+        self.pathway_mode = config.pathway_mode
+        self.class_chunk_size = config.class_chunk_size
+        self.class_texts = fixed_texts
+
+        self.image_encoder = ConvImageEncoder(config.vae)
+        self.image_projection = nn.Linear(config.vae.latent_channels, self.model_dim)
         self.image_pos_embed = nn.Parameter(
-            torch.zeros(1, self.latent_size * self.latent_size, model_dim)
+            torch.zeros(1, self.latent_size * self.latent_size, self.model_dim)
         )
         nn.init.trunc_normal_(self.image_pos_embed, std=0.02)
 
-        # ── Fixed class text tokens (registered as buffer, not parameter) ────
-        # 35 tokenized texts, one per class — part of the model, not input
-        self.register_buffer(
-            "class_text_ids",
-            _tokenize_fixed(CLASS_TEXTS),  # [35, 32]
+        self.conditioner = custom_conditioner or build_conditioner(
+            config.conditioner,
+            model_dim=self.model_dim,
+            num_classes=self.num_classes,
         )
 
-        # ── Per-class Early Fusion ────────────────────────────────────────────
-        # Each class has its own fusion layer (text differs per class)
-        self.early_fusions = nn.ModuleList([
-            EarlyFusion(model_dim, num_heads, mode=fusion_mode)
-            for _ in range(num_classes)
-        ])
+        block_kwargs = {
+            "dim": self.model_dim,
+            "num_classes": None,
+            "num_heads": config.num_heads,
+            "dropout": config.dropout,
+            "use_class_embedding": False,
+            "attention_chunk_size": config.attention_chunk_size,
+        }
+        self.shared_fusion: EarlyFusion | None = None
+        self.shared_blocks = nn.ModuleList()
+        self.early_fusions = nn.ModuleList()
+        self.class_blocks = nn.ModuleList()
+        if self.pathway_mode == "shared":
+            self.shared_fusion = EarlyFusion(
+                self.model_dim,
+                config.num_heads,
+                self.fusion_mode,
+                config.dropout,
+            )
+            self.shared_blocks = nn.ModuleList(
+                ObjectLearningBlock(**block_kwargs) for _ in range(self.depth_per_class)
+            )
+        else:
+            self.early_fusions = nn.ModuleList(
+                EarlyFusion(
+                    self.model_dim,
+                    config.num_heads,
+                    self.fusion_mode,
+                    config.dropout,
+                )
+                for _ in range(self.num_classes)
+            )
+            self.class_blocks = nn.ModuleList(
+                nn.ModuleList(
+                    ObjectLearningBlock(**block_kwargs) for _ in range(self.depth_per_class)
+                )
+                for _ in range(self.num_classes)
+            )
 
-        # ── Per-class Object Learning Blocks ──────────────────────────────────
-        self.class_blocks = nn.ModuleList([
-            nn.ModuleList([
-                ObjectLearningBlock(model_dim, num_classes=1, num_heads=num_heads, dropout=dropout)
-                for _ in range(depth_per_class)
-            ])
-            for _ in range(num_classes)
-        ])
+        self.out_norm = nn.LayerNorm(self.model_dim)
+        self.heatmap_head = HeatmapHead(
+            self.model_dim,
+            out_channels=5,
+            hidden_dim=config.head_channels,
+        )
 
-        # ── Spatial reshape + CenterNet Head ──────────────────────────────────
-        self.out_norm = nn.LayerNorm(model_dim)
-        self.heatmap_head = HeatmapHead(model_dim, out_channels=5)
+    @property
+    def vae_encoder(self) -> nn.Module:
+        """Compatibility view of the project-native image encoder."""
+        return self.image_encoder
+
+    @property
+    def img_proj(self) -> nn.Module:
+        """Compatibility view of the image token projection."""
+        return self.image_projection
+
+    @property
+    def text_encoder(self) -> nn.Module:
+        """Compatibility view of the active conditioner."""
+        return self.conditioner
+
+    @classmethod
+    def from_config(cls, config: ModelConfig, **kwargs) -> FloorPlanDetector:
+        return cls(config=config, **kwargs)
+
+    def _validate_image(self, image: torch.Tensor) -> None:
+        if image.ndim != 4:
+            raise ValueError(f"image must have shape [B,C,H,W], got {tuple(image.shape)}")
+        if image.shape[0] <= 0:
+            raise ValueError("image batch must be non-empty")
+        if image.shape[1] != self.config.vae.in_channels:
+            raise ValueError(f"expected {self.config.vae.in_channels} image channels")
+        height, width = image.shape[-2:]
+        if height % self.output_stride != 0 or width % self.output_stride != 0:
+            raise ValueError(
+                f"image height and width must be divisible by output_stride={self.output_stride}"
+            )
 
     def encode_image(self, image: torch.Tensor) -> tuple[torch.Tensor, int, int]:
-        """image [B,3,H,W] → tokens [B, h*w, D]"""
-        lat = self.vae_encoder(image)               # [B, C, h, w]
-        B, C, h, w = lat.shape
-        lat = lat.flatten(2).transpose(1, 2)        # [B, h*w, C]
-        tokens = self.img_proj(lat)                 # [B, h*w, D]
-
-        if h == self.latent_size and w == self.latent_size:
-            pos = self.image_pos_embed
-        else:
-            pos = self.image_pos_embed.transpose(1, 2).reshape(
-                1, self.model_dim, self.latent_size, self.latent_size
+        self._validate_image(image)
+        latent = self.image_encoder(image)
+        batch, channels, height, width = latent.shape
+        expected = (image.shape[-2] // self.output_stride, image.shape[-1] // self.output_stride)
+        if (height, width) != expected:
+            raise RuntimeError(
+                f"image encoder violated stride-{self.output_stride} contract: "
+                f"expected {expected}, got {(height, width)}"
             )
-            pos = F.interpolate(pos, size=(h, w), mode="bilinear", align_corners=False)
-            pos = pos.flatten(2).transpose(1, 2)
+        tokens = self.image_projection(latent.flatten(2).transpose(1, 2))
+        if (height, width) == (self.latent_size, self.latent_size):
+            position = self.image_pos_embed
+        else:
+            position = self.image_pos_embed.transpose(1, 2).reshape(
+                1,
+                self.model_dim,
+                self.latent_size,
+                self.latent_size,
+            )
+            position = F.interpolate(
+                position,
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+            ).flatten(2).transpose(1, 2)
+        return tokens + position, height, width
 
-        return tokens + pos, h, w
+    @staticmethod
+    def _normalise_conditioning_output(output) -> ConditioningOutput:
+        if isinstance(output, ConditioningOutput):
+            return output
+        if isinstance(output, dict):
+            tokens = output.get("tokens", output.get("token_embeddings"))
+            mask = output.get("attention_mask", output.get("mask"))
+            pooled = output.get("pooled", output.get("pooled_embedding"))
+            if tokens is not None and mask is not None and pooled is not None:
+                return ConditioningOutput(tokens=tokens, attention_mask=mask, pooled=pooled)
+        if isinstance(output, (tuple, list)) and len(output) == 3:
+            return ConditioningOutput(tokens=output[0], attention_mask=output[1], pooled=output[2])
+        raise TypeError("conditioner must return ConditioningOutput, a matching dict, or a 3-tuple")
+
+    def _condition(
+        self,
+        class_ids: torch.Tensor,
+        texts: Sequence[str],
+        reference: torch.Tensor,
+    ) -> ConditioningOutput:
+        output = self.conditioner(
+            texts=list(texts),
+            class_ids=class_ids,
+            batch_size=class_ids.shape[0],
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        output = self._normalise_conditioning_output(output)
+        return ConditioningOutput(
+            tokens=output.tokens.to(device=reference.device, dtype=reference.dtype),
+            attention_mask=output.attention_mask.to(device=reference.device, dtype=torch.bool),
+            pooled=output.pooled.to(device=reference.device, dtype=reference.dtype),
+        )
+
+    def _run_pathway(
+        self,
+        image_tokens: torch.Tensor,
+        height: int,
+        width: int,
+        class_ids: torch.Tensor,
+        texts: Sequence[str],
+        *,
+        pathway_class_id: int | None,
+    ) -> dict[str, torch.Tensor]:
+        conditioning = self._condition(class_ids, texts, image_tokens)
+        if self.pathway_mode == "shared":
+            assert self.shared_fusion is not None
+            fusion = self.shared_fusion
+            blocks = self.shared_blocks
+        else:
+            if pathway_class_id is None:
+                raise ValueError("per-class pathway requires pathway_class_id")
+            fusion = self.early_fusions[pathway_class_id]
+            blocks = self.class_blocks[pathway_class_id]
+
+        features = fusion(image_tokens, conditioning)
+        for block in blocks:
+            features = block(features, spatial_shape=(height, width))
+        batch = features.shape[0]
+        features = self.out_norm(features).transpose(1, 2).reshape(
+            batch,
+            self.model_dim,
+            height,
+            width,
+        )
+        raw = self.heatmap_head(features)
+        center_logits = raw[:, 0:1]
+        return {
+            "center_heatmap": torch.sigmoid(center_logits),
+            "center_logits": center_logits,
+            "size_map": F.softplus(raw[:, 1:3]),
+            "offset_map": torch.sigmoid(raw[:, 3:5]),
+        }
 
     def _process_class(
         self,
-        cid: int,
-        img_tokens: torch.Tensor,       # [B, h*w, D]
-        h: int, w: int,
+        class_id: int,
+        image_tokens: torch.Tensor,
+        height: int,
+        width: int,
+        texts: Sequence[str] | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Process one class: early fusion + OLB + head."""
-        # Text encode for this class
-        txt_ids = self.class_text_ids[cid:cid+1]         # [1, 32]
-        txt_ids = txt_ids.expand(img_tokens.shape[0], -1) # [B, 32]
-        txt_tokens = self.text_encoder(txt_ids)            # [B, 32, D]
+        if class_id < 0 or class_id >= self.num_classes:
+            raise ValueError(f"class_id must be in [0, {self.num_classes})")
+        batch = image_tokens.shape[0]
+        class_ids = torch.full(
+            (batch,), class_id, device=image_tokens.device, dtype=torch.long
+        )
+        resolved_texts = list(texts) if texts is not None else [self.class_texts[class_id]] * batch
+        if len(resolved_texts) != batch:
+            raise ValueError("texts must match the image batch size")
+        return self._run_pathway(
+            image_tokens,
+            height,
+            width,
+            class_ids,
+            resolved_texts,
+            pathway_class_id=class_id if self.pathway_mode == "per_class" else None,
+        )
 
-        # Early fusion (class-specific)
-        fused = self.early_fusions[cid](img_tokens, txt_tokens)  # [B, h*w, D]
+    def _validate_class_ids(self, class_ids: torch.Tensor | Sequence[int], batch: int, device) -> torch.Tensor:
+        class_ids = torch.as_tensor(class_ids, device=device, dtype=torch.long)
+        if class_ids.ndim != 1 or class_ids.shape[0] != batch:
+            raise ValueError(f"class_ids must have shape [{batch}]")
+        if torch.any(class_ids < 0) or torch.any(class_ids >= self.num_classes):
+            raise ValueError(f"class_ids must be in [0, {self.num_classes})")
+        return class_ids
 
-        # Object Learning Blocks
-        dummy_cid = torch.zeros(img_tokens.shape[0], dtype=torch.long, device=img_tokens.device)
-        x = fused
-        for block in self.class_blocks[cid]:
-            x = block(x, dummy_cid)
+    def _selected_texts(
+        self,
+        texts: str | Sequence[str] | None,
+        class_ids: torch.Tensor,
+    ) -> list[str]:
+        batch = class_ids.shape[0]
+        if texts is None:
+            return [self.class_texts[index] for index in class_ids.tolist()]
+        if isinstance(texts, str):
+            return [texts] * batch
+        values = list(texts)
+        if not all(isinstance(text, str) for text in values):
+            raise TypeError("texts must contain strings")
+        if len(values) == batch:
+            return values
+        if len(values) == self.num_classes:
+            return [values[index] for index in class_ids.tolist()]
+        raise ValueError(
+            f"selected-class texts must contain {batch} sample texts or {self.num_classes} class texts"
+        )
 
-        # Reshape → spatial → head
-        B = img_tokens.shape[0]
-        x = self.out_norm(x)
-        x = x.transpose(1, 2).reshape(B, self.model_dim, h, w)
-        out = self.heatmap_head(x)
+    def _all_class_texts(self, texts: str | Sequence[str] | None) -> list[str]:
+        if texts is None:
+            return list(self.class_texts)
+        if isinstance(texts, str):
+            return [texts] * self.num_classes
+        values = list(texts)
+        if len(values) != self.num_classes or not all(isinstance(text, str) for text in values):
+            raise ValueError(f"all-class texts must contain exactly {self.num_classes} strings")
+        return values
 
+    def _forward_selected(
+        self,
+        image_tokens: torch.Tensor,
+        height: int,
+        width: int,
+        class_ids: torch.Tensor,
+        texts: list[str],
+    ) -> dict[str, torch.Tensor]:
+        grouped_indices = []
+        grouped_outputs: dict[str, list[torch.Tensor]] = {
+            "center_heatmap": [],
+            "center_logits": [],
+            "size_map": [],
+            "offset_map": [],
+        }
+        for class_id_tensor in torch.unique(class_ids, sorted=True):
+            class_id = int(class_id_tensor.item())
+            indices = torch.nonzero(class_ids == class_id_tensor, as_tuple=False).flatten()
+            grouped_indices.append(indices)
+            group_texts = [texts[index] for index in indices.tolist()]
+            output = self._run_pathway(
+                image_tokens.index_select(0, indices),
+                height,
+                width,
+                class_ids.index_select(0, indices),
+                group_texts,
+                pathway_class_id=class_id if self.pathway_mode == "per_class" else None,
+            )
+            for key in grouped_outputs:
+                grouped_outputs[key].append(output[key])
+
+        grouped_order = torch.cat(grouped_indices)
+        restore_order = torch.argsort(grouped_order)
         return {
-            "center_heatmap": torch.sigmoid(out[:, 0:1, :, :]),
-            "size_map": F.relu(out[:, 1:3, :, :]),
-            "offset_map": torch.sigmoid(out[:, 3:5, :, :]),
+            key: torch.cat(values, dim=0).index_select(0, restore_order)
+            for key, values in grouped_outputs.items()
+        }
+
+    def _forward_all_shared(
+        self,
+        image_tokens: torch.Tensor,
+        height: int,
+        width: int,
+        class_texts: list[str],
+        chunk_size: int,
+    ) -> dict[str, torch.Tensor]:
+        batch, length, dim = image_tokens.shape
+        all_heatmaps, all_logits, all_sizes, all_offsets = [], [], [], []
+        for start in range(0, self.num_classes, chunk_size):
+            end = min(start + chunk_size, self.num_classes)
+            classes_in_chunk = end - start
+            expanded_tokens = image_tokens[:, None].expand(
+                batch, classes_in_chunk, length, dim
+            ).reshape(batch * classes_in_chunk, length, dim)
+            chunk_ids = torch.arange(start, end, device=image_tokens.device).view(1, -1).expand(
+                batch, -1
+            ).reshape(-1)
+            chunk_texts = [
+                class_texts[class_id]
+                for _ in range(batch)
+                for class_id in range(start, end)
+            ]
+            output = self._run_pathway(
+                expanded_tokens,
+                height,
+                width,
+                chunk_ids,
+                chunk_texts,
+                pathway_class_id=None,
+            )
+            all_heatmaps.append(
+                output["center_heatmap"].reshape(batch, classes_in_chunk, height, width)
+            )
+            all_logits.append(
+                output["center_logits"].reshape(batch, classes_in_chunk, height, width)
+            )
+            all_sizes.append(
+                output["size_map"].reshape(batch, classes_in_chunk * 2, height, width)
+            )
+            all_offsets.append(
+                output["offset_map"].reshape(batch, classes_in_chunk * 2, height, width)
+            )
+        return {
+            "center_heatmap": torch.cat(all_heatmaps, dim=1),
+            "center_logits": torch.cat(all_logits, dim=1),
+            "size_map": torch.cat(all_sizes, dim=1),
+            "offset_map": torch.cat(all_offsets, dim=1),
+        }
+
+    def _forward_all_per_class(
+        self,
+        image_tokens: torch.Tensor,
+        height: int,
+        width: int,
+        class_texts: list[str],
+        chunk_size: int,
+    ) -> dict[str, torch.Tensor]:
+        all_heatmaps, all_logits, all_sizes, all_offsets = [], [], [], []
+        for start in range(0, self.num_classes, chunk_size):
+            end = min(start + chunk_size, self.num_classes)
+            chunk_heatmaps, chunk_logits, chunk_sizes, chunk_offsets = [], [], [], []
+            for class_id in range(start, end):
+                output = self._process_class(
+                    class_id,
+                    image_tokens,
+                    height,
+                    width,
+                    texts=[class_texts[class_id]] * image_tokens.shape[0],
+                )
+                chunk_heatmaps.append(output["center_heatmap"])
+                chunk_logits.append(output["center_logits"])
+                chunk_sizes.append(output["size_map"])
+                chunk_offsets.append(output["offset_map"])
+            all_heatmaps.append(torch.cat(chunk_heatmaps, dim=1))
+            all_logits.append(torch.cat(chunk_logits, dim=1))
+            all_sizes.append(torch.cat(chunk_sizes, dim=1))
+            all_offsets.append(torch.cat(chunk_offsets, dim=1))
+        return {
+            "center_heatmap": torch.cat(all_heatmaps, dim=1),
+            "center_logits": torch.cat(all_logits, dim=1),
+            "size_map": torch.cat(all_sizes, dim=1),
+            "offset_map": torch.cat(all_offsets, dim=1),
         }
 
     def forward(
         self,
-        image: torch.Tensor,               # [B, 3, H, W]
-        class_ids: torch.Tensor | None = None,  # [B] — training: chọn class tính loss
+        image: torch.Tensor,
+        class_ids: torch.Tensor | Sequence[int] | None = None,
+        texts: str | Sequence[str] | None = None,
+        *,
+        class_chunk_size: int | None = None,
     ) -> dict[str, torch.Tensor]:
-        """
-        Training (class_ids provided):
-            Chỉ chạy block của class được chỉ định cho mỗi sample.
-            Returns: center_heatmap [B,1,h,w], size_map [B,2,h,w], offset_map [B,2,h,w]
-
-        Inference (class_ids=None):
-            Chạy tất cả 35 blocks.
-            Returns: center_heatmap [B,35,h,w], size_map [B,35*2,h,w], offset_map [B,35*2,h,w]
-        """
-        B = image.shape[0]
-        img_tokens, h, w = self.encode_image(image)  # encode 1 lần
-
+        image_tokens, height, width = self.encode_image(image)
         if class_ids is not None:
-            # ── Training mode: mỗi sample chạy qua block tương ứng ────────
-            hm_list, sz_list, off_list = [], [], []
-            for i in range(B):
-                cid = class_ids[i].item()
-                result = self._process_class(cid, img_tokens[i:i+1], h, w)
-                hm_list.append(result["center_heatmap"])
-                sz_list.append(result["size_map"])
-                off_list.append(result["offset_map"])
-            return {
-                "center_heatmap": torch.cat(hm_list, dim=0),  # [B, 1, h, w]
-                "size_map": torch.cat(sz_list, dim=0),          # [B, 2, h, w]
-                "offset_map": torch.cat(off_list, dim=0),       # [B, 2, h, w]
-            }
-        else:
-            # ── Inference mode: chạy tất cả 35 blocks ─────────────────────
-            all_hm, all_sz, all_off = [], [], []
-            for cid in range(self.num_classes):
-                result = self._process_class(cid, img_tokens, h, w)
-                all_hm.append(result["center_heatmap"])   # [B, 1, h, w]
-                all_sz.append(result["size_map"])          # [B, 2, h, w]
-                all_off.append(result["offset_map"])       # [B, 2, h, w]
-            return {
-                "center_heatmap": torch.cat(all_hm, dim=1),  # [B, 35, h, w]
-                "size_map": torch.cat(all_sz, dim=1),         # [B, 70, h, w]
-                "offset_map": torch.cat(all_off, dim=1),      # [B, 70, h, w]
-            }
+            selected_ids = self._validate_class_ids(class_ids, image.shape[0], image.device)
+            selected_texts = self._selected_texts(texts, selected_ids)
+            return self._forward_selected(
+                image_tokens,
+                height,
+                width,
+                selected_ids,
+                selected_texts,
+            )
 
-
-if __name__ == "__main__":
-    model = FloorPlanDetector(
-        image_size=512, model_dim=256, num_classes=35, depth_per_class=2
-    )
-    n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"Parameters: {n_params:.1f}M")
-    print(f"Per-class blocks: {len(model.class_blocks)} × {model.depth_per_class} depth")
-
-    image = torch.randn(1, 3, 512, 512)
-
-    # Training mode: 1 class per sample
-    cls_ids = torch.tensor([4])
-    out = model(image, class_ids=cls_ids)
-    print(f"\n[Training] class_id=4 (chair)")
-    print(f"  center_heatmap: {out['center_heatmap'].shape}")  # [1, 1, 64, 64]
-    print(f"  size_map      : {out['size_map'].shape}")        # [1, 2, 64, 64]
-    print(f"  offset_map    : {out['offset_map'].shape}")      # [1, 2, 64, 64]
-
-    # Inference mode: all 35 classes
-    out = model(image)
-    print(f"\n[Inference] all classes")
-    print(f"  center_heatmap: {out['center_heatmap'].shape}")  # [1, 35, 64, 64]
-    print(f"  size_map      : {out['size_map'].shape}")        # [1, 70, 64, 64]
-    print(f"  offset_map    : {out['offset_map'].shape}")      # [1, 70, 64, 64]
-
-
+        chunk_size = self.class_chunk_size if class_chunk_size is None else class_chunk_size
+        if chunk_size <= 0:
+            raise ValueError("class_chunk_size must be positive")
+        all_texts = self._all_class_texts(texts)
+        if self.pathway_mode == "shared":
+            return self._forward_all_shared(
+                image_tokens,
+                height,
+                width,
+                all_texts,
+                chunk_size,
+            )
+        return self._forward_all_per_class(
+            image_tokens,
+            height,
+            width,
+            all_texts,
+            chunk_size,
+        )

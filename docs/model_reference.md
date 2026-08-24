@@ -1,389 +1,364 @@
-# Model Reference — FloorPlanDetector
+# Model Reference — Configurable Conditioned CenterNet
 
-> Tài liệu kỹ thuật chi tiết cho model `FloorPlanDetector` và tất cả sub-modules.
-> Source: [detector.py](file:///e:/Dat/Research/src/models/detector.py), [object_learning_block.py](file:///e:/Dat/Research/src/models/blocks/object_learning_block.py)
+Tài liệu này mô tả implementation hiện tại trong:
 
----
+- `src/models/config.py`
+- `src/models/factory.py`
+- `src/models/detector.py`
+- `src/models/conditioning.py`
+- `src/models/baseline.py`
+- `src/models/blocks/object_learning_block.py`
 
-## 1. Tổng Quan
+Các tên compatibility như `VAEConfig`, `VAEEncoderStub` và `TextEncoderStub` vẫn tồn tại để giảm breakage cho code/API cũ. Chúng không cam kết compatibility với checkpoint pre-schema và không có nghĩa model active dùng VAE pretrained hoặc language model pretrained.
 
-`FloorPlanDetector` là model multimodal kết hợp **ảnh bản vẽ mặt bằng** + **text query** để phát hiện vị trí và kích thước các đối tượng thuộc class được chỉ định.
+## 1. Public construction API
 
-### Input / Output
-
-| Mode | Input | Shape | Mô tả |
-|---|---|---|---|
-| **Cả hai** | `image` | `[B, 3, 512, 512]` | Ảnh bản vẽ mặt bằng (normalized [-1, 1]) |
-| **Training** | `class_ids` | `[B]` | Index class cần tính loss (0–34) |
-| **Inference** | *(không cần)* | — | `class_ids=None` → chạy tất cả 35 blocks |
-
-| Mode | Output | Shape | Mô tả |
-|---|---|---|---|
-| **Training** | `center_heatmap` | `[B, 1, 64, 64]` | Heatmap cho class được chọn |
-| | `size_map` | `[B, 2, 64, 64]` | Kích thước (w, h) cho class được chọn |
-| | `offset_map` | `[B, 2, 64, 64]` | Offset fractional `(dx, dy)` tại center cell |
-| **Inference** | `center_heatmap` | `[B, 35, 64, 64]` | Heatmap cho tất cả 35 classes |
-| | `size_map` | `[B, 70, 64, 64]` | Kích thước cho tất cả 35 classes |
-| | `offset_map` | `[B, 70, 64, 64]` | Offset cho tất cả 35 classes |
-
-> 35 class texts là **built-in** (buffer trong model), không phải input bên ngoài.
-
-### Inference
+Model nên được tạo từ preset/config thay vì hard-code constructor assumptions:
 
 ```python
-# Tìm TẤT CẢ objects trong ảnh (chạy 35 blocks)
-preds = model(image)   # class_ids=None
-# preds["center_heatmap"]: [1, 35, 64, 64] — mỗi channel là 1 class
-# Threshold 0.3 → NMS → tâm các objects → size_map → bounding box
+from src.models import ModelConfig, build_model, get_model_preset
 
-# Training: chỉ chạy block của class cần tính loss
-preds = model(image, class_ids=torch.tensor([4]))  # chair only
+model = build_model("floorplan_base")
+
+config = get_model_preset("per_class_no_text")
+model = build_model(config)
+
+restored_config = ModelConfig.from_dict(checkpoint["model_config"])
+model = build_model(restored_config)
 ```
 
----
+`build_model` dispatch theo `ModelConfig.architecture`:
 
-## 2. Kiến Trúc Chi Tiết
+- `floorplan_detector` -> `FloorPlanDetector`;
+- `centernet_baseline` -> `SharedCenterNetBaseline`.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        FloorPlanDetector                            │
-│                                                                     │
-│  ┌──────────────┐    ┌──────────────┐                              │
-│  │ VAEEncoderStub│    │TextEncoderStub│                              │
-│  │ [3,512,512]  │    │ [B, 32]      │                              │
-│  │  → Conv×3    │    │  → Embed+Pos │                              │
-│  │  → stride 2  │    │  → LayerNorm │                              │
-│  └──────┬───────┘    └──────┬───────┘                              │
-│         │                   │                                       │
-│   [B, 16, 64, 64]    [B, 32, D]                                   │
-│         │                   │                                       │
-│   flatten + img_proj        │                                       │
-│         │                   │                                       │
-│   [B, 4096, D]              │                                       │
-│         │                   │                                       │
-│  ┌──────┴───────────────────┴──────┐                               │
-│  │          EarlyFusion            │                               │
-│  │  Cross-Attention:               │                               │
-│  │    Q=text, K=image, V=image     │                               │
-│  │  → mean pool text output        │                               │
-│  │  → project + residual to image  │                               │
-│  └──────────────┬──────────────────┘                               │
-│                 │                                                    │
-│           [B, 4096, D]  (fused features)                           │
-│                 │                                                    │
-│     ┌───────────┼────── class_id routing ──────────┐               │
-│     │           │                                  │               │
-│  ┌──▼──┐    ┌──▼──┐    ┌──▼──┐         ┌──▼──┐   │               │
-│  │ OLB │    │ OLB │    │ OLB │  . . .  │ OLB │   │               │
-│  │ [0] │    │ [4] │    │ [8] │         │ [34]│   │               │
-│  │×2dep│    │×2dep│    │×2dep│         │×2dep│   │               │
-│  └─────┘    └──┬──┘    └─────┘         └─────┘   │               │
-│                │ (chỉ 1 block active per sample)   │               │
-│     └──────────┼───────────────────────────────────┘               │
-│                │                                                    │
-│           [B, 4096, D]                                             │
-│                │                                                    │
-│           out_norm (LayerNorm)                                      │
-│                │                                                    │
-│           reshape → [B, D, 64, 64]                                 │
-│                │                                                    │
-│  ┌─────────────▼─────────────┐                                     │
-│  │       HeatmapHead        │                                     │
-│  │  Conv(D→256) + BN + ReLU │                                     │
-│  │  Conv(256→128) + ReLU    │                                     │
-│  │  Conv(128→3)             │                                     │
-│  └─────────────┬─────────────┘                                     │
-│                │                                                    │
-│           [B, 3, 64, 64]                                           │
-│           ├── ch 0: sigmoid → center_heatmap                       │
-│           └── ch 1-2: ReLU  → size_map (w, h)                     │
-└─────────────────────────────────────────────────────────────────────┘
+`ModelConfig` được validate khi tạo:
+
+- `output_stride` hiện phải bằng `8`;
+- `image_size` phải dương và chia hết cho `8`;
+- `model_dim` phải chia hết cho `num_heads`;
+- `pathway_mode` là `shared` hoặc `per_class`;
+- model config và nested conditioner/image config có thể serialize bằng `to_dict()`.
+
+## 2. Input/output contract
+
+### Query mode
+
+Input:
+
+```text
+image     [B,3,H,W]
+class_ids [B]
+texts     optional string/list
 ```
 
----
+Output:
 
-## 3. Sub-Modules
+```text
+center_heatmap [B,1,H/8,W/8]
+size_map       [B,2,H/8,W/8]
+offset_map     [B,2,H/8,W/8]
+```
 
-### 3.1 VAEEncoderStub
+Mỗi sample trong batch có thể query class khác nhau. `FloorPlanDetector` group sample theo class, chạy pathway tương ứng rồi scatter output về thứ tự ban đầu.
 
-> File: [detector.py](file:///e:/Dat/Research/src/models/detector.py) | Config: [config.py VAEConfig](file:///e:/Dat/Research/src/models/config.py)
+### All-class mode
 
-**Vai trò:** Nén ảnh RGB thành latent representation, giảm spatial resolution 8×.
+Khi bỏ `class_ids`:
 
-**Config (matching Flux 2 Klein):**
+```text
+center_heatmap [B,C,H/8,W/8]
+size_map       [B,2C,H/8,W/8]
+offset_map     [B,2C,H/8,W/8]
+```
 
-| Param | Value |
-|-------|-------|
-| `block_out_channels` | `[128, 256, 512, 512]` |
-| `latent_channels` | 16 |
-| `scaling_factor` | 0.3611 |
-| `downsample` | 8× (3 stride-2 stages) |
+Conditioned detector encode ảnh một lần. Shared pathway replicate image tokens theo bounded class chunks; per-class pathway reuse cùng encoded tokens và chạy từng specialist stack. `class_chunk_size` giới hạn số class được xử lý trong mỗi chunk nhưng không đổi output contract.
 
-| Layer | Input → Output |
-|-------|---------|
-| Conv2d(3→128, k=3, s=2, p=1) + SiLU | `[B,3,512,512]` → `[B,128,256,256]` |
-| Conv2d(128→256, k=3, s=2, p=1) + SiLU | → `[B,256,128,128]` |
-| Conv2d(256→512, k=3, s=2, p=1) + SiLU | → `[B,512,64,64]` |
-| Conv2d(512→512, k=3, p=1) + SiLU | → `[B,512,64,64]` |
-| Conv2d(512→16, k=1) | → `[B,16,64,64]` |
+`SharedCenterNetBaseline` tạo all-class maps bằng head `5C` channels trong một pass và có thể gather query output theo `class_ids`.
 
-**Upgrade path:**
+## 3. Image encoder
+
+`ConvImageEncoder` là CNN trainable của project với fixed stride 8:
+
+```text
+RGB image
+  -> Conv2d stride 2 + GroupNorm + SiLU
+  -> Conv2d stride 2 + GroupNorm + SiLU
+  -> Conv2d stride 2 + GroupNorm + SiLU
+  -> optional stride-1 stages từ block_out_channels còn lại
+  -> 1x1 projection tới latent_channels
+```
+
+Với input `[B,3,H,W]`, output phải là:
+
+```text
+[B, latent_channels, H/8, W/8]
+```
+
+`FloorPlanDetector` flatten feature 2D thành tokens, project tới `model_dim`, rồi cộng learned 2D positional embedding. Nếu runtime spatial size khác preset `image_size` nhưng vẫn chia hết cho 8, positional grid được bilinear-interpolate.
+
+Không có latent distribution, sampling, KL loss hoặc external VAE weights trong encoder này.
+
+## 4. Conditioning backends
+
+Mọi conditioner trả `ConditioningOutput`:
+
+```text
+tokens         [B,L,D]
+attention_mask [B,L]      # True = valid token
+pooled         [B,D]
+```
+
+### `none`
+
+`NoConditioner` trả zero signal và mask rỗng. Dùng cho no-conditioning ablation.
+
+### `class_embedding`
+
+`ClassEmbeddingConditioner` lookup một learned vector theo `class_id`, biểu diễn như một valid token. Đây là default của `floorplan_base`.
+
+### `lightweight_text`
+
+`ByteTextConditioner`:
+
+- tokenize deterministic theo UTF-8 bytes;
+- byte `0..255` map tới token ID `1..256`, ID `0` dành cho padding;
+- dùng learned token/position embedding, MLP projection và LayerNorm;
+- masked mean chỉ pool valid tokens;
+- trainable từ random initialization.
+
+Backend này không chứa pretrained linguistic knowledge và không đủ để tự tuyên bố open-vocabulary detection.
+
+### `pretrained_text`
+
+`LazyHFTextConditioner`:
+
+- giữ construction lazy: chưa import `transformers`, load tokenizer/model hoặc truy cập network;
+- `materialize()` là API explicit, idempotent để register HF submodule và khởi tạo projection trước strict checkpoint load hoặc optimizer construction;
+- training materialize pretrained conditioner trước khi tạo optimizer, nên `freeze_pretrained=False` backbone parameters không bị bỏ sót;
+- checkpoint restore chỉ materialize khi state dict thực sự chứa `conditioner.hf_model.*`;
+- truyền tokenizer attention mask vào pooling/fusion;
+- freeze backbone mặc định;
+- dùng `trust_remote_code=False`;
+- có thể đặt revision hoặc local-files-only qua `ConditionerConfig`.
+
+Dependencies riêng:
+
+```bash
+python -m pip install -r requirements-pretrained.txt
+```
+
+Weights phải có trong local cache hoặc được download khi runtime cho phép. Core/lightweight setup không cần dependency này và không tự download model.
+
+## 5. Fusion
+
+`EarlyFusion` nhận image tokens `X` và `ConditioningOutput`.
+
+| Mode | Hành vi |
+|---|---|
+| `none` | Trả image tokens không điều chế |
+| `add` | Project pooled condition rồi cộng vào mọi image token |
+| `film` | Sinh channel-wise `gamma`, `beta`; áp dụng `X * (1 + gamma) + beta` |
+| `cross_attention` | Image tokens query condition tokens, có padding mask |
+| `film_cross_attention` | FiLM trước, image-to-condition cross-attention sau |
+| `current` | Compatibility mode: condition tokens query image tokens, mean-pool rồi broadcast |
+
+No-condition rows được xử lý an toàn: empty mask không tạo NaN và không thêm condition delta.
+
+## 6. Shared và per-class pathways
+
+### Shared
+
+Một `EarlyFusion` và một stack `ObjectLearningBlock` dùng chung cho mọi class. Class/text condition là tín hiệu phân biệt query.
+
+### Per-class
+
+Mỗi class có:
+
+- một `EarlyFusion` riêng;
+- một stack `ObjectLearningBlock` riêng.
+
+Per-class routing tự tăng specialist capacity. Vì vậy muốn kết luận text có ích phải so `per_class + text` với `per_class + no text`, không chỉ so với shared baseline nhỏ hơn.
+
+## 7. ObjectLearningBlock
+
+Mỗi block là pre-norm residual stack:
+
+```text
+x = x + GatedSpatialMixer2D(LayerNorm(x))
+x = x + SelfAttention(LayerNorm(x))
+x = x + FFN(LayerNorm(x))
+```
+
+### GatedSpatialMixer2D
+
+```text
+Linear D -> 2 * inner
+  -> split content, gate
+  -> content reshape [B,inner,H,W]
+  -> depthwise Conv2d
+  -> flatten + LayerNorm
+  -> multiply SiLU(gate)
+  -> Linear inner -> D
+```
+
+Đây là gated depthwise 2D convolution. Nó không phải Mamba, selective scan hay state-space model. Mọi learned parameter đều tham gia forward path.
+
+### SelfAttention
+
+Q/K/V được reshape theo canonical layout `[B,heads,length,head_dim]`. PyTorch scaled-dot-product attention được dùng khi khả dụng. Query-chunk fallback giảm peak memory nhưng vẫn tính attention với mọi key; computational complexity vẫn là `O(L^2)`.
+
+### FFN
+
+```text
+Linear D -> 4D -> GELU -> dropout -> Linear 4D -> D -> dropout
+```
+
+## 8. Detection heads
+
+### Conditioned query head
+
+`HeatmapHead` dùng:
+
+```text
+Conv3x3 -> GroupNorm -> SiLU
+Conv3x3 -> GroupNorm -> SiLU
+Conv1x1 -> 5 raw channels
+```
+
+Activations:
+
+```text
+center_heatmap = sigmoid(raw[:,0:1])
+size_map       = softplus(raw[:,1:3])
+offset_map     = sigmoid(raw[:,3:5])
+```
+
+- heatmap nằm trong `[0,1]`;
+- size dương;
+- fractional offsets nằm trong `[0,1]` về mặt activation contract.
+
+GroupNorm tránh phụ thuộc batch statistics khi selected-class batch bị group theo class.
+
+### Shared CenterNet baseline head
+
+Baseline head xuất `5C` raw channels, reshape thành `[B,C,5,h,w]`, rồi áp dụng cùng sigmoid/softplus/sigmoid contract. Query mode gather class-specific maps từ all-class tensor.
+
+## 9. Data and target contract
+
+Training dùng `FloorPlanQueryDataset`: image-level split được chọn trước, sau đó mỗi image được expand thành một query cho mỗi class có mặt trong image.
+
+Target được sinh trực tiếp ở output resolution:
+
+```text
+center_heatmap [1,h,w]
+size_map       [2,h,w]
+offset_map     [2,h,w]
+mask_map       [1,h,w]
+```
+
+Với bbox input-pixel `[x0,y0,x1,y1)`:
+
+- bbox được scale sang output grid;
+- center cell là `floor(center_float)`;
+- size lưu theo output-cell units;
+- offset lưu phần lẻ của center;
+- Gaussian peak tại center được giữ chính xác bằng `1.0`;
+- regression chỉ tính ở center cells có `mask_map=1`.
+
+Nếu nhiều object cùng class rơi vào một output cell, default collision policy `largest` giữ size/offset của bbox có area lớn hơn. Heatmap vẫn max-composite; `TargetStats` ghi collision/replacement/ignored counts.
+
+## 10. Loss
+
+Implementation trong `src/training/losses.py`:
+
+```text
+L = focal_weight  * CenterNetFocal(center)
+  + size_weight   * SmoothL1(size at masked centers)
+  + offset_weight * SmoothL1(offset at masked centers)
+```
+
+Default CLI weights:
+
+```text
+focal_weight  = 10
+size_weight   = 1
+offset_weight = 1
+```
+
+`focal_loss` yêu cầu target có exact `1.0` positives ở cùng spatial resolution với prediction. Target builder đáp ứng contract này trực tiếp, không tạo full-resolution heatmap rồi bilinear-downsample.
+
+## 11. Decoder và evaluation
+
+`CenterNetDecoder`:
+
+1. áp dụng local-maximum suppression bằng max-pool;
+2. giữ scored peaks theo threshold và top-k per class;
+3. đọc size/offset ở peak cell;
+4. tính center trong input-pixel coordinates bằng output stride;
+5. tạo và clip xyxy boxes;
+6. trả per-image `boxes`, `scores`, `labels`.
+
+`evaluate.py` chạy image-level dataset và tính AP50/AP50:95. Validation loss trong `train.py` không thay thế detection metrics.
+
+## 12. Checkpoint construction
+
+Checkpoint mới lưu `model_config` hoàn chỉnh. Cách load đúng:
+
 ```python
-from diffusers import AutoencoderKL
-vae = AutoencoderKL.from_pretrained("black-forest-labs/FLUX.2-klein-9B", subfolder="vae")
-vae.requires_grad_(False)  # freeze
-latent = vae.encode(image).latent_dist.sample()  # [B, 16, 64, 64]
+from src.data.constants import CLASS_NAMES
+from src.models import ModelConfig, build_model
+from src.training.checkpoint import load_checkpoint, restore_training_state
+
+checkpoint = load_checkpoint("checkpoints/best.pt", map_location="cpu")
+config = ModelConfig.from_dict(checkpoint["model_config"])
+model = build_model(config)
+restore_training_state(
+    checkpoint,
+    model=model,
+    expected_model_config=config,
+    expected_class_names=CLASS_NAMES,
+    expected_output_stride=config.output_stride,
+    weights_only=True,
+    strict=True,
+)
+model.eval()
 ```
 
----
+Không reconstruct model mới bằng một tập constructor arguments phỏng đoán nếu checkpoint đã có serializable config. Checkpoint pre-schema từ kiến trúc lịch sử bị từ chối sớm bằng `CheckpointError`: state dict đó không tương thích với kiến trúc hiện tại và không có migration tự động đã được xác minh.
 
-### 3.2 TextEncoderStub
+## 13. Parameter accounting
 
-> File: [detector.py](file:///e:/Dat/Research/src/models/detector.py) | Config: [config.py TextEncoderConfig](file:///e:/Dat/Research/src/models/config.py)
-
-**Vai trò:** Chuyển tokenized text thành embedding vectors, project về model_dim.
-
-**Config (matching T5-v1.1-XXL):**
-
-| Param | Value |
-|-------|-------|
-| `model_name` | `google/t5-v1_1-xxl` |
-| `vocab_size` | 32128 |
-| `d_model` | 4096 |
-| `num_heads` | 64 |
-| `num_layers` | 24 |
-| `max_length` | 512 |
-
-| Component | Shape | Mô tả |
-|-----------|-------|-------|
-| `nn.Embedding(32128, 4096)` | → `[B, L, 4096]` | Word embedding |
-| `nn.Embedding(512, 4096)` | → `[B, L, 4096]` | Positional encoding |
-| `nn.LayerNorm(4096)` | → `[B, L, 4096]` | Normalize |
-| `nn.Linear(4096, model_dim)` | → `[B, L, model_dim]` | Project về internal dim |
-
-**Forward:** `embed(ids) + pos` → `LayerNorm` → `proj` → `[B, L, model_dim]`
-
-**Upgrade path:**
-```python
-from transformers import T5EncoderModel
-t5 = T5EncoderModel.from_pretrained("google/t5-v1_1-xxl")
-t5.requires_grad_(False)  # freeze
-# + nn.Linear(4096, model_dim) trainable projection
-```
-
----
-
-### 3.3 EarlyFusion
-
-> File: [detector.py L72-96](file:///e:/Dat/Research/src/models/detector.py#L72-L96)
-
-**Vai trò:** Kết hợp thông tin text vào image features thông qua Cross-Attention.
-
-**Cơ chế chi tiết:**
-
-```
-1. Normalize: img = LayerNorm(img_tokens)         [B, 4096, D]
-              txt = LayerNorm(txt_tokens)          [B, 32, D]
-
-2. Cross-Attention:
-   Query = txt   (text hỏi: "tôi đang tìm gì?")
-   Key   = img   (image trả lời: "đây là những gì tôi có")
-   Value = img
-   → fused: [B, 32, D]  (mỗi text token đã "nhìn" vào ảnh)
-
-3. Mean pool: fused_mean = fused.mean(dim=1)       [B, 1, D]
-   → Expand thành [B, 4096, D]
-
-4. Residual: output = img_tokens + proj(fused_mean) [B, 4096, D]
-```
-
-**Tại sao Query=text, không phải Query=image?**
-- Text biết nó đang tìm gì → nó "hỏi" ảnh
-- Kết quả: mỗi text token thu thập thông tin liên quan từ ảnh
-- Mean pool tạo ra một "tóm tắt" text-aware → thêm vào image features
-
----
-
-### 3.4 ObjectLearningBlock (OLB)
-
-> File: [object_learning_block.py L118-179](file:///e:/Dat/Research/src/models/blocks/object_learning_block.py#L118-L179)
-
-**Vai trò:** Khối học chuyên biệt cho mỗi class. Mỗi block xử lý spatial features qua 3 stage.
-
-**Cấu trúc (Pre-Norm Residual):**
-
-```
-Input x: [B, 4096, D]
-  │
-  ├── + class_embed(class_id)           ← Class conditioning
-  │
-  ├── + MambaBlock(LayerNorm(x))        ← Stage 1: Long-range sequence modeling
-  │     │  in_proj → Conv1d → SiLU → gated output → out_proj
-  │     │  Complexity: O(N) — linear with sequence length
-  │     │  Captures: global spatial patterns (walls span entire image)
-  │
-  ├── + SelfAttention(LayerNorm(x))     ← Stage 2: Spatial relationships
-  │     │  Multi-head attention (Q, K, V from same input)
-  │     │  Complexity: O(N²) — quadratic, but captures fine details
-  │     │  Captures: local object arrangements (chair near table)
-  │
-  └── + FFN(LayerNorm(x))              ← Stage 3: Non-linear feature mixing
-        │  Linear(D→4D) → GELU → Linear(4D→D)
-        │  Captures: complex feature combinations
-
-Output: [B, 4096, D]
-```
-
-**35 blocks × 2 depth:** Tổng 70 OLB instances, mỗi class có stack riêng.
-
----
-
-### 3.5 MambaBlock (SSM)
-
-> File: [object_learning_block.py L25-66](file:///e:/Dat/Research/src/models/blocks/object_learning_block.py#L25-L66)
-
-**Vai trò:** Selective State Space Model — xử lý chuỗi dài hiệu quả O(N).
-
-| Component | Shape | Mô tả |
-|-----------|-------|-------|
-| `in_proj` | `D → 2×d_inner` | Split thành x_ssm và gate z |
-| `conv1d` | `d_inner, k=4, groups=d_inner` | Depthwise convolution dọc sequence |
-| `norm + gated` | `d_inner` | `LayerNorm(x_conv) * SiLU(z)` — gated activation |
-| `out_proj` | `d_inner → D` | Project về dim gốc |
-
-**Tại sao Mamba?**
-- 4096 tokens (64×64 spatial) → Self-Attention O(N²) = ~16.7M operations
-- Mamba O(N) = ~4K operations → **4000× nhanh hơn** cho sequence processing
-- Phù hợp cho floor plan: wall/dimension_line trải dài toàn bộ ảnh
-
-**Lưu ý:** Đây là simplified Mamba (không có CUDA selective scan kernel). Khi deploy trên GPU, thay bằng `from mamba_ssm import Mamba` cho hiệu năng tốt hơn.
-
----
-
-### 3.6 SelfAttention
-
-> File: [object_learning_block.py L71-95](file:///e:/Dat/Research/src/models/blocks/object_learning_block.py#L71-L95)
-
-Standard multi-head scaled dot-product attention.
-
-```
-Q, K, V = Linear(x) split into num_heads
-attn = softmax(Q·Kᵀ / √d_k) · V
-output = Linear(concat(heads))
-```
-
-| Param | Default |
-|-------|---------|
-| `num_heads` | 8 |
-| `head_dim` | D / 8 = 32 (khi D=256) hoặc 64 (khi D=512) |
-| `dropout` | 0.1 |
-
----
-
-### 3.7 HeatmapHead (CenterNet)
-
-> File: [detector.py L101-120](file:///e:/Dat/Research/src/models/detector.py#L101-L120)
-
-**Vai trò:** Chuyển feature map thành 3-channel CenterNet output.
-
-```
-Input:  [B, D, 64, 64]   (spatial features)
-  │
-  Conv2d(D→256, k=3, p=1) + BatchNorm2d(256) + ReLU
-  Conv2d(256→128, k=3, p=1) + ReLU
-  Conv2d(128→3, k=1)         ← no activation (raw logits)
-  │
-Output: [B, 3, 64, 64]
-  ├── channel 0 → sigmoid → center_heatmap [B, 1, 64, 64]
-  └── channel 1-2 → ReLU  → size_map       [B, 2, 64, 64]
-```
-
----
-
-## 4. Per-Class Routing (Forward Pass)
-
-Mỗi forward pass nhận 1 cặp `(ảnh, text, class_id)` và route vào đúng block:
+Không hard-code parameter table trong tài liệu. Preset, architecture, pathway, depth, conditioner và optional pretrained backend đều làm count thay đổi.
 
 ```python
-# Trong forward():
-outputs = []
-for i in range(B):
-    cid = class_ids[i].item()              # e.g., 4 (chair)
-    sample = fused[i:i+1]                   # [1, 4096, D]
-    for block in self.class_blocks[cid]:    # class_blocks[4] → chair pathway
-        sample = block(sample, dummy_cid)
-    outputs.append(sample)
-x = torch.cat(outputs, dim=0)              # [B, 4096, D]
+from src.models import build_model
+
+model = build_model("floorplan_base")
+total = sum(parameter.numel() for parameter in model.parameters())
+trainable = sum(
+    parameter.numel()
+    for parameter in model.parameters()
+    if parameter.requires_grad
+)
+print(f"total={total:,} trainable={trainable:,}")
 ```
 
-**Training:** Dataset expand mỗi ảnh × N classes = N samples riêng biệt. Mỗi epoch xử lý hết 44,229 cặp → tất cả 35 blocks đều được train đầy đủ.
+Mọi experiment report phải ghi:
 
-**Inference:** Chạy 35 forward passes trên cùng 1 ảnh, mỗi lần với 1 text class khác nhau → 35 kết quả detection → gộp lại thành bounding boxes cho tất cả objects.
+- preset name;
+- resolved `model.config.to_dict()`;
+- measured total/trainable parameter count;
+- input size/output stride;
+- conditioner preload/freeze state;
+- latency/memory nếu có đo thực tế.
 
----
+## 14. Claims boundary
 
-## 5. Loss Functions
+Implementation cho phép kiểm tra các giả thuyết về class conditioning, fixed text, pretrained text và specialist pathways. Repository không tự chứng minh:
 
-> File: [train.py L28-76](file:///e:/Dat/Research/train.py#L28-L76)
-
-### 5.1 Penalty-Reduced Focal Loss (center_heatmap)
-
-Dùng cho Gaussian heatmap, giảm penalty cho vùng gần tâm thật.
-
-```
-L_focal = -1/N × Σ {
-  log(p) × (1-p)^α     nếu target = 1 (tâm đúng)
-  log(1-p) × p^α × (1-target)^β   nếu target < 1 (vùng lân cận)
-}
-```
-
-| Param | Value | Ý nghĩa |
-|-------|-------|---------|
-| α | 2.0 | Phạt nặng hơn khi prediction sai ở positive locations |
-| β | 4.0 | Giảm penalty mạnh hơn cho vùng gần tâm (Gaussian tail) |
-
-### 5.2 Masked L1 Loss (size_map)
-
-Chỉ tính loss tại pixel tâm vật thể (mask_map = 1).
-
-```
-L_size = Σ|pred_size - target_size| × mask / Σ mask
-```
-
-### 5.3 Combined Loss
-
-```
-L_total = 1.0 × L_focal + 0.1 × L_size
-```
-
-Size loss weight nhỏ (0.1) vì focal loss quan trọng hơn — model cần tìm đúng tâm trước, rồi mới dự đoán kích thước.
-
----
-
-## 6. Thông Số & Scaling
-
-| Config | `model_dim=256` | `model_dim=512` |
-|--------|-----------------|-----------------|
-| VAEEncoderStub | 0.66M | 0.66M |
-| TextEncoderStub | 8.4M | 16.8M |
-| img_proj | 4K | 8K |
-| EarlyFusion | 0.79M | 3.15M |
-| **35 × OLB (2 deep)** | **119.8M** | **479M** |
-| HeatmapHead | 1.97M | 3.5M |
-| **Total** | **~131.6M** | **~503M** |
-
-> [!NOTE]
-> 91% params nằm trong 35 per-class OLB. Đây là thiết kế có chủ đích — mỗi class cần đủ capacity để học pattern riêng. Nếu cần giảm params, giảm `depth_per_class` từ 2 → 1 (chia đôi OLB params).
-
----
-
-## 7. Stub → Production Upgrade Path
-
-| Component | Stub hiện tại | Production target | Frozen? |
-|-----------|--------------|-------------------|---------|
-| VAEEncoderStub | 3-layer Conv, random init | Flux VAE (`AutoencoderKL`) | ✅ Yes |
-| TextEncoderStub | Embedding + Pos, random init | T5-Base hoặc CLIP Text | ✅ Yes |
-| Tokenizer | `hash(word) % vocab_size` | T5 Tokenizer / CLIP Tokenizer | — |
-| MambaBlock | Simplified (no CUDA kernel) | `mamba_ssm.Mamba` | ❌ Trainable |
-
-**Lưu ý:** Khi thay encoder, cần thêm `nn.Linear(encoder_dim, model_dim)` projection nếu encoder output dim ≠ model_dim.
+- spatial mixer tốt hơn Mamba/SSM;
+- text-conditioned preset tốt hơn no-text baseline;
+- random-init byte text hiểu semantic ngoài prompt đã train;
+- per-class architecture tốt hơn sau khi kiểm soát parameter budget;
+- bất kỳ AP/mAP value nào trước khi evaluator thực sự chạy trên manifest được công bố.

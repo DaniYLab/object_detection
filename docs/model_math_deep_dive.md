@@ -1,965 +1,706 @@
-# Model Math Deep Dive — Render-Safe Version
+# Model Math Deep Dive — Current Implementation
 
-> Phiên bản này tránh dùng LaTeX `\[...\]` vì một số markdown viewer không render được. Công thức được viết bằng plain text / code block để đọc được ở GitHub, terminal, VS Code, Colab hoặc viewer thường.
+Tài liệu này formalize code hiện tại bằng plain text để render ổn định trong GitHub, terminal, VS Code và Colab. Nó mô tả implementation, không phải báo cáo kết quả thực nghiệm.
 
----
+## 1. Bài toán detection
 
-## 1. Formalize bài toán
-
-Với một ảnh floor plan:
+Một ảnh input sau preprocessing:
 
 ```text
-I ∈ R^(3 × H × W)
+I in R^(B x 3 x H x W)
 ```
 
-Với 35 class:
+FloorPlanCAD có `C=35` class trong benchmark chính. Conditioned detector hỗ trợ hai chế độ.
+
+### Query mode
+
+Mỗi ảnh đi kèm class ID `c_b` và optional text `t_b`:
 
 ```text
-c ∈ {0, 1, ..., 34}
+f(I_b, c_b, t_b) -> (Y_hat_b, S_hat_b, O_hat_b)
 ```
 
-Mỗi class có một text prompt cố định:
+Shape:
 
 ```text
-T_c = "Find {class_name} in this floor plan drawing"
+Y_hat in [0,1]^(B x 1 x h x w)
+S_hat in R_>0^(B x 2 x h x w)
+O_hat in (0,1)^(B x 2 x h x w)
 ```
 
-Model học ánh xạ:
+### All-class mode
 
 ```text
-f_θ(I, T_c, c) → (Y_hat_c, S_hat_c, O_hat_c)
+f_all(I) -> (Y_hat_all, S_hat_all, O_hat_all)
 ```
 
-Trong đó:
+Shape:
 
 ```text
-Y_hat_c ∈ [0, 1]^(1 × h × w)       # center heatmap cho class c
-S_hat_c ∈ R_>=0^(2 × h × w)        # size map: width, height tại tâm object
-O_hat_c ∈ [0, 1)^(2 × h × w)       # offset map: fractional dx, dy trong output cell
+Y_hat_all in [0,1]^(B x C x h x w)
+S_hat_all in R_>0^(B x 2C x h x w)
+O_hat_all in (0,1)^(B x 2C x h x w)
 ```
 
-Vì VAE/downsample factor = 8:
+Output stride hiện cố định:
 
 ```text
-h = H / 8
-w = W / 8
+s = 8
+h = H / s
+w = W / s
 ```
 
-Với ảnh 512×512:
+Do đó `H` và `W` phải chia hết cho 8. Ví dụ `512 x 512 -> 64 x 64`.
+
+## 2. Image encoder
+
+`ConvImageEncoder` là CNN trainable ba lần downsample stride 2:
 
 ```text
-h = w = 64
+Z = E_img(I)
+Z.shape = [B, C_z, H/8, W/8]
 ```
 
----
+Nó không parameterize một probability distribution và không sample latent variable. Tên compatibility `VAEConfig` không thay đổi computation này.
 
-## 2. Triết lý kiến trúc
-
-Dự án không phải object detection thông thường. Concept chính là **Conditioned Reflex Learning**:
-
-- **Text prompt** là tác nhân kích thích — stimulus.
-- **Mỗi class có pathway riêng** — giống một đường dây thần kinh chuyên biệt.
-- Model không tự detect mọi thứ một cách mù; nó phản ứng với stimulus.
-
-Ví dụ:
+Flatten spatial grid:
 
 ```text
-"Find chair" → kích hoạt pathway chair → output vị trí chair
-"Find wall"  → kích hoạt pathway wall  → output vị trí wall
+N = h * w
+Z_tokens = flatten_hw(Z).transpose(channel, token)
+Z_tokens.shape = [B, N, C_z]
 ```
 
-Pipeline ý tưởng:
+Linear projection tới model dimension `D`:
 
 ```text
-Image
-  ↓
-VAE Encoder
-  ↓
-Image tokens
-  ↓
-For class c:
-  Fixed text T_c
-      ↓
-  Text Encoder
-      ↓
-  Early Fusion(image tokens, text tokens)
-      ↓
-  class_blocks[c]
-      ↓
-  CenterNet Head
-      ↓
-  center_heatmap + size_map + offset_map
+X_0 = Z_tokens W_img + P_2d
+X_0.shape = [B, N, D]
 ```
 
----
+`P_2d` là learned positional grid. Khi runtime grid khác preset grid, code reshape `P_2d` về 2D, bilinear-interpolate rồi flatten lại.
 
-## 3. Image encoder: ảnh thành token
+## 3. Condition representation
 
-Input batch:
+Mọi conditioner trả ba tensor:
 
 ```text
-I.shape = [B, 3, 512, 512]
+T in R^(B x L x D)       # condition tokens
+M in {0,1}^(B x L)       # valid-token mask
+p in R^(B x D)           # pooled condition
 ```
 
-Qua VAE encoder stub:
+Masked mean:
 
 ```text
-Z = E_vae(I)
-Z.shape = [B, 16, 64, 64]
+p_b = sum_l M[b,l] * T[b,l] / max(1, sum_l M[b,l])
 ```
 
-Flatten spatial dimension:
+Nếu row không có valid token, numerator bằng 0 và denominator được clamp thành 1, nên pooled output bằng 0 thay vì NaN.
+
+### No condition
 
 ```text
-64 × 64 = 4096
-Z_flat.shape = [B, 4096, 16]
+T = 0
+M = 0
+p = 0
 ```
 
-Project latent channel 16 sang model dimension D:
+### Class embedding
+
+Với embedding table `E_cls in R^(C x D)`:
 
 ```text
-X = Z_flat @ W_img
-X.shape = [B, 4096, D]
+p_b = E_cls[c_b]
+T_b = p_b[None, :]
+M_b = [1]
 ```
 
-Với `model_dim=256`:
+### Lightweight byte text
+
+Text được encode thành UTF-8 bytes. Byte value `q in {0,...,255}` map tới token ID `q+1`; token ID 0 là padding.
 
 ```text
-X.shape = [B, 4096, 256]
+H_l = E_byte[id_l] + E_pos[l]
+T_l = LayerNorm(MLP(H_l))
+p   = masked_mean(T, M)
 ```
 
-Mỗi token tương ứng với một vùng 8×8 pixel trên ảnh gốc.
+Embedding/MLP được train từ random initialization. Đây là deterministic tokenization, không phải pretrained language semantics.
 
----
+### Optional pretrained text
 
-## 4. Text encoder: stimulus thành embedding
-
-Với class `chair`:
+Hugging Face tokenizer/model tạo hidden states `H_hf`; project projection đưa chúng về `D`:
 
 ```text
-T_c = "Find chair in this floor plan drawing"
+T = LayerNorm(H_hf W_hf)
+p = masked_mean(T, attention_mask)
 ```
 
-Tokenized thành:
+Backbone được freeze mặc định. Model/tokenizer chỉ load ở forward đầu tiên và cần optional dependencies cùng weights cache/network access.
+
+## 4. Fusion
+
+Gọi image tokens trước fusion là `X` và pooled condition là `p`.
+
+### None
 
 ```text
-ids_c.shape = [L]
-L = 32 hiện tại
+F = X
 ```
 
-Text encoder stub tạo embedding kiểu T5:
+### Additive
 
 ```text
-U_c.shape = [B, L, 4096]
+delta = W_add p
+F = LayerNorm(X + delta[:,None,:])
 ```
 
-Project xuống model dimension:
+Với empty condition mask, code nhân `delta` với zero valid-row indicator.
+
+### FiLM
+
+Một MLP sinh `gamma` và `beta`:
 
 ```text
-Q_c = U_c @ W_text
-Q_c.shape = [B, L, D]
+[gamma, beta] = MLP_film(p)
+F_pre = X * (1 + gamma[:,None,:]) + beta[:,None,:]
+F = LayerNorm(F_pre)
+```
+
+`gamma=beta=0` tương ứng identity trước output normalization.
+
+### Image-to-condition cross-attention
+
+Current spatial cross-attention dùng image tokens làm query:
+
+```text
+Q = LN_img(X) W_Q
+K = LN_cond(T) W_K
+V = LN_cond(T) W_V
+
+A = softmax(Q K^T / sqrt(d_head) + padding_mask)
+C = A V
+F = LayerNorm(X + W_o C)
+```
+
+Shape theo mỗi head:
+
+```text
+Q: [B, heads, N, d_head]
+K: [B, heads, L, d_head]
+A: [B, heads, N, L]
+```
+
+Padding mask loại invalid condition tokens. Empty rows được thay bằng một safe zero token trong attention call, rồi attention delta bị zero sau đó.
+
+### FiLM + cross-attention
+
+```text
+X_film = FiLM(X, p)
+F = LayerNorm(X_film + CrossAttention(X_film, T, M))
+```
+
+### Legacy `current` mode
+
+Compatibility mode đảo query/key direction:
+
+```text
+C_text = CrossAttention(query=T, key=X, value=X)
+summary = masked_mean(C_text, M)
+F = LayerNorm(X + W summary)
+```
+
+Mode này tạo global broadcast delta. Nó được giữ để tương thích, không phải default preset contract mới.
+
+## 5. Pathway routing
+
+### Shared pathway
+
+Mọi query dùng cùng parameters:
+
+```text
+H_0 = Fusion_shared(X, condition)
+H_k = Block_shared_k(H_(k-1))
+```
+
+Class differentiation đến từ conditioner/fusion.
+
+### Per-class pathway
+
+Class `c` chọn fusion và block stack riêng:
+
+```text
+H_0 = Fusion_c(X, condition)
+H_k = Block_(c,k)(H_(k-1))
+```
+
+Selected-class batch được partition theo unique class IDs. Với group indices `G_c`:
+
+```text
+H_c = Pathway_c(X[G_c])
+```
+
+Các output group sau đó được concatenate và permute về batch order ban đầu. Vì routing tự mang class information và thay đổi parameter budget, per-class gains không thể tự động được quy cho text.
+
+## 6. GatedSpatialMixer2D
+
+Input token tensor:
+
+```text
+X in R^(B x N x D), N = h*w
+```
+
+Projection và split:
+
+```text
+[U, G] = X W_in
+U, G in R^(B x N x D_inner)
+D_inner = expand * D
+```
+
+Reshape content về spatial grid:
+
+```text
+U_2d = reshape(U) in R^(B x D_inner x h x w)
+```
+
+Depthwise convolution:
+
+```text
+V_2d[channel] = K_channel (*) U_2d[channel]
+```
+
+Mỗi channel có kernel spatial riêng; `groups=D_inner`. Flatten lại và gate:
+
+```text
+V = flatten_hw(V_2d)
+R = LayerNorm(V) * SiLU(G)
+Y = Dropout(R W_out)
+```
+
+Block residual stage:
+
+```text
+X_1 = X + Mixer(LayerNorm(X))
+```
+
+Computation này là gated local 2D mixing. Không có recurrent state, selective scan, state transition matrix hoặc Mamba kernel.
+
+## 7. Self-attention
+
+Từ normalized tokens `X_1`:
+
+```text
+[Q, K, V] = X_1 W_qkv
+```
+
+Reshape chuẩn:
+
+```text
+Q, K, V in R^(B x heads x N x d_head)
+d_head = D / heads
+```
+
+Attention:
+
+```text
+A = softmax(Q K^T / sqrt(d_head), dim=key)
+Y = concat_heads(A V) W_o
+X_2 = X_1_residual_base + Y
+```
+
+Trong block code:
+
+```text
+X_2 = X_1 + SelfAttention(LayerNorm(X_1))
+```
+
+Attention matrix có `N^2` query-key pairs. Với `N=4096`, mỗi head conceptually có `16,777,216` pairs. PyTorch SDPA có thể dùng memory-efficient kernels, và fallback có thể chunk query dimension, nhưng full-key interaction vẫn giữ computational complexity `O(N^2)`.
+
+## 8. Feed-forward network
+
+```text
+FFN(X) = Dropout(Linear_2(Dropout(GELU(Linear_1(X)))))
+```
+
+Default expansion:
+
+```text
+D -> 4D -> D
+```
+
+Residual stage:
+
+```text
+X_3 = X_2 + FFN(LayerNorm(X_2))
+```
+
+Một `ObjectLearningBlock` hoàn chỉnh:
+
+```text
+X_1 = X_0 + Mixer(LN_1(X_0))
+X_2 = X_1 + Attention(LN_2(X_1))
+X_3 = X_2 + FFN(LN_3(X_2))
+```
+
+## 9. Query head
+
+Sau pathway:
+
+```text
+H in R^(B x N x D)
+H_2d = reshape(LayerNorm(H)) in R^(B x D x h x w)
+R = ConvHead(H_2d) in R^(B x 5 x h x w)
+```
+
+Channel split:
+
+```text
+Y_hat = sigmoid(R[:,0:1])
+S_hat = softplus(R[:,1:3])
+O_hat = sigmoid(R[:,3:5])
 ```
 
 Ý nghĩa:
 
-- Text không phải phụ kiện.
-- Text là **stimulus chính**.
-- Mỗi text class định hướng model tìm đúng object tương ứng.
-
----
-
-## 5. Early Fusion: text hỏi ảnh
-
-EarlyFusion hiện tại dùng cross-attention với:
-
 ```text
-Query = text tokens
-Key   = image tokens
-Value = image tokens
+Y_hat[0]   = center confidence
+S_hat[0]   = width in output-cell units
+S_hat[1]   = height in output-cell units
+O_hat[0]   = fractional center x offset
+O_hat[1]   = fractional center y offset
 ```
 
-Attention chuẩn:
+`softplus` giữ predicted size dương mà không tạo zero-gradient half-space như hard ReLU.
+
+## 10. All-class layout
+
+Với class `c`, regression channels được đặt tại:
 
 ```text
-Attention(Q, K, V) = softmax((Q @ K^T) / sqrt(d)) @ V
+size x/y   -> channels 2c, 2c+1
+offset x/y -> channels 2c, 2c+1
 ```
 
-Ở đây:
+Conditioned shared pathway xử lý class chunks. Với chunk `[a,b)` có `K=b-a` class:
 
 ```text
-Q = Q_c
-Q.shape = [B, L, D]
-
-K = V = X
-K.shape = V.shape = [B, N, D]
-
-N = 4096
+X_expand.shape = [B*K, N, D]
+class_ids.shape = [B*K]
 ```
 
-Attention matrix:
+Sau query head, output reshape về `[B,K,...]` rồi concatenate theo class dimension. Per-class pathway chạy từng class specialist trên cùng encoded image tokens. Baseline trực tiếp xuất `5C` raw channels rồi reshape `[B,C,5,h,w]`.
+
+## 11. Target coordinates
+
+Ground-truth bbox ở input pixels dùng half-open xyxy:
 
 ```text
-A_c = softmax((Q_c @ X^T) / sqrt(d))
-A_c.shape = [B, L, N]
+b = (x0, y0, x1, y1)
+0 <= x0 < x1 <= W
+0 <= y0 < y1 <= H
 ```
 
-Output:
+Scale sang output grid:
 
 ```text
-F_c = A_c @ X
-F_c.shape = [B, L, D]
-```
-
-Code hiện tại mean-pool text-aware output:
-
-```text
-F_bar_c = mean(F_c, dim=text_length)
-F_bar_c.shape = [B, 1, D]
-```
-
-Broadcast về toàn bộ image tokens:
-
-```text
-X'_c = X + Linear(F_bar_c)
-X'_c.shape = [B, N, D]
-```
-
-### Nhận xét
-
-EarlyFusion hiện tại tạo một **global text-aware bias** cho toàn bộ ảnh. Mọi spatial token nhận cùng một vector điều kiện hóa bởi text.
-
-Ưu điểm:
-
-- Đơn giản
-- Rẻ
-- Dễ train
-
-Nhược điểm:
-
-- Spatial selectivity còn yếu
-- Text chưa trực tiếp modulate từng token ảnh
-
-Một hướng nâng cấp sau này:
-
-```text
-X'_c = X + CrossAttention(Q=image_tokens, K=text_tokens, V=text_tokens)
-```
-
-Khi đó mỗi image token tự hỏi: “với text này, tôi có liên quan không?”
-
----
-
-## 6. Per-class Object Learning Blocks
-
-Sau fusion, feature được route vào block riêng của class:
-
-```text
-X'_c → B_c
-```
-
-Có 35 pathways:
-
-```text
-B_0, B_1, ..., B_34
-```
-
-Mỗi `B_c` là stack gồm `depth_per_class` ObjectLearningBlocks.
-
-Với depth = 2:
-
-```text
-H_c^(0) = X'_c
-H_c^(1) = OLB_c^(0)(H_c^(0))
-H_c^(2) = OLB_c^(1)(H_c^(1))
-
-H_c = H_c^(2)
-```
-
-Ý nghĩa sinh học:
-
-```text
-class_blocks[4]  → chair pathway
-class_blocks[8]  → door_double pathway
-class_blocks[30] → wall pathway
-```
-
-Mỗi block tích lũy kinh nghiệm riêng cho class của nó.
-
----
-
-## 7. ObjectLearningBlock toán học
-
-Một ObjectLearningBlock gồm 3 residual stages:
-
-```text
-x = x + Mamba(LayerNorm(x))
-x = x + SelfAttention(LayerNorm(x))
-x = x + FFN(LayerNorm(x))
-```
-
-Viết đầy đủ:
-
-```text
-X1 = X  + Mamba(LN(X))
-X2 = X1 + Attention(LN(X1))
-X3 = X2 + FFN(LN(X2))
-
-OLB(X) = X3
-```
-
-Đây là kiến trúc **Pre-Norm Residual**, giống nhiều Transformer hiện đại.
-
----
-
-## 8. Mamba-like block hiện tại
-
-MambaBlock hiện tại là approximation, chưa phải selective scan thật.
-
-Input:
-
-```text
-X.shape = [B, N, D]
-```
-
-Linear projection:
-
-```text
-[X_ssm, Z] = X @ W_in
-X_ssm.shape = Z.shape = [B, N, d_inner]
-```
-
-Depthwise Conv1D theo sequence:
-
-```text
-C = DWConv1D(X_ssm)
-```
-
-Activation:
-
-```text
-C' = SiLU(C)
-```
-
-Gating:
-
-```text
-G = LayerNorm(C') * SiLU(Z)
-```
-
-Project về D:
-
-```text
-Y = G @ W_out
-Y.shape = [B, N, D]
-```
-
-### Nhận xét
-
-Token order hiện tại là flatten 2D sang 1D:
-
-```text
-(0,0), (0,1), ..., (0,63),
-(1,0), (1,1), ...
-```
-
-Do đó Conv1D học tốt quan hệ gần theo raster order. Quan hệ dọc trong ảnh cách nhau 64 token.
-
-Mamba thật với selective scan sẽ phù hợp hơn cho long-range dependencies.
-
----
-
-## 9. Self-Attention trong OLB
-
-Self-attention chuẩn:
-
-```text
-Q = X @ W_Q
-K = X @ W_K
-V = X @ W_V
-
-A = softmax((Q @ K^T) / sqrt(d))
-Y = A @ V
-```
-
-Với `N = 4096`:
-
-```text
-A.shape = [4096, 4096]
-4096^2 = 16,777,216 attention pairs
-```
-
-Self-attention giúp model học global relations:
-
-- door nằm trên wall
-- chair gần table
-- sink/toilet trong bathroom
-- wall và dimension line trải dài toàn ảnh
-
-Nhược điểm là chi phí tính toán cao, đặc biệt khi inference 35 classes.
-
----
-
-## 10. FFN
-
-FFN có dạng:
-
-```text
-FFN(X) = W2 * activation(W1 * X)
-```
-
-Với expansion 4:
-
-```text
-D → 4D → D
-```
-
-Với `D=256`:
-
-```text
-256 → 1024 → 256
-```
-
-FFN chịu trách nhiệm nonlinear feature mixing sau khi sequence/spatial information đã được Mamba và Attention trộn.
-
----
-
-## 11. CenterNet Head
-
-Sau class block:
-
-```text
-H_c.shape = [B, 4096, D]
-```
-
-Reshape về spatial map:
-
-```text
-H_2d.shape = [B, D, 64, 64]
-```
-
-Qua Conv head:
-
-```text
-O_c = ConvHead(H_2d)
-O_c.shape = [B, 5, 64, 64]
-```
-
-Tách channels:
-
-```text
-center_heatmap = sigmoid(O_c[:, 0:1])
-size_map       = relu(O_c[:, 1:3])
-offset_map     = sigmoid(O_c[:, 3:5])
-```
-
-Trong đó:
-
-```text
-center_heatmap: xác suất tâm object
-size_map[0]   : width
-size_map[1]   : height
-```
-
----
-
-## 12. CenterNet target
-
-Với bbox:
-
-```text
-bbox = (x0, y0, x1, y1)
-```
-
-Scale từ ảnh gốc 512 sang output 64:
-
-```text
-s = 64 / 512 = 1 / 8
-
-x0' = x0 * s
-y0' = y0 * s
-x1' = x1 * s
-y1' = y1 * s
-```
-
-Center:
-
-```text
-cx = (x0' + x1') / 2
-cy = (y0' + y1') / 2
+scale_x = w / W
+scale_y = h / H
+
+x0' = x0 * scale_x
+y0' = y0 * scale_y
+x1' = x1 * scale_x
+y1' = y1 * scale_y
 ```
 
 Size:
 
 ```text
-w = x1' - x0'
-h = y1' - y0'
+bw = x1' - x0'
+bh = y1' - y0'
 ```
 
-Heatmap Gaussian:
+Continuous center:
 
 ```text
-Y[x, y] = exp(-((x - cx)^2 + (y - cy)^2) / (2 * sigma^2))
+cx_f = (x0' + x1') / 2
+cy_f = (y0' + y1') / 2
 ```
 
-Nếu nhiều object overlap:
+Discrete center cell:
 
 ```text
-Y = max(Y, Gaussian_for_current_bbox)
+cx = floor(cx_f)
+cy = floor(cy_f)
 ```
 
-Size map chỉ có giá trị tại center:
+Offset target:
 
 ```text
-S[0, cy, cx] = w
-S[1, cy, cx] = h
-M[cy, cx]    = 1
+dx = cx_f - cx
+dy = cy_f - cy
+0 <= dx,dy < 1
 ```
 
----
-
-## 13. Focal Loss
-
-Prediction:
+Regression targets ở center cell:
 
 ```text
-p = predicted center_heatmap value
+S[0,cy,cx] = bw
+S[1,cy,cx] = bh
+O[0,cy,cx] = dx
+O[1,cy,cx] = dy
+M[0,cy,cx] = 1
 ```
 
-Target:
+## 12. Center heatmap
+
+Code dùng CornerNet/CenterNet IoU-based radius với `min_overlap=0.7`. Gọi rounded box dimensions là `height=ceil(bh)`, `width=ceil(bw)`; ba candidate radii được tính từ quadratic constraints và lấy minimum, sau đó integer-floor/clamp về radius không âm.
+
+Gaussian kernel diameter:
 
 ```text
-y = target center_heatmap value
+diameter = 2 * radius + 1
+sigma = diameter / 6
 ```
 
-Positive pixel:
+Kernel:
 
 ```text
-y = 1
+G(x,y) = exp(-(x^2 + y^2) / (2 sigma^2))
 ```
 
-Negative pixel:
+Heatmap combine nhiều object bằng elementwise maximum:
 
 ```text
-y < 1
+Y = max(Y, shifted_G)
 ```
 
-Positive loss:
+Sau khi draw, code gán center cell chính xác bằng `1.0`. Điều này quan trọng vì focal loss dùng:
 
 ```text
-L_pos = log(p) * (1 - p)^alpha
+positive = target == 1
 ```
 
-Negative loss:
+Target được tạo trực tiếp ở `(h,w)`, không downsample Gaussian từ input resolution.
+
+## 13. Center-cell collisions
+
+Nếu hai bbox cùng query class có center floor vào cùng `(cx,cy)`, một cell không thể lưu hai cặp size/offset khác nhau.
+
+Default policy `largest`:
 
 ```text
-L_neg = log(1 - p) * p^alpha * (1 - y)^beta
+if cell empty:
+    write regression target
+elif new_area > stored_area:
+    replace stored size/offset
+else:
+    keep stored size/offset
 ```
 
-Total:
+Heatmap vẫn được draw cho từng bbox trước collision resolution. `TargetStats` ghi:
 
 ```text
-L_focal = -1/N * (sum(L_pos over positives) + sum(L_neg over negatives))
+valid_boxes
+encoded_boxes
+collisions
+replacements
+ignored_collisions
+collision_rate = collisions / valid_boxes
 ```
 
-Default:
+Số collision là limitation của representation ở stride 8 và phải được report, không được bỏ qua khi phân tích recall.
+
+## 14. CenterNet focal loss
+
+Cho prediction probability `p` và target heatmap value `y`.
+
+Positive indicator:
 
 ```text
-alpha = 2
-beta  = 4
+I_pos = 1[y == 1]
 ```
 
-Ý nghĩa:
-
-- Tâm thật phải có `p → 1`
-- Background phải có `p → 0`
-- Vùng gần tâm Gaussian không bị phạt quá nặng nhờ `(1-y)^beta`
-
-Ví dụ nếu `y = 0.7`:
+Negative indicator và weight:
 
 ```text
-(1 - y)^4 = 0.3^4 = 0.0081
+I_neg = 1[y < 1]
+w_neg = (1 - y)^beta
 ```
 
----
-
-## 14. Masked L1 Size Loss
-
-Prediction:
+Với defaults `alpha=2`, `beta=4`:
 
 ```text
-S_hat.shape = [B, 2, h, w]
+L_pos = log(p) * (1-p)^alpha * I_pos
+L_neg = log(1-p) * p^alpha * (1-y)^beta * I_neg
 ```
 
-Target:
+Nếu có positives:
 
 ```text
-S.shape = [B, 2, h, w]
+L_center = -(sum L_pos + sum L_neg) / N_pos
 ```
 
-Mask:
+Nếu không có positive, implementation trả negative-loss mean thay vì sum. Normal query dataset được xây từ class thực sự có trong ảnh, nên target contract kỳ vọng có ít nhất một valid center trừ trường hợp annotation/transform bị loại hoàn toàn.
+
+## 15. Masked Smooth L1 losses
+
+Với error `d = prediction - target`, PyTorch Smooth L1 mặc định dùng transition beta 1:
 
 ```text
-M.shape = [B, 1, h, w]
-M ∈ {0, 1}
+smooth_l1(d) = 0.5 * d^2        if abs(d) < 1
+             = abs(d) - 0.5     otherwise
 ```
 
-Loss:
+Mask một channel được expand sang hai regression channels:
 
 ```text
-L_size = sum(M * abs(S_hat - S)) / (sum(M) + eps)
+M_2 = expand(M, channels=2)
 ```
 
-Chỉ tính tại center object.
-
----
-
-## 15. Total Loss sau chỉnh sửa
-
-Trước đây:
+Size loss:
 
 ```text
-L = 1.0 * L_focal + 0.1 * L_size
+L_size = sum(M_2 * smooth_l1(S_hat - S)) / max(1, sum(M_2))
 ```
 
-Sau khi training log cho thấy focal collapse, chỉnh thành:
+Offset loss:
 
 ```text
-L = 10.0 * L_focal + 0.1 * L_size
+L_offset = sum(M_2 * smooth_l1(O_hat - O)) / max(1, sum(M_2))
 ```
 
-Lý do:
+Total loss defaults:
 
 ```text
-Epoch 2:
-focal  ≈ 0.0000
-size_l1 ≈ 22
-total  ≈ 2.2
+L_total = 10 * L_center + 1 * L_size + 1 * L_offset
 ```
 
-Vì:
+Các weight này là CLI defaults, không phải bằng chứng rằng chúng tối ưu. Chúng phải được ghi trong run config/report.
+
+## 16. Decoder
+
+Sau local max suppression, với peak ở integer output cell `(x,y)`:
 
 ```text
-0.1 * 22 = 2.2
+center_x_px = (x + O_hat_x[y,x]) * stride_x
+center_y_px = (y + O_hat_y[y,x]) * stride_y
+width_px    = S_hat_w[y,x] * stride_x
+height_px   = S_hat_h[y,x] * stride_y
 ```
 
-Focal gần như biến mất, model không còn đủ áp lực học center. Tăng focal weight giúp ép model tiếp tục học vị trí tâm object.
-
----
-
-## 16. Vì sao focal loss có thể collapse?
-
-Center heatmap rất sparse.
-
-Output 64×64 có:
+Decoded box:
 
 ```text
-4096 pixels
+x0 = center_x_px - width_px / 2
+y0 = center_y_px - height_px / 2
+x1 = center_x_px + width_px / 2
+y1 = center_y_px + height_px / 2
 ```
 
-Một ảnh/class có thể chỉ có 1–5 centers.
+Boxes được clip vào input image bounds và loại nếu non-finite, non-positive size hoặc trở thành degenerate sau clip.
 
-Nếu model predict gần 0 mọi nơi:
+`topk` được áp dụng per class sau local-peak selection. Threshold là score floor; AP report phải ghi threshold/top-k vì chúng có thể ảnh hưởng prediction set.
+
+## 17. Detection metrics
+
+Matching diễn ra trong cùng `(image_id, class_id)`:
+
+1. sort predictions theo score giảm dần;
+2. với mỗi prediction, chọn unmatched GT có IoU cao nhất;
+3. prediction là TP nếu IoU đạt threshold, nếu không là FP;
+4. mỗi GT chỉ match tối đa một prediction.
+
+IoU continuous xyxy:
 
 ```text
-p ≈ 0
+IoU(A,B) = area(intersection(A,B)) / area(union(A,B))
 ```
 
-Negative loss:
+Không dùng inclusive-pixel `+1`.
+
+AP dùng 101 recall points:
 
 ```text
-log(1-p) * p^alpha ≈ 0
+R = {0.00, 0.01, ..., 1.00}
+AP_t = mean_r max(precision where recall >= r)
 ```
 
-Positive loss đáng lẽ phải lớn, nhưng code hiện tại xác định positive bằng:
+Report chính:
+
+```text
+AP50     = class-macro AP at IoU 0.50
+AP50:95  = class-macro mean over IoU 0.50,0.55,...,0.95
+```
+
+Macro average chỉ gồm class có ít nhất một ground-truth instance. Evaluator hiện không implement COCO area ranges, crowd handling hoặc max-detections variants, nên claim phải gọi đúng metric implementation này thay vì nói chung là full COCO evaluation.
+
+## 18. Validation và held-out test
+
+Training loop dùng query-level validation loss trên `val`, không dùng `test_set`:
+
+```text
+train source images -> deterministic image-level train/val split
+original test_set   -> untouched test split
+```
+
+Checkpoint selection dựa trên `val_loss` hiện tại. Detection AP có thể chạy trên `val` để chọn/tune decoder. Test AP chỉ được chạy sau khi preset, checkpoint, threshold, top-k và hyperparameters đã chốt.
+
+## 19. Checkpoint state
+
+Checkpoint schema v2 chứa:
+
+```text
+model_state
+model_config + fingerprint
+preset
+optimizer_state
+scheduler_state
+epoch + global_step
+best_metric + metrics
+class mapping + fingerprint
+output_stride
+split manifest fingerprint
+metadata fingerprint
+Python/NumPy/PyTorch/DataLoader RNG state
+```
+
+Exact resume yêu cầu runtime config và data fingerprints khớp. `--weights-only` chỉ nạp model state rồi restart optimizer/scheduler/RNG.
+
+## 20. Parameter scaling và đo lường
+
+Một số thành phần tuyến tính/attention/FFN scale gần `O(D^2)`, convolutional activation memory scale theo spatial grid, và per-class pathways nhân specialist stacks theo số class. Tuy nhiên tổng parameter count còn phụ thuộc:
+
+- architecture (`floorplan_detector` hoặc baseline);
+- shared/per-class routing;
+- depth;
+- conditioner;
+- head/image channels;
+- optional pretrained backbone load state.
+
+Vì vậy không dùng bảng estimate cố định. Đo từ model thực tế:
 
 ```python
-pos_inds = target.eq(1).float()
+from src.models import build_model
+
+model = build_model("floorplan_base")
+total = sum(p.numel() for p in model.parameters())
+trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(total, trainable)
 ```
 
-Nếu target được tạo ở 512×512 rồi downsample về 64×64 bằng bilinear, peak Gaussian có thể không còn đúng bằng 1 nữa. Khi đó:
+Parameter count không đo FLOPs, latency hoặc memory. Các đại lượng đó phải benchmark riêng trên hardware/input/batch được công bố.
 
-```text
-num_pos = 0
-```
+## 21. Falsifiable research questions
 
-và code rơi vào nhánh chỉ tính negative loss:
+Kiến trúc cho phép kiểm tra, nhưng chưa tự trả lời, các câu hỏi:
 
-```python
-if num_pos == 0:
-    return -neg_loss.sum()
-```
+1. Shared class embedding + FiLM có tốt hơn shared no-conditioning baseline không?
+2. Per-class no-text có tốt hơn shared baseline sau khi kiểm soát parameter budget không?
+3. Fixed byte text có thêm giá trị ngoài class routing không?
+4. Pretrained text có tốt hơn lightweight text trên cùng pathway/fusion không?
+5. Cross-attention có tốt hơn FiLM khi giữ các yếu tố khác cố định không?
+6. Collision rate ở stride 8 giới hạn recall bao nhiêu trên từng class?
 
-Khi model all-zero, negative loss gần 0, focal collapse.
-
-### Điểm cần kiểm tra kỹ
-
-Nếu log vẫn tiếp tục có:
-
-```text
-focal=0.0000
-```
-
-thì nhiều khả năng cần sửa target generation:
-
-1. Generate CenterNet target trực tiếp ở output resolution 64×64
-2. Hoặc đổi positive condition từ `target.eq(1)` sang threshold, ví dụ `target.ge(0.99)`
-
-Cách đúng hơn là target nên được sinh thẳng ở output stride.
-
----
-
-## 17. Warmup schedule
-
-Sau khi chỉnh:
-
-```text
-lr_max = 1e-5
-warmup_steps = 500
-warmup_start_factor = 0.1
-```
-
-Step đầu:
-
-```text
-lr_0 = 1e-6
-```
-
-Step 500:
-
-```text
-lr_500 = 1e-5
-```
-
-Warmup tuyến tính:
-
-```text
-lr_t = lr_max * (start_factor + (1 - start_factor) * t / warmup_steps)
-```
-
-Sau warmup dùng cosine decay:
-
-```text
-lr_t = lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(pi * t / T))
-```
-
-Với:
-
-```text
-lr_min = 0.01 * lr_max = 1e-7
-```
-
----
-
-## 18. Parameter scaling
-
-Tham số trong OLB chủ yếu scale theo:
-
-```text
-O(D^2)
-```
-
-Do đó khi tăng `model_dim` từ 256 lên 512:
-
-```text
-(512 / 256)^2 = 4
-```
-
-Số tham số trong OLB tăng khoảng 4 lần.
-
-Theo model docs:
-
-| Component | model_dim=256 | model_dim=512 |
-|---|---:|---:|
-| VAE stub | ~0.66M | ~0.66M |
-| Text stub | ~8.4M | ~16.8M |
-| 35 × OLB × depth 2 | ~119.8M | ~479M |
-| Total | ~131M | ~500M+ |
-
-Vì vậy `model_dim=512` rất nặng. `model_dim=256` hợp lý hơn cho baseline.
-
----
-
-## 19. Training semantics
-
-Dataset đã expand thành các cặp:
-
-```text
-(image_1, chair)
-(image_1, door_double)
-(image_1, table)
-(image_2, wall)
-...
-```
-
-Mỗi sample có:
-
-```text
-(I_i, c_i)
-```
-
-Model chạy:
-
-```text
-X_i = E_vae(I_i)
-H_i = B_c_i(Fusion(X_i, T_c_i))
-```
-
-Loss:
-
-```text
-L_i = Loss(f(I_i, T_c_i, c_i), target_for_class_c_i)
-```
-
-Gradient update:
-
-- Shared image encoder
-- Shared text encoder
-- Early fusion của class đó
-- Pathway/block của class đó
-- Shared CenterNet head
-
-Vì dataset expanded nên trong một epoch, các class xuất hiện trong toàn bộ train set đều được train.
-
----
-
-## 20. Inference semantics
-
-Input inference chỉ có một ảnh:
-
-```text
-I
-```
-
-Model built-in sẵn 35 texts:
-
-```text
-T_0, T_1, ..., T_34
-```
-
-Inference all-class:
-
-```text
-for c in 0..34:
-    Y_hat_c, S_hat_c = f(I, T_c, c)
-```
-
-Sau đó decode:
-
-1. Threshold heatmap
-2. Local max / NMS
-3. Lấy center `(x, y)`
-4. Lấy size `(w, h)`
-5. Convert thành bbox:
-
-```text
-x0 = x - w / 2
-y0 = y - h / 2
-x1 = x + w / 2
-y1 = y + h / 2
-```
-
-Scale về ảnh gốc:
-
-```text
-x_orig = 8 * x
-y_orig = 8 * y
-w_orig = 8 * w
-h_orig = 8 * h
-```
-
----
-
-## 21. Điểm yếu hiện tại
-
-### 21.1 EarlyFusion spatial selectivity yếu
-
-Hiện tại text-aware feature bị mean-pool rồi broadcast toàn ảnh. Điều này tạo global conditioning nhưng chưa tạo spatial attention mạnh.
-
-Có thể nâng cấp bằng FiLM:
-
-```text
-gamma_c, beta_c = MLP(mean_text_embedding)
-X'_c = gamma_c * X + beta_c
-```
-
-Hoặc image-query cross-attention:
-
-```text
-X'_c = X + CrossAttention(Q=X, K=T_c, V=T_c)
-```
-
-### 21.2 MambaBlock chưa phải Mamba thật
-
-Block hiện tại là approximation bằng Conv1D + gating. Để có long-range modeling tốt hơn, production nên thay bằng:
-
-```python
-from mamba_ssm import Mamba
-```
-
-### 21.3 Size scale cần kiểm chứng
-
-Cần đảm bảo size target và decode cùng scale.
-
-Khuyến nghị:
-
-- Target heatmap nên ở output resolution 64×64
-- Size map nên lưu width/height cũng ở output resolution
-- Khi decode về ảnh gốc thì nhân stride 8
-
----
-
-## 22. Checklist khi train lại
-
-Sau khi chỉnh LR/focal/warmup, log tốt nên có dạng:
-
-```text
-Epoch 1:
-- focal giảm nhưng không biến mất quá sớm
-- size_l1 giảm nhẹ
-- val_loss giảm
-
-Epoch 2:
-- focal vẫn còn meaningful, không nên toàn 0.0000
-- val_loss không tăng mạnh
-```
-
-Nếu vẫn thấy:
-
-```text
-focal=0.0000
-```
-
-thì ưu tiên debug target:
-
-1. Kiểm tra `target.eq(1).sum()` sau downsample
-2. Nếu bằng 0 nhiều batch → sinh target trực tiếp ở output resolution
-3. Hoặc tạm đổi positive mask sang `target.ge(0.99)`
-
----
-
-## 23. Công thức tổng kết
-
-Model:
-
-```text
-f_θ(I, T_c, c)
-  = Head(
-      B_c(
-        Fusion(
-          E_vae(I),
-          E_text(T_c)
-        )
-      )
-    )
-```
-
-Loss:
-
-```text
-L = 10 * L_focal(Y_hat_c, Y_c)
-  + 0.1 * L_size(S_hat_c, S_c, M_c)
-```
-
-Core idea:
-
-> Text class là stimulus. 35 class pathways là các phản xạ chuyên biệt. CenterNet head chuyển phản xạ đó thành tâm object và kích thước bbox.
+Mỗi kết luận cần cùng metadata v2, split manifest, decoder, metric implementation và measured parameter/latency context. Không được invent AP values hoặc dùng test set để tune rồi gọi đó là held-out result.

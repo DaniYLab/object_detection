@@ -1,11 +1,8 @@
-#!/bin/bash
-# =============================================================================
-# FloorPlanCAD — SSH Server Setup Script
-# Chạy 1 lần duy nhất khi mới thuê server
-# Usage: bash setup_server.sh
-# =============================================================================
+#!/usr/bin/env bash
+# FloorPlanCAD server setup. This script prepares and verifies the environment;
+# it does not start training.
 
-set -e  # Dừng nếu có lỗi
+set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[+]${NC} $1"; }
@@ -13,81 +10,81 @@ warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 err()  { echo -e "${RED}[x]${NC} $1"; }
 
 echo "============================================================"
-echo "  FloorPlanCAD — Server Setup"
+echo "  FloorPlanCAD — Server Setup (no training)"
 echo "============================================================"
 
-# ── 1. System packages ────────────────────────────────────────────────────────
 log "Installing system packages..."
 sudo apt-get update -qq
-sudo apt-get install -y -qq tmux htop nvtop tree git curl unzip
+sudo apt-get install -y -qq python3-venv tmux htop nvtop tree git curl unzip
 
-# ── 2. Kiểm tra CUDA ─────────────────────────────────────────────────────────
-log "Checking GPU..."
-nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || {
-    err "No GPU detected!"; exit 1
-}
-CUDA_VERSION=$(nvcc --version 2>/dev/null | grep "release" | sed 's/.*release //' | sed 's/,.*//' | tr -d '.')
-log "CUDA version: $CUDA_VERSION"
-
-# ── 3. Python environment ─────────────────────────────────────────────────────
-log "Setting up Python environment..."
-python3 -m venv .venv
-source .venv/bin/activate
-
-pip install --upgrade pip -q
-
-# Install PyTorch với CUDA phù hợp
-# Parse CUDA major version (e.g. "130" → 13, "124" → 12, "118" → 11)
-CUDA_MAJOR=$(echo $CUDA_VERSION | cut -c1-2 | sed 's/^0//')
-CUDA_MINOR=$(echo $CUDA_VERSION | cut -c3)
-
-if   [[ "$CUDA_MAJOR" -ge 13 ]]; then
-    TORCH_CUDA="cu132"
-elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 4 ]]; then
-    TORCH_CUDA="cu124"
-elif [[ "$CUDA_MAJOR" -eq 12 ]]; then
-    TORCH_CUDA="cu121"
-elif [[ "$CUDA_MAJOR" -eq 11 && "$CUDA_MINOR" -ge 8 ]]; then
-    TORCH_CUDA="cu118"
-else
-    warn "Old CUDA $CUDA_MAJOR.$CUDA_MINOR, defaulting to cu118"
-    TORCH_CUDA="cu118"
+log "Checking GPU driver..."
+if ! nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader; then
+    warn "No NVIDIA GPU detected. CPU tests still work, but future training will be slow."
 fi
 
-log "Installing PyTorch for $TORCH_CUDA..."
-pip install torch torchvision \
-    --index-url "https://download.pytorch.org/whl/$TORCH_CUDA" -q
+log "Setting up Python environment..."
+if [[ ! -d .venv ]]; then
+    python3 -m venv .venv
+fi
+# shellcheck disable=SC1091
+source .venv/bin/activate
+python -m pip install --upgrade pip
 
+# Do not guess a wheel from the locally-installed CUDA toolkit. Override this for
+# the server image, e.g. TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128.
+TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
+log "Installing PyTorch from $TORCH_INDEX_URL..."
+python -m pip install torch torchvision --index-url "$TORCH_INDEX_URL"
+python -m pip install -r requirements.txt -r requirements-dev.txt
 
-# Install dependencies (includes gdown for dataset download)
-pip install -r requirements.txt -q
+python - <<'PY'
+import torch
+print(f"torch={torch.__version__}")
+print(f"cuda_available={torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"gpu={torch.cuda.get_device_name(0)}")
+PY
 
-log "Python environment ready!"
-python -c "import torch; print(f'  torch={torch.__version__}, cuda={torch.cuda.is_available()}, gpu={torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"none\"}')"
+if [[ ! -d data/FloorPlanCAD_original ]]; then
+    log "Downloading FloorPlanCAD dataset..."
+    mkdir -p data
+    python scripts/data/download_gdrive.py
+else
+    log "Dataset directory already exists; skipping download."
+fi
 
-# ── 4. Download dataset ───────────────────────────────────────────────────────
-log "Downloading FloorPlanCAD dataset..."
-mkdir -p data
-python scripts/data/download_gdrive.py
+log "Building/validating metadata schema v2 (stuff excluded for object benchmark)..."
+python scripts/data/build_dataset.py \
+    --data-root ./data/FloorPlanCAD_original \
+    --stuff-policy exclude
 
-log "Building metadata (writes *_meta.json alongside PNGs)..."
-python scripts/data/build_dataset.py --data_root ./data/FloorPlanCAD_original
+if [[ ! -f data/FloorPlanCAD_original/splits.json ]]; then
+    log "Creating deterministic image-level train/val/test manifest..."
+    python scripts/data/build_splits.py \
+        --data-root ./data/FloorPlanCAD_original \
+        --output ./data/FloorPlanCAD_original/splits.json \
+        --seed 1337 \
+        --val-fraction 0.10
+else
+    log "Split manifest already exists; validating in memory."
+    python scripts/data/build_splits.py \
+        --data-root ./data/FloorPlanCAD_original \
+        --seed 1337 \
+        --val-fraction 0.10 \
+        --validate-only
+fi
 
-# ── 5. Verify ─────────────────────────────────────────────────────────────────
-log "Verifying dataset..."
-python - <<'EOF'
-import sys; sys.path.insert(0, '.')
-from src.data.dataset import FloorPlanDataset, NUM_CLASSES
-train_ds = FloorPlanDataset('./data/FloorPlanCAD_original', split='train')
-val_ds   = FloorPlanDataset('./data/FloorPlanCAD_original', split='test')
-s = train_ds[0]
-print(f'  Train: {len(train_ds):,} | Val: {len(val_ds):,} | Classes: {NUM_CLASSES}')
-print(f'  Target: heatmap={tuple(s["center_heatmap"].shape)}, size={tuple(s["size_map"].shape)}, offset={tuple(s["offset_map"].shape)}')
-print(f'  Centers: {int(s["mask_map"].sum().item())}')
-EOF
+log "Running no-training verification..."
+python -m pytest -q
+python scripts/dev/smoke_models.py \
+    --device cpu \
+    --image-size 32 \
+    --model-dim 16 \
+    --depth 1 \
+    --all-lightweight-presets
 
 echo ""
 echo "============================================================"
-echo -e "  ${GREEN}Setup hoàn tất!${NC}"
-echo "  Chạy training: bash run_train.sh"
+echo -e "  ${GREEN}Setup and verification complete.${NC}"
+echo "  No training was started. Review README.md before using run_train.sh."
 echo "============================================================"

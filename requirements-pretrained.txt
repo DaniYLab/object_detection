@@ -1,0 +1,5 @@
+# Optional dependencies for LazyHFTextConditioner only.
+# Core and lightweight model tests do not require these packages.
+transformers>=4.45,<6
+sentencepiece>=0.2
+safetensors>=0.4

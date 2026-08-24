@@ -1,10 +1,8 @@
-"""Visualize CenterNet targets and optional predictions.
+"""Visualize CenterNet targets and optional decoded predictions.
 
-Outputs a triptych:
-  1. Original + GT boxes
-  2. Heatmap only
-  3. Grayscale overlay + GT/pred boxes
+This utility performs inference only. It does not run an optimizer or training.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -17,179 +15,183 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
 sys.path.insert(0, ".")
-from src.data.dataset import FloorPlanDataset, CLASS_NAMES
-from src.models.detector import FloorPlanDetector
+from src.data.constants import CLASS_NAMES
+from src.data.dataset import FloorPlanDataset
+from src.evaluation import CenterNetDecoder
+from src.models import ModelConfig, build_model
+from src.training.checkpoint import CheckpointError, load_checkpoint, restore_training_state
 
 
-def denorm_image(img_t: torch.Tensor) -> Image.Image:
-    img_np = ((img_t.permute(1, 2, 0).numpy() * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
-    return Image.fromarray(img_np).convert("RGB")
+def denorm_image(image: torch.Tensor) -> Image.Image:
+    array = ((image.permute(1, 2, 0).numpy() * 0.5 + 0.5) * 255).clip(0, 255)
+    return Image.fromarray(array.astype(np.uint8)).convert("RGB")
 
 
-def draw_gt(draw: ImageDraw.ImageDraw, sample: dict, stride: int, color=(0, 255, 0)) -> int:
-    mask = sample["mask_map"][0]
-    size = sample["size_map"]
-    offset = sample["offset_map"]
-    centers = torch.nonzero(mask > 0.5)
-    for k, (cy, cx) in enumerate(centers):
-        cy_i, cx_i = int(cy), int(cx)
-        off_x = float(offset[0, cy_i, cx_i])
-        off_y = float(offset[1, cy_i, cx_i])
-        w = float(size[0, cy_i, cx_i]) * stride
-        h = float(size[1, cy_i, cx_i]) * stride
-        cx_img = (cx_i + off_x) * stride
-        cy_img = (cy_i + off_y) * stride
-        box = [cx_img - w / 2, cy_img - h / 2, cx_img + w / 2, cy_img + h / 2]
+def draw_gt(
+    draw: ImageDraw.ImageDraw,
+    boxes: torch.Tensor,
+    color: tuple[int, int, int] = (0, 255, 0),
+) -> int:
+    for index, box_tensor in enumerate(boxes):
+        box = [float(value) for value in box_tensor]
         draw.rectangle(box, outline=color, width=3)
-        draw.ellipse([cx_img - 4, cy_img - 4, cx_img + 4, cy_img + 4], fill=(0, 80, 255))
-        draw.text((box[0], max(0, box[1] - 14)), f"GT{k}", fill=color)
-    return len(centers)
+        center_x = (box[0] + box[2]) / 2
+        center_y = (box[1] + box[3]) / 2
+        draw.ellipse(
+            [center_x - 4, center_y - 4, center_x + 4, center_y + 4],
+            fill=(0, 80, 255),
+        )
+        draw.text((box[0], max(0, box[1] - 14)), f"GT{index}", fill=color)
+    return int(boxes.shape[0])
 
 
-def heatmap_image(hm: torch.Tensor, image_size: int, mode: str = "nearest") -> Image.Image:
-    hm_up = F.interpolate(
-        hm.unsqueeze(0).unsqueeze(0),
+def heatmap_image(heatmap: torch.Tensor, image_size: int, mode: str = "nearest") -> Image.Image:
+    upsampled = F.interpolate(
+        heatmap.unsqueeze(0).unsqueeze(0),
         size=(image_size, image_size),
         mode=mode,
         align_corners=False if mode == "bilinear" else None,
     )[0, 0].numpy()
-    heat_np = np.zeros((image_size, image_size, 3), dtype=np.uint8)
-    heat_np[..., 0] = (hm_up * 255).clip(0, 255).astype(np.uint8)
-    heat_np[..., 1] = (hm_up * 80).clip(0, 255).astype(np.uint8)
-    return Image.fromarray(heat_np)
+    array = np.zeros((image_size, image_size, 3), dtype=np.uint8)
+    array[..., 0] = (upsampled * 255).clip(0, 255).astype(np.uint8)
+    array[..., 1] = (upsampled * 80).clip(0, 255).astype(np.uint8)
+    return Image.fromarray(array)
 
 
-def overlay_heatmap(base: Image.Image, hm: torch.Tensor, image_size: int) -> Image.Image:
-    hm_up = F.interpolate(
-        hm.unsqueeze(0).unsqueeze(0),
+def overlay_heatmap(base: Image.Image, heatmap: torch.Tensor, image_size: int) -> Image.Image:
+    upsampled = F.interpolate(
+        heatmap.unsqueeze(0).unsqueeze(0),
         size=(image_size, image_size),
         mode="bilinear",
         align_corners=False,
     )[0, 0].numpy()
     red = Image.new("RGBA", base.size, (255, 0, 0, 0))
-    red.putalpha(Image.fromarray((hm_up * 170).clip(0, 170).astype(np.uint8), mode="L"))
+    red.putalpha(
+        Image.fromarray((upsampled * 170).clip(0, 170).astype(np.uint8), mode="L")
+    )
     return Image.alpha_composite(base.convert("RGBA"), red).convert("RGB")
-
-
-def local_maxima(hm: torch.Tensor, kernel: int = 3) -> torch.Tensor:
-    pad = kernel // 2
-    pooled = F.max_pool2d(hm.unsqueeze(0).unsqueeze(0), kernel, stride=1, padding=pad)[0, 0]
-    return hm * (hm == pooled)
 
 
 def draw_predictions(
     draw: ImageDraw.ImageDraw,
-    preds: dict[str, torch.Tensor],
+    prediction: dict,
     class_id: int,
-    stride: int,
-    threshold: float,
-    topk: int,
-    color=(255, 80, 80),
+    color: tuple[int, int, int] = (255, 80, 80),
 ) -> int:
-    hm = preds["center_heatmap"][0, class_id].detach().cpu()
-    size = preds["size_map"][0, class_id * 2 : class_id * 2 + 2].detach().cpu()
-    offset = preds["offset_map"][0, class_id * 2 : class_id * 2 + 2].detach().cpu()
-
-    peaks = local_maxima(hm)
-    scores, inds = torch.topk(peaks.flatten(), k=min(topk, peaks.numel()))
-    drawn = 0
-    width = hm.shape[-1]
-    for score, ind in zip(scores, inds):
-        if float(score) < threshold:
-            continue
-        cy = int(ind // width)
-        cx = int(ind % width)
-        off_x = float(offset[0, cy, cx])
-        off_y = float(offset[1, cy, cx])
-        w = float(size[0, cy, cx]) * stride
-        h = float(size[1, cy, cx]) * stride
-        cx_img = (cx + off_x) * stride
-        cy_img = (cy + off_y) * stride
-        box = [cx_img - w / 2, cy_img - h / 2, cx_img + w / 2, cy_img + h / 2]
+    keep = prediction["labels"].detach().cpu().eq(class_id)
+    boxes = prediction["boxes"].detach().cpu()[keep]
+    scores = prediction["scores"].detach().cpu()[keep]
+    for box_tensor, score_tensor in zip(boxes, scores):
+        box = [float(value) for value in box_tensor]
         draw.rectangle(box, outline=color, width=2)
-        draw.text((box[0], max(0, box[1] - 12)), f"{float(score):.2f}", fill=color)
-        drawn += 1
-    return drawn
+        draw.text(
+            (box[0], max(0, box[1] - 12)),
+            f"{float(score_tensor):.2f}",
+            fill=color,
+        )
+    return int(boxes.shape[0])
+
+
+def _checkpoint_model(path: str, image_size: int) -> tuple[torch.nn.Module, ModelConfig, dict]:
+    checkpoint = load_checkpoint(path, map_location="cpu")
+    config_value = checkpoint.get("model_config")
+    if not isinstance(config_value, dict):
+        raise CheckpointError("Checkpoint does not contain a serializable model_config")
+    config = ModelConfig.from_dict(config_value)
+    if config.image_size != image_size:
+        raise ValueError(
+            f"Visualization image_size={image_size} does not match checkpoint "
+            f"image_size={config.image_size}"
+        )
+    model = build_model(config)
+    restore_training_state(
+        checkpoint,
+        model=model,
+        expected_model_config=config,
+        expected_class_names=CLASS_NAMES,
+        expected_output_stride=config.output_stride,
+        weights_only=True,
+    )
+    model.eval()
+    return model, config, checkpoint
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_root", default="./data/FloorPlanCAD_original")
-    parser.add_argument("--split", default="train", choices=["train", "test"])
+    parser.add_argument("--data-root", "--data_root", dest="data_root", default="./data/FloorPlanCAD_original")
+    parser.add_argument("--manifest", default=None)
+    parser.add_argument("--split", default="train", choices=["train", "val", "test"])
     parser.add_argument("--index", type=int, default=0)
-    parser.add_argument("--image_size", type=int, default=512)
-    parser.add_argument("--output_stride", type=int, default=8)
+    parser.add_argument("--image-size", "--image_size", dest="image_size", type=int, default=512)
+    parser.add_argument("--output-stride", "--output_stride", dest="output_stride", type=int, default=8)
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--pred", action="store_true")
     parser.add_argument("--threshold", type=float, default=0.3)
     parser.add_argument("--topk", type=int, default=50)
-    parser.add_argument("--out_dir", default="./outputs")
+    parser.add_argument("--out-dir", "--out_dir", dest="out_dir", default="./outputs")
     args = parser.parse_args()
 
-    ds = FloorPlanDataset(
+    dataset = FloorPlanDataset(
         args.data_root,
         split=args.split,
         image_size=args.image_size,
         output_stride=args.output_stride,
+        manifest_path=args.manifest,
     )
-    sample = ds[args.index]
-    cls_name = CLASS_NAMES[sample["class_id"]]
-    hm = sample["center_heatmap"][0]
+    sample = dataset[args.index]
+    class_id = sample["class_id"]
+    class_name = CLASS_NAMES[class_id]
+    heatmap = sample["center_heatmap"][0]
 
     original = denorm_image(sample["image"])
     original_boxes = original.copy()
-    n_gt = draw_gt(ImageDraw.Draw(original_boxes), sample, stride=args.output_stride)
+    num_gt = draw_gt(ImageDraw.Draw(original_boxes), sample["boxes"])
+    heat_only = heatmap_image(heatmap, args.image_size, mode="nearest")
 
-    heat_only = heatmap_image(hm, args.image_size, mode="nearest")
-
-    gray = original.convert("L").convert("RGB")
-    overlay = overlay_heatmap(gray, hm, args.image_size)
+    overlay = overlay_heatmap(original.convert("L").convert("RGB"), heatmap, args.image_size)
     draw = ImageDraw.Draw(overlay)
-    draw_gt(draw, sample, stride=args.output_stride)
+    draw_gt(draw, sample["boxes"])
 
-    n_pred = 0
+    num_predictions = 0
     if args.pred:
         if not args.checkpoint:
             raise ValueError("--pred requires --checkpoint")
-        ckpt = torch.load(args.checkpoint, map_location="cpu")
-        model_args = ckpt.get("args", {})
-        model = FloorPlanDetector(
-            image_size=args.image_size,
-            model_dim=int(model_args.get("model_dim", 256)),
-            num_classes=len(CLASS_NAMES),
-            depth_per_class=int(model_args.get("depth_per_class", 2)),
-            fusion_mode=model_args.get("fusion_mode", "film"),
-        )
-        model.load_state_dict(ckpt["model_state"])
-        model.eval()
-        with torch.no_grad():
-            preds = model(sample["image"].unsqueeze(0))
-        n_pred = draw_predictions(
-            draw,
-            preds,
-            class_id=sample["class_id"],
-            stride=args.output_stride,
+        model, config, _checkpoint = _checkpoint_model(args.checkpoint, args.image_size)
+        with torch.inference_mode():
+            outputs = model(sample["image"].unsqueeze(0))
+        decoder = CenterNetDecoder(
+            stride=config.output_stride,
             threshold=args.threshold,
             topk=args.topk,
         )
+        prediction = decoder(
+            outputs,
+            [sample["image_id"]],
+            image_size=(args.image_size, args.image_size),
+        )[0]
+        num_predictions = draw_predictions(draw, prediction, class_id)
 
-    # Compose triptych.
-    w, h = original.size
+    width, height = original.size
     header = 30
-    canvas = Image.new("RGB", (w * 3, h + header), (20, 20, 20))
+    canvas = Image.new("RGB", (width * 3, height + header), (20, 20, 20))
     canvas.paste(original_boxes, (0, header))
-    canvas.paste(heat_only, (w, header))
-    canvas.paste(overlay, (w * 2, header))
-    text = ImageDraw.Draw(canvas)
-    text.text((10, 8), "Original + GT boxes (green), centers blue", fill=(255, 255, 255))
-    text.text((w + 10, 8), "Heatmap only (red, nearest upsample)", fill=(255, 255, 255))
-    text.text((w * 2 + 10, 8), "Grayscale overlay + GT/pred boxes", fill=(255, 255, 255))
-    text.text((10, h + header - 18), f"{sample['sample_id']} | {cls_name} | GT={n_gt} | Pred={n_pred}", fill=(255, 255, 255))
+    canvas.paste(heat_only, (width, header))
+    canvas.paste(overlay, (width * 2, header))
+    labels = ImageDraw.Draw(canvas)
+    labels.text((10, 8), "Original + all GT boxes", fill=(255, 255, 255))
+    labels.text((width + 10, 8), "Query target heatmap", fill=(255, 255, 255))
+    labels.text((width * 2 + 10, 8), "GT (green) + decoded predictions", fill=(255, 255, 255))
+    labels.text(
+        (10, height + header - 18),
+        f"{sample['image_id']} | {class_name} | GT={num_gt} | Pred={num_predictions}",
+        fill=(255, 255, 255),
+    )
 
-    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
-    out_path = Path(args.out_dir) / f"viz_centernet_{args.split}_{args.index}_{cls_name}.png"
-    canvas.save(out_path)
-    print(f"Saved: {out_path}")
+    output_dir = Path(args.out_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"viz_centernet_{args.split}_{args.index}_{class_name}.png"
+    canvas.save(output_path)
+    print(f"Saved: {output_path}")
 
 
 if __name__ == "__main__":

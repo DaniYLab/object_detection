@@ -1,251 +1,309 @@
-"""
-Build FloorPlanCAD metadata — parse SVG annotations, write {stem}_meta.json
-alongside each original PNG. No image copying.
+"""Build canonical FloorPlanCAD schema-v2 metadata beside source PNG files.
 
-Input : FloorPlanCAD_original/{train_set_1, train_set_2, test_set}/
-          Each folder: xxx.png + xxx.svg
-Output: Same folders, new file xxx_meta.json per sample
-
-Usage:
-    python scripts/data/build_dataset.py
-    python scripts/data/build_dataset.py --data_root /content/FloorPlanCAD_orig
-    DATA_ROOT=/content/FloorPlanCAD_orig python scripts/data/build_dataset.py
-
-Annotation format: SVG paths with semantic-id + instance-id attributes.
+No images are copied. Existing metadata is never replaced unless ``--force`` is
+explicitly supplied. ``--validate-only`` performs no writes.
 """
 
+from __future__ import annotations
+
+import argparse
 import json
-import xml.etree.ElementTree as ET
 import os
-from collections import defaultdict
-from pathlib import Path
-
-from PIL import Image
-
-# ─── Shared class mappings ─────────────────────────────────────────────────────
 import sys
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.data.constants import SEMANTIC_ID_TO_NAME, CLASS_TO_IDX
+
+from src.data.metadata import (  # noqa: E402
+    STUFF_POLICIES,
+    UNKNOWN_POLICIES,
+    MetadataValidationError,
+    StuffPolicy,
+    UnknownPolicy,
+    load_metadata,
+    parse_path_bbox,
+    parse_svg_metadata,
+    validate_metadata,
+    validate_metadata_sources,
+)
+
+SPLITS = {
+    "train": ["train_set_1", "train_set_2"],
+    "test": ["test_set"],
+}
 
 
-def get_class_name(semantic_id: int) -> str:
-    return SEMANTIC_ID_TO_NAME.get(semantic_id, f"class_{semantic_id:02d}")
+@dataclass
+class BuildReport:
+    data_root: str
+    settings: dict[str, Any]
+    discovered: int = 0
+    processed: int = 0
+    validated: int = 0
+    skipped_existing: int = 0
+    missing_svg: int = 0
+    failed: int = 0
+    instances: int = 0
+    errors: list[dict[str, str]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
-# ─── SVG coordinate parser ─────────────────────────────────────────────────────
+def _write_metadata(path: Path, metadata: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(metadata, handle, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        handle.write("\n")
+    temporary.replace(path)
 
-from svgpathtools import parse_path
-
-def parse_path_bbox(d: str) -> tuple[float, float, float, float] | None:
-    try:
-        path = parse_path(d)
-        if not path:
-            return None
-        xmin, xmax, ymin, ymax = path.bbox()
-        return xmin, ymin, xmax, ymax
-    except Exception:
-        return None
-
-
-def svg_to_pixel(bbox: tuple, scale_x: float, scale_y: float) -> tuple[int, int, int, int]:
-    x_min, y_min, x_max, y_max = bbox
-    return (
-        int(x_min * scale_x),
-        int(y_min * scale_y),
-        int(x_max * scale_x),
-        int(y_max * scale_y),
-    )
-
-
-# ─── Core processing ───────────────────────────────────────────────────────────
 
 def process_sample(
     png_path: Path,
     svg_path: Path,
-    min_size: int = 8,
+    min_size: float = 8,
+    *,
+    stuff_policy: StuffPolicy = "exclude",
+    unknown_policy: UnknownPolicy = "warn",
+    force: bool = False,
+    validate_only: bool = False,
+    strict: bool = False,
 ) -> int:
+    """Process one sample and return instances, or ``-1`` when skipped.
+
+    This preserves the old helper's integer return contract while delegating all
+    parsing and validation to the canonical implementation.
     """
-    Parse one SVG file → write {stem}_meta.json alongside the PNG.
-    No image copying — PNG stays where it is.
 
-    Returns number of instances found.
-    """
-    meta_path = png_path.with_name(png_path.stem + "_meta.json")
+    meta_path = png_path.with_name(f"{png_path.stem}_meta.json")
+    if meta_path.exists() and not force:
+        if validate_only or strict:
+            metadata = load_metadata(meta_path, allow_legacy=True, strict=strict)
+            source_report = validate_metadata_sources(metadata, png_path, svg_path)
+            if source_report.errors or (strict and source_report.warnings):
+                issues = source_report.errors + (source_report.warnings if strict else [])
+                raise MetadataValidationError(
+                    "; ".join(f"{issue.path}: {issue.message}" for issue in issues),
+                    source_report,
+                )
+            return int(metadata["num_instances"])
+        return -1
 
-    # Skip if already done
-    if meta_path.exists():
-        return -1  # -1 = skipped
-
-    # Get image dimensions (open minimally)
-    try:
-        with Image.open(png_path) as img:
-            img_w, img_h = img.size
-    except Exception:
-        return 0
-
-    # Parse SVG
-    try:
-        tree = ET.parse(svg_path)
-    except ET.ParseError:
-        return 0
-    root = tree.getroot()
-
-    # Get SVG viewBox dimensions for scaling
-    vb = root.get("viewBox", "0 0 100 100")
-    vb_parts = [float(v) for v in vb.split()]
-    svg_w = vb_parts[2] if len(vb_parts) >= 4 else 100.0
-    svg_h = vb_parts[3] if len(vb_parts) >= 4 else 100.0
-    scale_x = img_w / svg_w
-    scale_y = img_h / svg_h
-
-    # Group paths by (semantic_id, instance_id) → aggregate bounding boxes
-    # instance-id == -1 means "stuff" (wall, etc.) — treat each path as own instance
-    instance_bboxes: dict[tuple, list] = defaultdict(list)
-
-    for elem in root.iter():
-        d = elem.get("d")
-        if d is None:
-            continue
-        sid_str = elem.get("semantic-id")
-        if sid_str is None:
-            continue
-        sid = int(sid_str)
-        iid_str = elem.get("instance-id")
-        iid = int(iid_str) if iid_str else -1
-        bbox = parse_path_bbox(d)
-        if bbox is None:
-            continue
-
-        key = (sid, iid) if iid != -1 else (sid, id(elem))
-        instance_bboxes[key].append(bbox)
-
-    if not instance_bboxes:
-        return 0
-
-    # Build instances list
-    instances_meta = []
-    for (sid, iid), bboxes in instance_bboxes.items():
-        x_min = min(b[0] for b in bboxes)
-        y_min = min(b[1] for b in bboxes)
-        x_max = max(b[2] for b in bboxes)
-        y_max = max(b[3] for b in bboxes)
-
-        px0, py0, px1, py1 = svg_to_pixel((x_min, y_min, x_max, y_max), scale_x, scale_y)
-        px0 = max(0, px0)
-        py0 = max(0, py0)
-        px1 = min(img_w, px1)
-        py1 = min(img_h, py1)
-
-        if (px1 - px0) < min_size or (py1 - py0) < min_size:
-            continue
-
-        class_name = get_class_name(sid)
-        instances_meta.append({
-            "class":       class_name,
-            "class_id":    CLASS_TO_IDX.get(class_name, -1),
-            "instance_id": iid if isinstance(iid, int) else -1,
-            "bbox_px":     [px0, py0, px1, py1],
-        })
-
-    # Write metadata alongside the PNG
-    metadata = {
-        "image_size":    [img_w, img_h],
-        "svg_viewbox":   [0, 0, svg_w, svg_h],
-        "num_instances": len(instances_meta),
-        "instances":     instances_meta,
-    }
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, separators=(",", ":"))
-
-    return len(instances_meta)
-
-
-# ─── Dataset builder ───────────────────────────────────────────────────────────
-
-SPLITS = {
-    "train": ["train_set_1", "train_set_2"],
-    "test":  ["test_set"],
-}
+    metadata = parse_svg_metadata(
+        svg_path,
+        png_path,
+        min_size=min_size,
+        stuff_policy=stuff_policy,
+        unknown_policy=unknown_policy,
+        strict=strict,
+    )
+    validation = validate_metadata(metadata)
+    if not validation.valid:
+        raise MetadataValidationError(f"Generated invalid metadata for {png_path}", validation)
+    if not validate_only:
+        _write_metadata(meta_path, metadata)
+    return int(metadata["num_instances"])
 
 
 def build_dataset(
     data_root: Path,
-    min_size: int = 8,
-) -> None:
-    print("=" * 60)
-    print("  FloorPlanCAD Metadata Builder")
-    print(f"  Data root : {data_root.resolve()}")
-    print(f"  min_size  : {min_size}px")
-    print("  (No image copying — writes *_meta.json alongside PNGs)")
-    print("=" * 60)
+    min_size: float = 8,
+    *,
+    stuff_policy: StuffPolicy = "exclude",
+    unknown_policy: UnknownPolicy = "warn",
+    force: bool = False,
+    validate_only: bool = False,
+    strict: bool = False,
+    report_path: Path | None = None,
+) -> dict[str, Any]:
+    """Build or validate all source metadata and return a structured report."""
 
-    total_samples = 0
-    total_skipped = 0
-    total_instances = 0
+    data_root = Path(data_root)
+    report = BuildReport(
+        data_root=str(data_root.resolve()),
+        settings={
+            "min_size": float(min_size),
+            "stuff_policy": stuff_policy,
+            "unknown_policy": unknown_policy,
+            "force": force,
+            "validate_only": validate_only,
+            "strict": strict,
+        },
+    )
+    print("=" * 60)
+    print("  FloorPlanCAD Metadata Builder (schema v2)")
+    print(f"  Data root     : {data_root.resolve()}")
+    print(f"  min_size       : {min_size}px")
+    print(f"  stuff_policy   : {stuff_policy}")
+    print(f"  unknown_policy : {unknown_policy}")
+    print(f"  validate_only  : {validate_only}")
+    print(f"  force           : {force}")
+    print("=" * 60)
 
     for split_name, source_dirs in SPLITS.items():
         print(f"\n[{split_name.upper()}]")
-
-        for src_dir_name in source_dirs:
-            src_dir = data_root / src_dir_name
-            if not src_dir.exists():
-                print(f"  [SKIP] {src_dir} not found")
+        for source_dir_name in source_dirs:
+            source_dir = data_root / source_dir_name
+            if not source_dir.exists():
+                print(f"  [SKIP] {source_dir} not found")
                 continue
-
-            png_files = sorted([
-                p for p in src_dir.glob("*.png")
-                if not p.parent.name == "coco_vis"
-            ])
-            print(f"  {src_dir_name}: {len(png_files)} samples")
-
-            split_instances = 0
-            split_skipped = 0
-
-            for i, png_path in enumerate(png_files):
+            png_files = sorted(source_dir.glob("*.png"))
+            print(f"  {source_dir_name}: {len(png_files)} images")
+            for png_path in png_files:
+                report.discovered += 1
                 svg_path = png_path.with_suffix(".svg")
-                if not svg_path.exists():
+                metadata_path = png_path.with_name(f"{png_path.stem}_meta.json")
+                if not svg_path.is_file() and not (validate_only and metadata_path.is_file()):
+                    report.missing_svg += 1
+                    message = "matching SVG is missing"
+                    if strict:
+                        report.failed += 1
+                        report.errors.append({"sample": str(png_path), "error": message})
                     continue
+                try:
+                    if metadata_path.exists() and not force:
+                        if validate_only or strict:
+                            metadata = load_metadata(
+                                metadata_path,
+                                allow_legacy=True,
+                                strict=strict,
+                            )
+                            source_report = validate_metadata_sources(
+                                metadata, png_path, svg_path
+                            )
+                            if source_report.errors or (strict and source_report.warnings):
+                                issues = source_report.errors + (
+                                    source_report.warnings if strict else []
+                                )
+                                raise MetadataValidationError(
+                                    "; ".join(
+                                        f"{issue.path}: {issue.message}" for issue in issues
+                                    ),
+                                    source_report,
+                                )
+                            report.validated += 1
+                            report.instances += int(metadata["num_instances"])
+                        else:
+                            report.skipped_existing += 1
+                        continue
 
-                n = process_sample(png_path, svg_path, min_size=min_size)
-                if n == -1:
-                    split_skipped += 1
-                else:
-                    split_instances += n
-                    total_samples += 1
+                    metadata = parse_svg_metadata(
+                        svg_path,
+                        png_path,
+                        min_size=min_size,
+                        stuff_policy=stuff_policy,
+                        unknown_policy=unknown_policy,
+                        strict=strict,
+                    )
+                    report.instances += int(metadata["num_instances"])
+                    if validate_only:
+                        report.validated += 1
+                    else:
+                        _write_metadata(metadata_path, metadata)
+                        report.processed += 1
+                except Exception as exc:
+                    report.failed += 1
+                    report.errors.append({"sample": str(png_path), "error": str(exc)})
+                    print(f"    [ERROR] {png_path.name}: {exc}")
 
-                if (i + 1) % 500 == 0:
-                    print(f"    [{i+1}/{len(png_files)}] — {split_instances} instances so far")
-
-            total_instances += split_instances
-            total_skipped += split_skipped
-            print(f"  => {total_samples} processed, {split_skipped} skipped (already done)")
+    result = report.to_dict()
+    if report_path is not None:
+        report_path = Path(report_path)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with report_path.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(result, handle, indent=2, sort_keys=True, ensure_ascii=False)
+            handle.write("\n")
 
     print(f"\n{'=' * 60}")
-    print(f"  DONE!")
-    print(f"  Total processed : {total_samples}")
-    print(f"  Total skipped   : {total_skipped} (already had _meta.json)")
-    print(f"  Total instances : {total_instances}")
-    print(f"{'=' * 60}")
+    print(f"  Processed       : {report.processed}")
+    print(f"  Validated       : {report.validated}")
+    print(f"  Skipped existing: {report.skipped_existing}")
+    print(f"  Missing SVG     : {report.missing_svg}")
+    print(f"  Failed          : {report.failed}")
+    print(f"  Instances       : {report.instances}")
+    print("=" * 60)
+    return result
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate canonical *_meta.json files without copying images"
+    )
+    parser.add_argument(
+        "--data-root",
+        "--data_root",
+        dest="data_root",
+        default=os.environ.get("DATA_ROOT", "./data/FloorPlanCAD_original"),
+        help="Directory containing train_set_1, train_set_2, and test_set",
+    )
+    parser.add_argument(
+        "--min-size",
+        "--min_size",
+        dest="min_size",
+        type=float,
+        default=8.0,
+        help="Drop boxes smaller than this many pixels",
+    )
+    parser.add_argument(
+        "--stuff-policy",
+        "--stuff_policy",
+        dest="stuff_policy",
+        choices=STUFF_POLICIES,
+        default="exclude",
+        help="How instance-id=-1 paths are represented",
+    )
+    parser.add_argument(
+        "--unknown-policy",
+        "--unknown_policy",
+        dest="unknown_policy",
+        choices=UNKNOWN_POLICIES,
+        default="warn",
+        help="Skip unknown semantic IDs with warnings or reject the SVG",
+    )
+    parser.add_argument("--force", action="store_true", help="Replace existing metadata")
+    parser.add_argument(
+        "--validate-only",
+        "--validate_only",
+        dest="validate_only",
+        action="store_true",
+        help="Parse/validate without writing metadata",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Treat source warnings, missing files, and validation warnings as failures",
+    )
+    parser.add_argument(
+        "--report",
+        "--report-json",
+        "--report_json",
+        dest="report",
+        nargs="?",
+        const="build_metadata_report.json",
+        default=None,
+        metavar="PATH",
+        help="Write a JSON build report (default: build_metadata_report.json)",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_argument_parser().parse_args(argv)
+    result = build_dataset(
+        data_root=Path(args.data_root),
+        min_size=args.min_size,
+        stuff_policy=args.stuff_policy,
+        unknown_policy=args.unknown_policy,
+        force=args.force,
+        validate_only=args.validate_only,
+        strict=args.strict,
+        report_path=Path(args.report) if args.report else None,
+    )
+    return 1 if result["failed"] else 0
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Generate *_meta.json metadata for FloorPlanCAD (no image copying)"
-    )
-    parser.add_argument(
-        "--data_root",
-        default=os.environ.get("DATA_ROOT", "./data/FloorPlanCAD_original"),
-        help="Path to FloorPlanCAD_original/ (contains train_set_1/, etc.)",
-    )
-    parser.add_argument(
-        "--min_size", type=int, default=8,
-        help="Skip bboxes smaller than this (pixels)",
-    )
-    args = parser.parse_args()
-
-    build_dataset(
-        data_root=Path(args.data_root),
-        min_size=args.min_size,
-    )
+    raise SystemExit(main())

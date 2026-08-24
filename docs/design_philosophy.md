@@ -1,82 +1,111 @@
-# Triết Lý Thiết Kế: Phản Xạ Có Điều Kiện (Conditioned Reflex Learning)
+# Triết Lý Thiết Kế: Conditioned Detection như một giả thuyết có thể kiểm chứng
 
-## Bối Cảnh
+## Bối cảnh
 
-Dự án này phát triển một mô hình deep learning để phát hiện đối tượng (object detection) trên bản vẽ mặt bằng kiến trúc (floor plan CAD). Khác với các phương pháp detection truyền thống (YOLO, Faster R-CNN), thiết kế lấy cảm hứng từ **lý thuyết phản xạ có điều kiện của Pavlov** trong sinh học thần kinh.
+Dự án nghiên cứu object detection trên bản vẽ FloorPlanCAD. “Conditioned Reflex” là trực giác thiết kế: một điều kiện về class hoặc text có thể hướng image features tới loại đối tượng cần tìm. Đây là **giả thuyết cần ablation và detection metrics**, không phải kết luận đã được chứng minh.
 
-## Ý Tưởng Cốt Lõi
+## Input hợp lệ
 
-### 1. Tác Nhân Kích Thích (Stimulus) = Text Prompt
+Model luôn nhận ảnh floor plan hoàn chỉnh. Không dùng object crop hoặc visual template làm input vì chúng không tồn tại khi inference trên ảnh mới.
 
-Thay vì cho model "nhìn" ảnh rồi tự detect tất cả mọi thứ, ta dùng **Text prompt** như một **tác nhân kích thích**:
+Conditioning có thể là:
 
-```
-Input:  Ảnh bản vẽ + "Find chair in this floor plan drawing"
-Output: Vị trí và kích thước các ghế trong ảnh
-```
+- không conditioning;
+- learned class embedding;
+- lightweight text encoder random-init;
+- optional pretrained text encoder;
+- runtime text hoặc fixed class prompts.
 
-Model **không tự quyết** sẽ tìm gì. Con người (hoặc hệ thống) **ra lệnh** thông qua ngôn ngữ.
+Lightweight text encoder không có pretrained language semantics. Fixed prompts cũng không tự biến model thành open-vocabulary detector.
 
-### 2. Đường Dây Thần Kinh Riêng Biệt = Per-Class Blocks
+## Ba trục phải tách riêng
 
-Mỗi loại đối tượng (class) có **một bộ não riêng** — một stack of Object Learning Blocks chuyên biệt:
+### 1. Pathway
 
-```
-class_blocks[0]  → Chuyên nhận diện annotation_text
-class_blocks[4]  → Chuyên nhận diện chair
-class_blocks[8]  → Chuyên nhận diện door_double
-class_blocks[30] → Chuyên nhận diện wall
-... (35 pathways tổng cộng)
-```
+- `shared`: mọi class dùng chung feature-processing stack;
+- `per_class`: mỗi class có stack riêng.
 
-Khi text prompt là `"Find chair"` → `class_id = 4` → dữ liệu **chỉ đi qua `class_blocks[4]`**. Các block khác không được kích hoạt.
+Per-class pathway có nhiều capacity hơn và class ID đã trực tiếp chọn module. Vì vậy hiệu quả của nó không được quy cho text nếu chưa so với `per_class + no text`.
 
-### 3. Phản Xạ Không Điều Kiện → Phản Xạ Có Điều Kiện
+### 2. Conditioning
 
-- **Phase 1 (Không điều kiện):** Model được cho xem ảnh + text cụ thể + ground truth heatmap → học cách phản ứng.
-- **Phase 2 (Có điều kiện):** Qua nhiều epochs, mỗi block tích lũy "kinh nghiệm" riêng. Chỉ cần nghe text "Find chair" → block chair tự kích hoạt các neuron đúng mà không cần bất kỳ gợi ý thị giác nào khác.
+- `none`;
+- `class_embedding`;
+- `lightweight_text`;
+- `pretrained_text`.
 
-### 4. Tại Sao Không Dùng Visual Crops Làm Input?
+### 3. Fusion
 
-Crops (ảnh cắt nhỏ của từng đối tượng) **chỉ tồn tại trong training set**. Khi inference trên một bản vẽ hoàn toàn mới:
-- Bạn **không có** crops — vì đó chính là thứ bạn đang cố tìm!
-- Bạn **chỉ có** ảnh mới + text query
+- `none`;
+- additive condition;
+- FiLM;
+- image-to-text cross-attention;
+- FiLM + cross-attention.
 
-Do đó, input duy nhất hợp lệ cho model là: **Ảnh gốc + Text**.
+Các trục này được cấu hình độc lập qua model presets để tạo ablation công bằng.
 
-## Sơ Đồ Kiến Trúc
+## Kiến trúc khái quát
 
-```
-                    ┌─────────────┐
-                    │  Text Prompt │  "Find chair in this floor plan drawing"
-                    │  (Stimulus)  │
-                    └──────┬──────┘
-                           │ Text Encoder
-                           ▼
-┌──────────┐        ┌─────────────┐
-│  Image   │───────►│ Early Fusion │  Cross-Attention (text queries image)
-│ (VAE Enc)│        │             │
-└──────────┘        └──────┬──────┘
-                           │
-                           ▼ class_id routing
-              ┌────────────┼────────────┐
-              │            │            │
-         ┌────▼────┐  ┌────▼────┐  ┌────▼────┐
-         │ Block 0 │  │ Block 4 │  │Block 30 │  ← 35 per-class pathways
-         │ annot.  │  │ chair ★ │  │  wall   │     (Mamba + Self-Attention)
-         └─────────┘  └────┬────┘  └─────────┘
-                           │ (only block 4 is active)
-                           ▼
-                    ┌─────────────┐
-                    │ CenterNet   │  center_heatmap [1, H, W]
-                    │   Head      │  size_map       [2, H, W]
-                    │             │  offset_map     [2, H, W]
-                    └─────────────┘
+```text
+Image
+  -> stride-8 ConvImageEncoder
+  -> image tokens + 2D positional embedding
+
+Condition (none / class / text)
+  -> conditioner tokens + padding mask + pooled condition
+
+image tokens + condition
+  -> selected fusion
+  -> shared hoặc per-class pathway
+       GatedSpatialMixer -> corrected SelfAttention -> FFN
+  -> CenterNet head
+       center heatmap + size + fractional offset
 ```
 
-## Quy Tắc Thiết Kế Bất Biến
+`GatedSpatialMixer` là depthwise spatial convolution có gate, không phải Mamba hoặc selective state-space model. Self-attention dùng scaled dot-product attention normalize theo key dimension.
 
-1. **Text là input duy nhất ngoài ảnh** — không có crops, không có visual templates.
-2. **Mỗi class có block riêng** — không share weights giữa các class.
-3. **Mỗi epoch train đầy đủ tất cả class** — dataset expanded: mỗi (ảnh, class) = 1 sample.
-4. **Output là CenterNet** — Gaussian center heatmap + size regression, phân biệt từng instance riêng rẽ.
+## Runtime behavior
+
+Query mode:
+
+```text
+image + class_id + optional text
+-> prediction cho class được yêu cầu
+```
+
+All-class mode:
+
+```text
+image
+-> encode image một lần
+-> evaluate class conditions theo chunk
+-> concatenate outputs
+```
+
+Text preset dùng fixed prompt khi caller không truyền runtime text. Preset không dùng text không được coi text là nguồn thông tin ngầm.
+
+## Điều gì sẽ chứng minh hoặc bác bỏ giả thuyết?
+
+Các so sánh tối thiểu:
+
+1. Shared CenterNet, không conditioning.
+2. Shared + class embedding.
+3. Per-class pathways, không text.
+4. Per-class pathways + fixed text.
+5. Shared + fixed text.
+6. Shared + pretrained text.
+7. FiLM so với cross-attention khi giữ nguyên các yếu tố khác.
+
+Nếu cấu hình 4 không tốt hơn 3, fixed text không cung cấp giá trị ngoài routing. Nếu 3 tốt hơn 1 nhưng có nhiều tham số hơn đáng kể, cần kiểm soát parameter budget trước khi kết luận specialist pathways tốt hơn.
+
+Protocol split, AP metrics và report requirements nằm tại `docs/research_protocol.md`.
+
+## Nguyên tắc bất biến mới
+
+1. Ảnh hoàn chỉnh là visual input; không dùng ground-truth crop làm gợi ý.
+2. Train/val/test chia ở image level; test không tham gia model selection.
+3. Output detection là center heatmap + size + offset ở stride 8.
+4. Mọi padding text phải được mask.
+5. Mọi tên module phải mô tả đúng computation thực tế.
+6. Text, routing và specialist capacity phải được ablate độc lập.
+7. Chỉ detection AP trên held-out data mới được dùng làm bằng chứng hiệu quả.

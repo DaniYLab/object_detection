@@ -1,84 +1,160 @@
-# Kiến Trúc Hệ Thống (Architecture Reference)
+# Kiến trúc hệ thống
 
-## Tổng Quan Pipeline
+## Tổng quan
 
+Repository triển khai một **Configurable Conditioned CenterNet**. Pathway, conditioner và fusion là ba trục độc lập để tạo baseline/ablation; per-class text architecture không còn là giả định bắt buộc.
+
+```text
+Image [B,3,H,W]
+  -> ConvImageEncoder, stride 8
+  -> feature [B,C,H/8,W/8]
+  -> flatten + linear projection + learned 2D position
+  -> image tokens [B,(H/8)*(W/8),D]
+
+Condition
+  none | class embedding | byte text | optional pretrained text
+  -> condition tokens + valid-token mask + pooled condition
+
+Image tokens + condition
+  -> fusion: none | add | FiLM | cross-attention | FiLM+cross-attention
+  -> pathway: shared | per-class
+       GatedSpatialMixer2D
+       corrected scaled-dot-product SelfAttention
+       FFN
+  -> GroupNorm CenterNet head
+  -> center heatmap + positive size + fractional offset
 ```
-Image [B, 3, 512, 512]
-  │
-  ├──► VAEEncoderStub ──► latent [B, 16, 64, 64] ──► flatten + proj ──► img_tokens [B, 4096, D]
-  │
-  │    Text "Find {class} ..." 
-  │      │
-  │      ├──► hash tokenizer ──► text_ids [B, 32]
-  │      └──► TextEncoderStub ──► txt_tokens [B, 32, D]
-  │
-  ├──► EarlyFusion(img_tokens, txt_tokens) ──► fused [B, 4096, D]
-  │
-  ├──► Route by class_id ──► class_blocks[cid] ──► x [B, 4096, D]
-  │    (35 separate Mamba+Attention stacks)
-  │
-  └──► HeatmapHead ──► [B, 5, 64, 64]
-         ├── channel 0: sigmoid → center_heatmap [B, 1, 64, 64]
-         ├── channel 1-2: ReLU  → size_map       [B, 2, 64, 64]
-         └── channel 3-4: sigmoid → offset_map   [B, 2, 64, 64]
+
+Output stride hiện được khóa ở 8. `image_size` phải chia hết cho 8; config khác bị từ chối trước forward/target loss.
+
+## Image encoder
+
+`ConvImageEncoder` là CNN trainable ba stage stride-2. Nó không phải VAE, không sample latent distribution và không chứa Flux weights. Tên `VAEConfig`/`VAEEncoderStub` chỉ được giữ như compatibility alias cho code/checkpoint cũ.
+
+## Conditioning
+
+### None
+
+Không truyền class/text information. Dùng cho shared CenterNet baseline và ablation `per-class no text`.
+
+### Class embedding
+
+Một learned embedding theo class ID. Đây là default nhẹ và rõ nhất cho closed-vocabulary 35-class detection.
+
+### Lightweight byte text
+
+- Tokenize UTF-8 bytes, không hash collision.
+- PAD mask tường minh.
+- Masked mean chỉ dùng token hợp lệ.
+- Cho phép runtime text và fixed class prompt fallback.
+- Random-init; không được mô tả là pretrained language understanding.
+
+### Optional pretrained text
+
+Lazy Hugging Face backend, truyền tokenizer attention mask và freeze backbone mặc định. Dependency nằm trong `requirements-pretrained.txt`; default tests không download model.
+
+## Fusion
+
+- `none`: image tokens không được điều chế.
+- `add`: cộng pooled condition.
+- `film`: condition sinh channel-wise gamma/beta.
+- `cross_attention`: image tokens query condition tokens và dùng padding mask.
+- `film_cross_attention`: FiLM trước, cross-attention sau.
+
+## Spatial pathway
+
+### GatedSpatialMixer2D
+
+```text
+Linear D -> 2*inner
+-> content/gate split
+-> content reshape về [B,C,H,W]
+-> depthwise Conv2d
+-> LayerNorm
+-> multiply SiLU(gate)
+-> Linear về D
 ```
 
-## Các Module
+Module được đặt tên theo computation thật. Nó không phải Mamba/SSM và không có disconnected SSM parameters.
 
-### 1. VAEEncoderStub (`detector.py`)
-- **Vai trò:** Mã hoá ảnh thành latent space (downscale 8x)
-- **Hiện tại:** 3-layer Conv stub (64→128→256→16)
-- **Tương lai:** Thay bằng Flux VAE (`AutoencoderKL` từ `diffusers`)
-- **Output:** `[B, 16, H/8, W/8]`
+### SelfAttention
 
-### 2. TextEncoderStub (`detector.py`)
-- **Vai trò:** Mã hoá text prompt thành embedding
-- **Hiện tại:** Embedding + Positional + LayerNorm
-- **Tương lai:** Thay bằng T5 Encoder hoặc CLIP Text
-- **Output:** `[B, L, D]`
+Q/K/V dùng layout `[B,heads,length,head_dim]`. `scaled_dot_product_attention` normalize trên key dimension. Query-chunk fallback giảm peak attention memory nhưng compute vẫn là O(L²); tài liệu không tuyên bố linear-time attention.
 
-### 3. EarlyFusion (`detector.py`)
-- **Vai trò:** Kết hợp text với image qua Cross-Attention
-- **Cơ chế:** Query=text, Key/Value=image → text "hỏi" ảnh
-- **Output:** Enriched image tokens `[B, img_len, D]`
+### Shared và per-class routing
 
-### 4. ObjectLearningBlock (`blocks/object_learning_block.py`)
-- **Vai trò:** Khối học chuyên biệt cho mỗi class
-- **Cấu trúc:** Mamba (long-range) → Self-Attention (spatial) → FFN
-- **Số lượng:** 35 block × `depth_per_class` layers (mặc định 2)
-- **Class conditioning:** Nhận `class_id` → thêm class embedding
+- Shared: một fusion/pathway stack xử lý mọi class condition.
+- Per-class: một stack cho mỗi class.
 
-### 5. HeatmapHead (`detector.py`)
-- **Vai trò:** Chuyển feature map thành CenterNet output
-- **Output:** 5 channels:
-  - Channel 0: Center heatmap (Gaussian peaks tại tâm vật thể)
-  - Channel 1-2: Size map (width, height tại tâm, theo output-grid units)
-  - Channel 3-4: Offset map (fractional dx, dy trong cell output)
+Selected-class batch được group theo class ID rồi scatter về thứ tự ban đầu; không còn gọi shared head từng sample. All-class shared inference replicate condition theo class chunk, còn ảnh chỉ encode một lần.
 
-## Thông Số Mô Hình
+## Detection head
 
-| Config | `model_dim=256` | `model_dim=512` |
-|--------|-----------------|-----------------|
-| Params | ~131.6M | ~500M+ |
-| Per-class blocks | 35 × 2 depth | 35 × 2 depth |
-| Latent size | 64×64 | 64×64 |
-| Output size | 64×64 | 64×64 |
+Query output:
 
-## Dataset
+```text
+center_heatmap [B,1,h,w]   = sigmoid(center logits)
+size_map       [B,2,h,w]   = softplus(raw size)
+offset_map     [B,2,h,w]   = sigmoid(raw offset)
+```
 
-| Metric | Giá trị |
-|--------|---------|
-| Ảnh gốc (train) | 9,718 |
-| Expanded samples | 44,229 (mỗi ảnh × class = 1 entry) |
-| Trung bình class/ảnh | ~4.5 |
-| Tổng số class | 35 |
-| Image size | 512×512 (resized) |
-| Output resolution | 64×64 (VAE 8x downscale) |
+All-class output:
 
-## Loss Functions
+```text
+center_heatmap [B,C,h,w]
+size_map       [B,2C,h,w]
+offset_map     [B,2C,h,w]
+```
 
-| Loss | Áp dụng cho | Mô tả |
-|------|-------------|-------|
-| Penalty-reduced Focal Loss | `center_heatmap` | Phạt nặng khi đoán sai tâm, giảm nhẹ tại vùng lân cận Gaussian |
-| Masked Smooth L1 Loss | `size_map` | Chỉ tính loss kích thước tại đúng pixel tâm (dùng `mask_map`) |
-| Masked Smooth L1 Loss | `offset_map` | Học offset fractional `(dx, dy)` để sửa lỗi lượng tử hoá stride 8 |
+Head dùng GroupNorm thay BatchNorm để không phụ thuộc batch statistics của class routing. Softplus giữ size dương và vẫn có gradient khi raw size âm.
+
+## Unconditioned pathway control
+
+`shared_no_condition` dùng cùng ConvImageEncoder, learned 2-D positional embedding, `GatedSpatialMixer2D → SelfAttention → FFN` stack và GroupNorm CenterNet head design như `floorplan_base`, nhưng bỏ conditioner/fusion. Head trả multi-class `5C` channels trong một pass; selected-query training chỉ gather channels của class được hỏi.
+
+Multi-class head là bắt buộc để control hợp lệ: shared query head 1-channel không nhận class signal sẽ tạo cùng output cho mọi class và không thể học class discrimination. Control này đo hiệu ứng conditioning mà vẫn cho từng class output riêng.
+
+## Shared CenterNet baseline
+
+`centernet_baseline` dùng chung image encoder contract, output stride, target builder, decoder và evaluator nhưng không text/class routing. Head trả multi-class 5C channels trong một pass. Đây là project-native control baseline, không phải reproduction chính thức của CenterNet paper.
+
+## Data flow
+
+```text
+PNG + SVG
+-> canonical metadata schema v2
+-> explicit thing/stuff policy
+-> image-level index
+-> deterministic train/val manifest + untouched test
+-> expand train/val thành (image,class) queries
+-> paired augmentation + resize
+-> CenterNet heatmap/size/offset targets + collision stats
+```
+
+Evaluation dùng image-level dataset, reusable decoder và AP50/AP50:95. Chi tiết nằm tại:
+
+- `docs/data_semantics.md`
+- `docs/research_protocol.md`
+- `docs/baselines.md`
+
+## Loss
+
+```text
+L = 10 * focal(center)
+  + 1 * SmoothL1(size at centers)
+  + 1 * SmoothL1(offset at centers)
+```
+
+Target được tạo trực tiếp ở output resolution và giữ exact heatmap peak 1.0.
+
+## Parameter accounting
+
+Không hard-code parameter estimate trong tài liệu vì preset/pathway/conditioner thay đổi số lượng lớn. Đo trực tiếp:
+
+```python
+model = build_model("floorplan_base")
+params = sum(parameter.numel() for parameter in model.parameters())
+trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+```
+
+Mọi experiment report phải lưu resolved `ModelConfig` và hai con số trên.
