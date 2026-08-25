@@ -373,10 +373,18 @@ def _forward_query_batch(
     image: torch.Tensor,
     class_ids: torch.Tensor,
     texts: Sequence[str],
+    stroke_tokens: torch.Tensor | None = None,
+    stroke_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
+    kwargs: dict[str, Any] = {}
+    if getattr(model, "vector_enabled", False):
+        if stroke_tokens is None or stroke_mask is None:
+            raise ValueError("vector-branch models require stroke_tokens and stroke_mask")
+        kwargs["stroke_tokens"] = stroke_tokens
+        kwargs["stroke_mask"] = stroke_mask
     if _uses_text_conditioning(model):
-        return model(image, class_ids=class_ids, texts=list(texts))
-    return model(image, class_ids=class_ids)
+        return model(image, class_ids=class_ids, texts=list(texts), **kwargs)
+    return model(image, class_ids=class_ids, **kwargs)
 
 
 def _resolve_precision(requested: str, device: torch.device) -> str:
@@ -452,6 +460,11 @@ def train_one_epoch(
         }
         class_ids = torch.as_tensor(batch["class_ids"], dtype=torch.long, device=device)
         _accumulate_target_stats(target_stats, batch.get("target_stats", ()))
+        stroke_tokens = batch.get("stroke_tokens")
+        stroke_mask = batch.get("stroke_mask")
+        if stroke_tokens is not None:
+            stroke_tokens = stroke_tokens.to(device, non_blocking=device.type == "cuda")
+            stroke_mask = stroke_mask.to(device, non_blocking=device.type == "cuda")
 
         optimizer.zero_grad(set_to_none=True)
         with _autocast_context(device, precision):
@@ -460,6 +473,8 @@ def train_one_epoch(
                 image,
                 class_ids,
                 batch.get("texts", ()),
+                stroke_tokens=stroke_tokens,
+                stroke_mask=stroke_mask,
             )
             losses = centernet_loss(
                 predictions,
@@ -557,6 +572,11 @@ def validate(
         }
         class_ids = torch.as_tensor(batch["class_ids"], dtype=torch.long, device=device)
         _accumulate_target_stats(target_stats, batch.get("target_stats", ()))
+        stroke_tokens = batch.get("stroke_tokens")
+        stroke_mask = batch.get("stroke_mask")
+        if stroke_tokens is not None:
+            stroke_tokens = stroke_tokens.to(device, non_blocking=device.type == "cuda")
+            stroke_mask = stroke_mask.to(device, non_blocking=device.type == "cuda")
 
         with _autocast_context(device, precision):
             predictions = _forward_query_batch(
@@ -564,6 +584,8 @@ def validate(
                 image,
                 class_ids,
                 batch.get("texts", ()),
+                stroke_tokens=stroke_tokens,
+                stroke_mask=stroke_mask,
             )
             losses = centernet_loss(
                 predictions,
@@ -611,6 +633,7 @@ def validate_ap(
     num_workers: int = 0,
     limit_images: int = 0,
     precision: str = "fp32",
+    vector_n_max: int = 0,
 ) -> dict[str, float]:
     """Run image-level detection evaluation on the val split.
 
@@ -627,6 +650,8 @@ def validate_ap(
         split="val",
         image_size=image_size,
         manifest_path=manifest_path,
+        vector_branch=vector_n_max > 0,
+        vector_n_max=vector_n_max if vector_n_max > 0 else 1024,
     )
     selected_dataset: Dataset = val_dataset
     if limit_images > 0 and limit_images < len(val_dataset):
@@ -649,9 +674,17 @@ def validate_ap(
     targets: list[dict] = []
     for batch in loader:
         images = batch["image"].to(device, non_blocking=device.type == "cuda")
+        stroke_kwargs: dict[str, Any] = {}
+        if "stroke_tokens" in batch:
+            stroke_kwargs["stroke_tokens"] = batch["stroke_tokens"].to(
+                device, non_blocking=device.type == "cuda"
+            )
+            stroke_kwargs["stroke_mask"] = batch["stroke_mask"].to(
+                device, non_blocking=device.type == "cuda"
+            )
         with _autocast_context(device, precision):
             if isinstance(model, FloorPlanDetector):
-                outputs = model(images, class_chunk_size=class_chunk_size)
+                outputs = model(images, class_chunk_size=class_chunk_size, **stroke_kwargs)
             else:
                 outputs = model(images)
         predictions.extend(
@@ -721,6 +754,8 @@ def _build_runtime_config(
     warmup_steps: int,
     train_metadata_fingerprint: str,
     val_metadata_fingerprint: str,
+    vector_branch: bool = False,
+    vector_n_max: int = 0,
 ) -> dict[str, Any]:
     """Capture every setting that affects an exact epoch-boundary resume."""
 
@@ -748,8 +783,9 @@ def _build_runtime_config(
             "balance_power": args.balance_power,
             "cache_images": args.cache_images,
             "steps_per_epoch": steps_per_epoch,
-        },
-        "optimization": {
+            "vector_branch": vector_branch,
+            "vector_n_max": vector_n_max,
+        },        "optimization": {
             "epochs": args.epochs,
             "lr": args.lr,
             "weight_decay": 1e-4,
@@ -901,6 +937,8 @@ def main(args: argparse.Namespace) -> int:
 
     # Both query datasets are derived from the same image-level manifest. Test is
     # intentionally untouched during training and validation.
+    vector_branch = bool(getattr(model_config.vector, "enabled", False))
+    vector_n_max = int(getattr(model_config.vector, "n_max", 1024))
     train_base = FloorPlanQueryDataset(
         args.data_root,
         split="train",
@@ -910,6 +948,9 @@ def main(args: argparse.Namespace) -> int:
         neg_queries_per_pos=args.neg_queries_per_pos,
         neg_seed=args.seed,
         cache_images=args.cache_images,
+        vector_branch=vector_branch,
+        vector_n_max=vector_n_max,
+        vector_seed=args.seed,
     )
     val_base = FloorPlanQueryDataset(
         args.data_root,
@@ -919,7 +960,22 @@ def main(args: argparse.Namespace) -> int:
         manifest_path=manifest_path,
         neg_queries_per_pos=0,
         cache_images=args.cache_images,
+        vector_branch=vector_branch,
+        vector_n_max=vector_n_max,
     )
+    if vector_branch:
+        with_strokes = 0
+        for record in train_base.records:
+            metadata_path = Path(record.metadata_path)
+            if not metadata_path.is_absolute():
+                metadata_path = Path(args.data_root) / metadata_path
+            tokens = train_base._load_stroke_tokens(metadata_path)
+            if tokens.shape[0] > 0:
+                with_strokes += 1
+        print(
+            f"Vector branch enabled: {with_strokes}/{len(train_base.records)} train images "
+            f"carry stroke tokens (n_max={vector_n_max})"
+        )
     if train_base.split_manifest_fingerprint not in {None, manifest_fingerprint}:
         raise RuntimeError("Training dataset loaded a different split manifest fingerprint")
     if val_base.split_manifest_fingerprint not in {None, manifest_fingerprint}:
@@ -1015,6 +1071,8 @@ def main(args: argparse.Namespace) -> int:
         warmup_steps=warmup_steps,
         train_metadata_fingerprint=train_base.metadata_fingerprint,
         val_metadata_fingerprint=val_base.metadata_fingerprint,
+        vector_branch=vector_branch,
+        vector_n_max=vector_n_max,
     )
 
     start_epoch = 1
@@ -1146,6 +1204,7 @@ def main(args: argparse.Namespace) -> int:
                 num_workers=0,
                 limit_images=args.limit_val_ap_images,
                 precision=precision,
+                vector_n_max=vector_n_max if vector_branch else 0,
             )
             print(
                 f"  => Val AP50={val_ap_metrics['val_ap50']:.4f} | "

@@ -71,6 +71,7 @@ def process_sample(
     force: bool = False,
     validate_only: bool = False,
     strict: bool = False,
+    include_strokes: bool = False,
 ) -> int:
     """Process one sample and return instances, or ``-1`` when skipped.
 
@@ -99,6 +100,7 @@ def process_sample(
         stuff_policy=stuff_policy,
         unknown_policy=unknown_policy,
         strict=strict,
+        include_strokes=include_strokes,
     )
     validation = validate_metadata(metadata)
     if not validation.valid:
@@ -118,6 +120,7 @@ def build_dataset(
     validate_only: bool = False,
     strict: bool = False,
     report_path: Path | None = None,
+    include_strokes: bool = False,
 ) -> dict[str, Any]:
     """Build or validate all source metadata and return a structured report."""
 
@@ -197,6 +200,7 @@ def build_dataset(
                         stuff_policy=stuff_policy,
                         unknown_policy=unknown_policy,
                         strict=strict,
+                        include_strokes=include_strokes,
                     )
                     report.instances += int(metadata["num_instances"])
                     if validate_only:
@@ -265,6 +269,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--force", action="store_true", help="Replace existing metadata")
     parser.add_argument(
+        "--include-strokes",
+        "--include_strokes",
+        dest="include_strokes",
+        action="store_true",
+        help="Embed whole-drawing 12-dim stroke tokens (dual-pathway vector branch)",
+    )
+    parser.add_argument(
         "--validate-only",
         "--validate_only",
         dest="validate_only",
@@ -301,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
         validate_only=args.validate_only,
         strict=args.strict,
         report_path=Path(args.report) if args.report else None,
+        include_strokes=args.include_strokes,
     )
     return 1 if result["failed"] else 0
 

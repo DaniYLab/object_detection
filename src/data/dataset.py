@@ -18,6 +18,13 @@ from torch.utils.data import Dataset
 
 from src.data.constants import CLASS_NAMES, CLASS_TO_IDX, NUM_CLASSES, TEXT_TEMPLATE
 from src.data.metadata import load_metadata
+from src.data.strokes import (
+    STROKE_FEATURE_DIM,
+    metadata_strokes,
+    normalize_strokes,
+    pad_stroke_batch,
+    sample_strokes,
+)
 from src.data.splits import (
     ImageRecord,
     image_index_fingerprint,
@@ -107,6 +114,8 @@ class FloorPlanImageDataset(Dataset):
         manifest_path: str | Path | None = None,
         strict_metadata: bool = False,
         records: list[ImageRecord] | None = None,
+        vector_branch: bool = False,
+        vector_n_max: int = 1024,
     ) -> None:
         self.root = Path(root)
         self.split = "val" if split == "validation" else split
@@ -115,6 +124,8 @@ class FloorPlanImageDataset(Dataset):
             raise ValueError("image_size must be positive")
         self.transform = transform or _default_transform(self.image_size, self.split)
         self.strict_metadata = strict_metadata
+        self.vector_branch = vector_branch
+        self.vector_n_max = int(vector_n_max)
         if records is not None:
             self.records = validate_image_records(
                 self.root,
@@ -182,7 +193,7 @@ class FloorPlanImageDataset(Dataset):
             extra,
             image_path,
         ) = self._load_record(record)
-        return {
+        sample = {
             "image": image_tensor,
             "boxes": boxes,
             "labels": labels,
@@ -195,6 +206,20 @@ class FloorPlanImageDataset(Dataset):
             "original_size": extra["original_size"],
             "image_size": (int(image_tensor.shape[-1]), int(image_tensor.shape[-2])),
         }
+        if self.vector_branch:
+            # Deterministic subsample (sorted) at eval: the same drawing always
+            # yields the same primitive subset.
+            tokens = normalize_strokes(
+                extra["metadata"].get("strokes") or [],
+                extra["metadata"].get("image_size") or extra["original_size"],
+            )
+            if tokens.shape[0] > self.vector_n_max:
+                keep = torch.linspace(
+                    0, tokens.shape[0] - 1, self.vector_n_max
+                ).round().long()
+                tokens = tokens.index_select(0, keep)
+            sample["stroke_tokens"] = tokens
+        return sample
 
 
 class FloorPlanQueryDataset(Dataset):
@@ -223,6 +248,9 @@ class FloorPlanQueryDataset(Dataset):
         neg_queries_per_pos: int = 0,
         neg_seed: int = 0,
         cache_images: bool = False,
+        vector_branch: bool = False,
+        vector_n_max: int = 1024,
+        vector_seed: int = 0,
     ) -> None:
         self.root = Path(root)
         self.split = "val" if split == "validation" else split
@@ -248,6 +276,15 @@ class FloorPlanQueryDataset(Dataset):
         # augmentation still runs per query on the smaller cached image. Metadata
         # tensors are cached to avoid re-reading and re-validating JSON per query.
         self.cache_images = cache_images
+        # Dual-pathway vector branch: whole-drawing stroke tokens from
+        # schema-v3 metadata. Per-worker RNG makes epoch-to-epoch stroke
+        # subsampling stochastic while staying off the main training RNG.
+        self.vector_branch = vector_branch
+        self.vector_n_max = int(vector_n_max)
+        if self.vector_branch and self.vector_n_max <= 0:
+            raise ValueError("vector_n_max must be positive when the vector branch is on")
+        self._stroke_rng = __import__("random").Random(vector_seed)
+        self._stroke_cache: dict[str, torch.Tensor] = {}
         self._image_cache: dict[str, Image.Image] = {}
         self._metadata_cache: dict[
             str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]
@@ -377,6 +414,35 @@ class FloorPlanQueryDataset(Dataset):
             )
         return boxes, labels, instance_ids, class_names, original_size
 
+    def _load_stroke_tokens(self, metadata_path: Path) -> torch.Tensor:
+        """Return normalized ``[N, 12]`` whole-drawing stroke tokens (cached).
+
+        Schema-v2 metadata has no strokes; the vector branch then degrades to
+        an empty token set and the model runs image-only for that sample.
+        """
+
+        if not self.vector_branch:
+            return torch.zeros((0, STROKE_FEATURE_DIM), dtype=torch.float32)
+        key = str(metadata_path)
+        cached = self._stroke_cache.get(key)
+        if cached is not None:
+            return cached
+        metadata = load_metadata(metadata_path, allow_legacy=True, strict=self.strict_metadata)
+        image_size = metadata.get("image_size")
+        size = (
+            (int(image_size[0]), int(image_size[1]))
+            if isinstance(image_size, (list, tuple)) and len(image_size) == 2
+            else None
+        )
+        strokes = metadata.get("strokes")
+        if size is None or not isinstance(strokes, list):
+            tokens = torch.zeros((0, STROKE_FEATURE_DIM), dtype=torch.float32)
+        else:
+            tokens = normalize_strokes(strokes, size)
+        self._stroke_cache[key] = tokens
+        return tokens
+
+
     def _load_resized_image(self, image_path: Path) -> tuple[Image.Image, tuple[int, int]]:
         """Decode an image once and cache the full-resolution RGB copy.
 
@@ -423,7 +489,7 @@ class FloorPlanQueryDataset(Dataset):
             min_overlap=self.min_overlap,
             collision_policy=self.collision_policy,
         )
-        return {
+        sample: dict[str, Any] = {
             "image": image_tensor,
             **target_maps,
             "text": TEXT_TEMPLATE.format(cls=target_class),
@@ -437,12 +503,21 @@ class FloorPlanQueryDataset(Dataset):
             "target_stats": target_stats,
             "original_size": original_size,
         }
+        if self.vector_branch:
+            # Stochastic per-epoch subsampling: drawings above n_max see a
+            # different primitive subset each epoch (free augmentation).
+            sample["stroke_tokens"] = sample_strokes(
+                self._load_stroke_tokens(metadata_path),
+                self.vector_n_max,
+                generator=self._stroke_rng,
+            )
+        return sample
 
 
 def query_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     """Collate fixed-size query samples while preserving variable-length boxes."""
 
-    return {
+    collated = {
         "image": torch.stack([sample["image"] for sample in batch]),
         "center_heatmap": torch.stack([sample["center_heatmap"] for sample in batch]),
         "size_map": torch.stack([sample["size_map"] for sample in batch]),
@@ -459,12 +534,20 @@ def query_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "target_stats": [sample["target_stats"] for sample in batch],
         "original_sizes": [sample["original_size"] for sample in batch],
     }
+    if any("stroke_tokens" in sample for sample in batch):
+        tokens, valid = pad_stroke_batch(
+            [sample.get("stroke_tokens", torch.zeros((0, STROKE_FEATURE_DIM))) for sample in batch],
+            n_max=max(sample["stroke_tokens"].shape[0] for sample in batch if "stroke_tokens" in sample) or 1,
+        )
+        collated["stroke_tokens"] = tokens
+        collated["stroke_mask"] = valid
+    return collated
 
 
 def image_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     """Collate image-level evaluation samples without padding annotations."""
 
-    return {
+    collated = {
         "image": torch.stack([sample["image"] for sample in batch]),
         "boxes": [sample["boxes"] for sample in batch],
         "labels": [sample["labels"] for sample in batch],
@@ -477,6 +560,19 @@ def image_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "original_sizes": [sample["original_size"] for sample in batch],
         "image_sizes": [sample["image_size"] for sample in batch],
     }
+    if any("stroke_tokens" in sample for sample in batch):
+        tokens, valid = pad_stroke_batch(
+            [sample.get("stroke_tokens", torch.zeros((0, STROKE_FEATURE_DIM))) for sample in batch],
+            n_max=max(
+                sample["stroke_tokens"].shape[0]
+                for sample in batch
+                if "stroke_tokens" in sample
+            )
+            or 1,
+        )
+        collated["stroke_tokens"] = tokens
+        collated["stroke_mask"] = valid
+    return collated
 
 
 # Backward-compatible public API used by train.py and existing launchers.

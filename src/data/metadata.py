@@ -310,6 +310,63 @@ def parse_path_bbox(path_data: str) -> tuple[float, float, float, float] | None:
     return bbox
 
 
+def extract_strokes(path_data: str) -> list[list[float]]:
+    """Convert one SVG path ``d`` string into 12-dim stroke tokens.
+
+    FloorPlanCAD paths contain exactly one primitive each (``M → L`` or
+    ``M → A``; verified in ``docs/stroke_audit.md``), so this returns either
+    a single token or none. Layout (see ``src/data/strokes.py``):
+
+        line: [x0, y0, x1, y1, 0, 0, 0, 0, 0, 0, 0, 0]
+        arc:  [x0, y0, x1, y1, cx, cy, r, cos(t0), sin(t0), cos(t1), sin(t1), large]
+
+    Coordinates stay in SVG user units; the dataset normalizes them to the
+    image frame. Tokens contain pure geometry — semantic/instance ids are
+    labels and must never be embedded here.
+    """
+
+    try:
+        from svgpathtools import parse_path  # type: ignore[import-not-found]
+    except ImportError:
+        # The dependency-free fallback cannot recover arc parameters; emit a
+        # line token from the path endpoints so vector training still works.
+        tokens = _PATH_TOKEN_RE.findall(path_data)
+        numbers = [float(token) for token in tokens if not token.isalpha()]
+        if len(numbers) < 4:
+            return []
+        return [[*numbers[-4:]] + [0.0] * 8]
+
+    strokes: list[list[float]] = []
+    for segment in parse_path(path_data):
+        start = complex(segment.start)
+        end = complex(segment.end)
+        if hasattr(segment, "radius"):  # Arc
+            radius = float(abs(segment.radius))
+            center = complex(segment.center)
+            theta0 = float(segment.theta)
+            theta1 = float(segment.theta + segment.delta)
+            strokes.append(
+                [
+                    start.real, start.imag,
+                    end.real, end.imag,
+                    center.real, center.imag,
+                    radius,
+                    math.cos(theta0), math.sin(theta0),
+                    math.cos(theta1), math.sin(theta1),
+                    1.0,
+                ]
+            )
+        else:  # Line (or degenerate curve collapsed to its endpoints)
+            strokes.append(
+                [
+                    start.real, start.imag,
+                    end.real, end.imag,
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                ]
+            )
+    return [stroke for stroke in strokes if all(math.isfinite(v) for v in stroke)]
+
+
 def _merge_bboxes(bboxes: Sequence[Sequence[float]]) -> tuple[float, float, float, float]:
     return (
         min(float(box[0]) for box in bboxes),
@@ -351,6 +408,7 @@ def parse_svg_metadata(
     stuff_policy: StuffPolicy = "exclude",
     unknown_policy: UnknownPolicy = "warn",
     strict: bool = False,
+    include_strokes: bool = False,
 ) -> dict[str, Any]:
     """Parse one FloorPlanCAD SVG into canonical schema-v2 metadata.
 
@@ -363,6 +421,10 @@ def parse_svg_metadata(
 
     Unknown semantic IDs are skipped and recorded when ``unknown_policy="warn"``;
     ``unknown_policy="error"`` rejects the source SVG.
+
+    With ``include_strokes=True`` (schema v3), the metadata additionally carries
+    a whole-drawing ``strokes`` array of 12-dim primitive tokens (pure geometry,
+    never semantic/instance ids) for the dual-pathway vector branch.
     """
 
     svg_path = Path(svg_path)
@@ -400,6 +462,7 @@ def parse_svg_metadata(
     unknown_semantic_messages: list[str] = []
     # key -> {sid, iid, bboxes}; insertion order follows source path order.
     groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+    drawing_strokes: list[list[float]] = []
 
     for path_index, element in enumerate(root.iter()):
         path_data = _get_attribute(element, "d")
@@ -434,6 +497,14 @@ def parse_svg_metadata(
 
         if _get_attribute(element, "transform") is not None:
             stats.warnings.append(f"path[{path_index}] transform is unsupported and was ignored")
+
+        if include_strokes:
+            # Whole-drawing vector context: geometry only, before stuff/thing
+            # filtering, so walls and other instance-id-less strokes survive.
+            try:
+                drawing_strokes.extend(extract_strokes(path_data))
+            except Exception as exc:
+                stats.warnings.append(f"path[{path_index}] stroke extraction failed: {exc}")
 
         try:
             bbox = parse_path_bbox(path_data)
@@ -531,6 +602,8 @@ def parse_svg_metadata(
         "bbox_convention": BBOX_CONVENTION,
         "class_mapping_fingerprint": CLASS_MAPPING_FINGERPRINT,
     }
+    if include_strokes:
+        settings["strokes"] = "whole_drawing_v1"
     image_sha256 = sha256_file(image_path)
     svg_sha256 = sha256_file(svg_path)
     fingerprint = build_fingerprint(image_sha256, svg_sha256, settings)
@@ -559,6 +632,9 @@ def parse_svg_metadata(
         "num_instances": len(instances),
         "instances": instances,
     }
+    if include_strokes:
+        metadata["strokes"] = drawing_strokes
+        metadata["num_strokes"] = len(drawing_strokes)
 
     validation = validate_metadata(metadata)
     if not validation.valid:

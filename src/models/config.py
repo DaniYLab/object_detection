@@ -132,6 +132,38 @@ class ConditionerConfig:
 
 
 @dataclass
+class VectorBranchConfig:
+    """Configuration for the dual-pathway SVG stroke (vector) branch.
+
+    ``enabled`` gates the whole branch. ``n_max`` bounds the token count per
+    drawing (drawings are subsampled when larger — see ``src/data/strokes.py``).
+    ``fusion`` selects how encoded vector tokens meet image tokens:
+
+    - ``cross_attention``: image tokens query the vector tokens (K/V);
+    - ``add``: mean-pooled vector features are added to every image token.
+    """
+
+    enabled: bool = False
+    n_max: int = 1024
+    depth: int = 1
+    num_heads: int = 8
+    fusion: str = "cross_attention"
+    feature_dim: int = 12
+
+    def __post_init__(self) -> None:
+        if self.n_max <= 0:
+            raise ValueError("vector n_max must be positive")
+        if self.depth < 0:
+            raise ValueError("vector depth cannot be negative")
+        if self.num_heads <= 0:
+            raise ValueError("vector num_heads must be positive")
+        if self.fusion not in {"cross_attention", "add"}:
+            raise ValueError(f"unknown vector fusion mode: {self.fusion!r}")
+        if self.feature_dim <= 0:
+            raise ValueError("vector feature_dim must be positive")
+
+
+@dataclass
 class ModelConfig:
     """Full serializable configuration for :class:`FloorPlanDetector`."""
 
@@ -154,6 +186,7 @@ class ModelConfig:
     conditioner: ConditionerConfig = field(
         default_factory=lambda: ConditionerConfig(kind="class_embedding")
     )
+    vector: VectorBranchConfig = field(default_factory=VectorBranchConfig)
 
     def __post_init__(self) -> None:
         if isinstance(self.vae, dict):
@@ -162,6 +195,10 @@ class ModelConfig:
             self.text_encoder = TextEncoderConfig.from_dict(self.text_encoder)
         if isinstance(self.conditioner, dict):
             self.conditioner = ConditionerConfig.from_dict(self.conditioner)
+        if isinstance(self.vector, dict):
+            self.vector = VectorBranchConfig(**self.vector)
+        elif not isinstance(self.vector, VectorBranchConfig):
+            raise TypeError("vector must be a VectorBranchConfig or a dict")
         if self.class_texts is not None:
             self.class_texts = tuple(self.class_texts)
             if len(self.class_texts) != self.num_classes or not all(
@@ -430,3 +467,27 @@ register_model_preset(
         num_heads=8,
     ),
 )
+
+# ── Dual-pathway (image + SVG vector) presets ──────────────────────────────────
+
+# Main dual-pathway model: floorplan_base (class embedding + FiLM) plus the
+# SVG stroke branch fused into the image tokens via cross-attention. Compare
+# against floorplan_base on the same seeds to isolate the vector-source gain.
+register_model_preset(
+    "dual_pathway",
+    ModelConfig(
+        vector=VectorBranchConfig(enabled=True),
+    ),
+)
+
+# Control: vector encoder present and trained, but its output is never used
+# downstream. Isolates the fusion contribution from the extra capacity.
+register_model_preset(
+    "dual_no_fusion",
+    ModelConfig(
+        vector=VectorBranchConfig(enabled=True, fusion="cross_attention"),
+        conditioner=ConditionerConfig(kind="none"),
+        fusion_mode="none",
+    ),
+)
+

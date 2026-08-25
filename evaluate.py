@@ -164,8 +164,16 @@ def _predict(
     targets: list[dict[str, Any]] = []
     for batch in loader:
         images = batch["image"].to(device, non_blocking=device.type == "cuda")
+        stroke_kwargs: dict[str, Any] = {}
+        if "stroke_tokens" in batch:
+            stroke_kwargs["stroke_tokens"] = batch["stroke_tokens"].to(
+                device, non_blocking=device.type == "cuda"
+            )
+            stroke_kwargs["stroke_mask"] = batch["stroke_mask"].to(
+                device, non_blocking=device.type == "cuda"
+            )
         if isinstance(model, FloorPlanDetector):
-            outputs = model(images, class_chunk_size=class_chunk_size)
+            outputs = model(images, class_chunk_size=class_chunk_size, **stroke_kwargs)
         else:
             outputs = model(images)
         predictions.extend(
@@ -253,12 +261,30 @@ def main(argv: list[str] | None = None) -> int:
     if manifest_path is not None:
         manifest_fingerprint = load_split_manifest(manifest_path).get("fingerprint")
 
+    # The model is loaded first so its config decides whether the dataset
+    # carries stroke tokens for the dual-pathway vector branch.
+    model: torch.nn.Module | None = None
+    checkpoint: dict[str, Any] | None = None
+    config = None
+    if not args.predictions_json:
+        checkpoint_path = Path(args.checkpoint)
+        model, checkpoint, config = _load_model(
+            checkpoint_path,
+            device=device,
+            image_size=args.image_size,
+            manifest_fingerprint=manifest_fingerprint,
+            allow_manifest_mismatch=args.allow_manifest_mismatch,
+        )
+
+    vector_branch = bool(getattr(config, "vector", None) and config.vector.enabled)
     dataset = FloorPlanImageDataset(
         args.data_root,
         split=args.split,
         image_size=args.image_size,
         manifest_path=args.manifest,
         strict_metadata=args.strict_metadata,
+        vector_branch=vector_branch,
+        vector_n_max=int(getattr(config.vector, "n_max", 1024)) if vector_branch else 1024,
     )
     selected_dataset = dataset
     if args.limit_images and args.limit_images < len(dataset):
@@ -287,14 +313,7 @@ def main(argv: list[str] | None = None) -> int:
             "sha256": _sha256(Path(args.predictions_json)),
         }
     else:
-        checkpoint_path = Path(args.checkpoint)
-        model, checkpoint, config = _load_model(
-            checkpoint_path,
-            device=device,
-            image_size=args.image_size,
-            manifest_fingerprint=manifest_fingerprint,
-            allow_manifest_mismatch=args.allow_manifest_mismatch,
-        )
+        assert model is not None and checkpoint is not None and config is not None
         decoder = CenterNetDecoder(
             stride=config.output_stride,
             threshold=args.threshold,

@@ -11,7 +11,8 @@ import torch.nn.functional as F
 
 from .blocks import ObjectLearningBlock
 from .conditioning import ConditioningOutput, build_conditioner, masked_mean
-from .config import ConditionerConfig, ModelConfig, TextEncoderConfig, VAEConfig
+from .config import ConditionerConfig, ModelConfig, TextEncoderConfig, VAEConfig, VectorBranchConfig
+from .vector_encoder import VectorEncoder
 
 # Alphabetical FloorPlanCAD names mirror src.data.constants without importing the
 # data package (whose optional image dependencies should not be required by models).
@@ -514,6 +515,35 @@ class FloorPlanDetector(nn.Module):
             hidden_dim=config.head_channels,
         )
 
+        # Dual-pathway vector (SVG stroke) branch. Cross-attention fusion uses
+        # image tokens as Query and encoded strokes as Key/Value so the stride-8
+        # spatial layout is preserved; "add" pools strokes per image and adds.
+        self.vector_enabled = bool(config.vector.enabled)
+        self.vector_n_max = int(config.vector.n_max)
+        self.vector_fusion_mode = config.vector.fusion
+        self.vector_encoder: VectorEncoder | None = None
+        self.vector_cross_attention = None
+        if self.vector_enabled:
+            self.vector_encoder = VectorEncoder(
+                feature_dim=config.vector.feature_dim,
+                model_dim=self.model_dim,
+                depth=config.vector.depth,
+                num_heads=config.vector.num_heads,
+                dropout=config.dropout,
+                attention_chunk_size=config.attention_chunk_size,
+            )
+            if self.vector_fusion_mode == "cross_attention":
+                self.vector_norm = nn.LayerNorm(self.model_dim)
+                self.vector_cross_attention = nn.MultiheadAttention(
+                    self.model_dim,
+                    config.vector.num_heads,
+                    dropout=config.dropout,
+                    batch_first=True,
+                )
+                self.vector_projection = nn.Linear(self.model_dim, self.model_dim)
+            else:
+                self.vector_projection = nn.Linear(self.model_dim, self.model_dim)
+
     @property
     def vae_encoder(self) -> nn.Module:
         """Compatibility view of the project-native image encoder."""
@@ -573,6 +603,62 @@ class FloorPlanDetector(nn.Module):
                 align_corners=False,
             ).flatten(2).transpose(1, 2)
         return tokens + position, height, width
+
+    def encode_vector(
+        self,
+        stroke_tokens: torch.Tensor | None,
+        valid_mask: torch.Tensor | None,
+        image_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fuse the vector branch into image tokens (identity when disabled).
+
+        ``stroke_tokens`` is ``[B, N, 12]`` with ``[B, N]`` validity. In
+        cross-attention mode image tokens query the encoded strokes; in add
+        mode the masked-mean stroke feature is added to every image token.
+        Rows with no valid stroke pass through unchanged.
+        """
+
+        if not self.vector_enabled or self.vector_encoder is None:
+            return image_tokens
+        if stroke_tokens is None or valid_mask is None:
+            return image_tokens
+        if stroke_tokens.ndim != 3 or stroke_tokens.shape[-1] != self.vector_encoder.feature_dim:
+            raise ValueError(
+                f"stroke_tokens must have shape [B,N,{self.vector_encoder.feature_dim}], "
+                f"got {tuple(stroke_tokens.shape)}"
+            )
+        if valid_mask.shape != stroke_tokens.shape[:2]:
+            raise ValueError(
+                f"valid_mask must have shape {tuple(stroke_tokens.shape[:2])}, "
+                f"got {tuple(valid_mask.shape)}"
+            )
+        if stroke_tokens.shape[0] != image_tokens.shape[0]:
+            raise ValueError("stroke batch size must match the image batch size")
+
+        encoded = self.vector_encoder(stroke_tokens, valid_mask)
+        valid_rows = valid_mask.any(dim=1).to(encoded.dtype)
+
+        if self.vector_fusion_mode == "cross_attention":
+            key_padding = ~valid_mask.to(torch.bool)
+            # Guard all-pad rows so key_padding_mask never masks everything.
+            if not bool(valid_rows.all()):
+                key_padding = key_padding.clone()
+                key_padding[~valid_rows.bool(), 0] = False
+            attended, _ = self.vector_cross_attention(
+                query=self.vector_norm(image_tokens),
+                key=encoded,
+                value=encoded,
+                key_padding_mask=key_padding,
+                need_weights=False,
+            )
+            delta = self.vector_projection(attended)
+            return image_tokens + delta * valid_rows[:, None, None].to(delta.dtype)
+
+        pooled = masked_mean(encoded, valid_mask.to(torch.bool)) * valid_rows[:, None].to(
+            encoded.dtype
+        )
+        delta = self.vector_projection(pooled)
+        return image_tokens + delta.unsqueeze(1)
 
     @staticmethod
     def _normalise_conditioning_output(output) -> ConditioningOutput:
@@ -844,8 +930,13 @@ class FloorPlanDetector(nn.Module):
         texts: str | Sequence[str] | None = None,
         *,
         class_chunk_size: int | None = None,
+        stroke_tokens: torch.Tensor | None = None,
+        stroke_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         image_tokens, height, width = self.encode_image(image)
+        # Vector (SVG stroke) fusion runs once per image, before conditioning,
+        # so every class chunk benefits from the same fused image tokens.
+        image_tokens = self.encode_vector(stroke_tokens, stroke_mask, image_tokens)
         if class_ids is not None:
             selected_ids = self._validate_class_ids(class_ids, image.shape[0], image.device)
             selected_texts = self._selected_texts(texts, selected_ids)
