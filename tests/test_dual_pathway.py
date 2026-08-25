@@ -92,6 +92,30 @@ class TestSampleStrokes:
         second = sample_strokes(tokens, 5, generator=random.Random(7))
         assert torch.equal(first, second)
 
+    def test_length_weighted_keeps_long_strokes(self) -> None:
+        import random
+
+        # One long stroke, 99 zero-length strokes; sampling 10 should keep the
+        # long one with overwhelming probability under length weighting.
+        tokens = torch.zeros((100, STROKE_FEATURE_DIM))
+        tokens[0, 2] = 1.0  # long stroke: x1 - x0 = 1
+        kept_count = sum(
+            bool(sample_strokes(tokens, 10, generator=random.Random(seed))[0, 2] == 1.0)
+            for seed in range(20)
+        )
+        assert kept_count >= 18  # floor allows rare misses
+
+    def test_exact_count_after_weighted_sampling(self) -> None:
+        import random
+
+        tokens = torch.rand(200, STROKE_FEATURE_DIM)
+        result = sample_strokes(tokens, 50, generator=random.Random(0))
+        assert result.shape == (50, STROKE_FEATURE_DIM)
+        # Unique rows preserved (no duplicated indices).
+        originals = {tuple(row.tolist()) for row in tokens}
+        assert len({tuple(row.tolist()) for row in result}) == 50
+        assert all(tuple(row.tolist()) in originals for row in result)
+
     def test_rejects_nonpositive_n_max(self) -> None:
         with pytest.raises(ValueError):
             sample_strokes(torch.randn(4, STROKE_FEATURE_DIM), 0)
@@ -271,3 +295,93 @@ class TestDetectorVectorForward:
             if name.startswith("vector_encoder") and parameter.grad is not None
         ]
         assert grads, "no gradients reached the vector encoder"
+
+
+class TestClassConditionedVectorFusion:
+    """dual_pathway_v2: FiLM(class embedding) over vector tokens before fusion."""
+
+    @pytest.fixture()
+    def v2_model(self) -> torch.nn.Module:
+        model = build_model(preset="dual_pathway_v2")
+        model.eval()
+        return model
+
+    @staticmethod
+    def _strokes(batch: int, length: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
+        tokens = torch.rand(batch, length, STROKE_FEATURE_DIM)
+        mask = torch.ones(batch, length, dtype=torch.bool)
+        return tokens, mask
+
+    def test_preset_config(self, v2_model) -> None:
+        assert v2_model.vector_enabled
+        assert v2_model.vector_class_conditioned
+        assert v2_model.config.conditioner.kind == "class_embedding"
+
+    def test_selected_class_forward(self, v2_model) -> None:
+        image = torch.randn(2, 3, 512, 512)
+        tokens, mask = self._strokes(2)
+        out = v2_model(
+            image, class_ids=torch.tensor([3, 5]), stroke_tokens=tokens, stroke_mask=mask
+        )
+        assert out["center_heatmap"].shape == (2, 1, 64, 64)
+
+    def test_all_class_forward(self, v2_model) -> None:
+        image = torch.randn(1, 3, 512, 512)
+        tokens, mask = self._strokes(1)
+        out = v2_model(
+            image, stroke_tokens=tokens, stroke_mask=mask, class_chunk_size=8
+        )
+        assert out["center_heatmap"].shape == (1, 35, 64, 64)
+
+    def test_class_identity_changes_fusion(self, v2_model) -> None:
+        torch.manual_seed(2)
+        image = torch.randn(1, 3, 512, 512)
+        tokens, mask = self._strokes(1)
+        with torch.no_grad():
+            out_a = v2_model(
+                image, class_ids=torch.tensor([4]), stroke_tokens=tokens, stroke_mask=mask
+            )
+            out_b = v2_model(
+                image, class_ids=torch.tensor([9]), stroke_tokens=tokens, stroke_mask=mask
+            )
+        assert not torch.allclose(out_a["center_heatmap"], out_b["center_heatmap"])
+
+    def test_backward_reaches_film_and_encoder(self) -> None:
+        model = build_model(preset="dual_pathway_v2")
+        image = torch.randn(1, 3, 512, 512)
+        tokens, mask = self._strokes(1)
+        out = model(image, class_ids=torch.tensor([4]), stroke_tokens=tokens, stroke_mask=mask)
+        out["center_logits"].sum().backward()
+        film = [n for n, p in model.named_parameters() if "vector_film" in n and p.grad is not None]
+        encoder = [
+            n for n, p in model.named_parameters()
+            if n.startswith("vector_encoder") and p.grad is not None
+        ]
+        assert film and encoder
+
+    def test_requires_conditioner(self) -> None:
+        from src.models.config import ConditionerConfig, ModelConfig, VectorBranchConfig
+
+        # class_conditioned fusion with the "none" conditioner is rejected at
+        # model construction (the FiLM would have no input).
+        config = ModelConfig(
+            vector=VectorBranchConfig(enabled=True, class_conditioned=True),
+            fusion_mode="none",
+            conditioner=ConditionerConfig(kind="none"),
+        )
+        with pytest.raises(ValueError):
+            build_model(config)
+
+    def test_class_conditioned_serializes(self) -> None:
+        config = ModelConfig(
+            vector=VectorBranchConfig(enabled=True, class_conditioned=True)
+        )
+        data = config.to_dict()
+        assert data["vector"]["class_conditioned"] is True
+        restored = ModelConfig.from_dict(data)
+        assert restored.vector.class_conditioned
+
+    def test_budget_discipline_v2(self) -> None:
+        base = sum(p.numel() for p in build_model(preset="floorplan_base").parameters())
+        v2 = sum(p.numel() for p in build_model(preset="dual_pathway_v2").parameters())
+        assert base < v2 < base * 1.5

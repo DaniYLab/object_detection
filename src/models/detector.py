@@ -521,6 +521,7 @@ class FloorPlanDetector(nn.Module):
         self.vector_enabled = bool(config.vector.enabled)
         self.vector_n_max = int(config.vector.n_max)
         self.vector_fusion_mode = config.vector.fusion
+        self.vector_class_conditioned = bool(config.vector.class_conditioned)
         self.vector_encoder: VectorEncoder | None = None
         self.vector_cross_attention = None
         if self.vector_enabled:
@@ -532,6 +533,20 @@ class FloorPlanDetector(nn.Module):
                 dropout=config.dropout,
                 attention_chunk_size=config.attention_chunk_size,
             )
+            if self.vector_class_conditioned:
+                if config.conditioner.kind == "none":
+                    raise ValueError(
+                        "vector class_conditioned fusion requires a conditioner "
+                        "(class_embedding) as the FiLM source"
+                    )
+                # FiLM over vector tokens: the queried class modulates which
+                # strokes the cross-attention emphasises (e.g. arc-heavy
+                # strokes for a "toilet" query).
+                self.vector_film = nn.Sequential(
+                    nn.Linear(self.model_dim, self.model_dim * 2),
+                    nn.SiLU(),
+                    nn.Linear(self.model_dim * 2, self.model_dim * 2),
+                )
             if self.vector_fusion_mode == "cross_attention":
                 self.vector_norm = nn.LayerNorm(self.model_dim)
                 self.vector_cross_attention = nn.MultiheadAttention(
@@ -609,13 +624,17 @@ class FloorPlanDetector(nn.Module):
         stroke_tokens: torch.Tensor | None,
         valid_mask: torch.Tensor | None,
         image_tokens: torch.Tensor,
+        class_pooled: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Fuse the vector branch into image tokens (identity when disabled).
 
         ``stroke_tokens`` is ``[B, N, 12]`` with ``[B, N]`` validity. In
         cross-attention mode image tokens query the encoded strokes; in add
         mode the masked-mean stroke feature is added to every image token.
-        Rows with no valid stroke pass through unchanged.
+        When ``class_conditioned`` is set, ``class_pooled`` (the queried
+        class embedding) FiLM-modulates the encoded strokes first so the
+        query class biases which strokes the attention emphasises. Rows with
+        no valid stroke pass through unchanged.
         """
 
         if not self.vector_enabled or self.vector_encoder is None:
@@ -634,9 +653,16 @@ class FloorPlanDetector(nn.Module):
             )
         if stroke_tokens.shape[0] != image_tokens.shape[0]:
             raise ValueError("stroke batch size must match the image batch size")
+        if self.vector_class_conditioned and class_pooled is None:
+            raise ValueError("class-conditioned vector fusion requires class_pooled")
 
         encoded = self.vector_encoder(stroke_tokens, valid_mask)
         valid_rows = valid_mask.any(dim=1).to(encoded.dtype)
+
+        if self.vector_class_conditioned and class_pooled is not None:
+            gamma, beta = self.vector_film(class_pooled.to(encoded.dtype)).chunk(2, dim=-1)
+            encoded = encoded * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
+            encoded = encoded * valid_rows[:, None, None].to(encoded.dtype)
 
         if self.vector_fusion_mode == "cross_attention":
             key_padding = ~valid_mask.to(torch.bool)
@@ -703,8 +729,19 @@ class FloorPlanDetector(nn.Module):
         texts: Sequence[str],
         *,
         pathway_class_id: int | None,
+        stroke_tokens: torch.Tensor | None = None,
+        stroke_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         conditioning = self._condition(class_ids, texts, image_tokens)
+        # Class-conditioned vector fusion needs the class embedding before
+        # the pathway runs; plain vector fusion already happened in forward().
+        if self.vector_class_conditioned and stroke_tokens is not None:
+            image_tokens = self.encode_vector(
+                stroke_tokens,
+                stroke_mask,
+                image_tokens,
+                class_pooled=conditioning.pooled,
+            )
         if self.pathway_mode == "shared":
             assert self.shared_fusion is not None
             fusion = self.shared_fusion
@@ -806,6 +843,8 @@ class FloorPlanDetector(nn.Module):
         width: int,
         class_ids: torch.Tensor,
         texts: list[str],
+        stroke_tokens: torch.Tensor | None = None,
+        stroke_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         grouped_indices = []
         grouped_outputs: dict[str, list[torch.Tensor]] = {
@@ -826,6 +865,12 @@ class FloorPlanDetector(nn.Module):
                 class_ids.index_select(0, indices),
                 group_texts,
                 pathway_class_id=class_id if self.pathway_mode == "per_class" else None,
+                stroke_tokens=stroke_tokens.index_select(0, indices)
+                if stroke_tokens is not None
+                else None,
+                stroke_mask=stroke_mask.index_select(0, indices)
+                if stroke_mask is not None
+                else None,
             )
             for key in grouped_outputs:
                 grouped_outputs[key].append(output[key])
@@ -844,6 +889,8 @@ class FloorPlanDetector(nn.Module):
         width: int,
         class_texts: list[str],
         chunk_size: int,
+        stroke_tokens: torch.Tensor | None = None,
+        stroke_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         batch, length, dim = image_tokens.shape
         all_heatmaps, all_logits, all_sizes, all_offsets = [], [], [], []
@@ -861,6 +908,20 @@ class FloorPlanDetector(nn.Module):
                 for _ in range(batch)
                 for class_id in range(start, end)
             ]
+            expanded_strokes = None
+            expanded_mask = None
+            if stroke_tokens is not None and stroke_mask is not None:
+                stroke_length = stroke_tokens.shape[1]
+                expanded_strokes = (
+                    stroke_tokens[:, None]
+                    .expand(batch, classes_in_chunk, stroke_length, stroke_tokens.shape[-1])
+                    .reshape(batch * classes_in_chunk, stroke_length, -1)
+                )
+                expanded_mask = (
+                    stroke_mask[:, None]
+                    .expand(batch, classes_in_chunk, stroke_length)
+                    .reshape(batch * classes_in_chunk, stroke_length)
+                )
             output = self._run_pathway(
                 expanded_tokens,
                 height,
@@ -868,6 +929,8 @@ class FloorPlanDetector(nn.Module):
                 chunk_ids,
                 chunk_texts,
                 pathway_class_id=None,
+                stroke_tokens=expanded_strokes,
+                stroke_mask=expanded_mask,
             )
             all_heatmaps.append(
                 output["center_heatmap"].reshape(batch, classes_in_chunk, height, width)
@@ -934,9 +997,12 @@ class FloorPlanDetector(nn.Module):
         stroke_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         image_tokens, height, width = self.encode_image(image)
-        # Vector (SVG stroke) fusion runs once per image, before conditioning,
-        # so every class chunk benefits from the same fused image tokens.
-        image_tokens = self.encode_vector(stroke_tokens, stroke_mask, image_tokens)
+        # Plain (class-agnostic) vector fusion runs once per image, before
+        # conditioning, so every class chunk shares the same fused tokens.
+        # Class-conditioned fusion is deferred to _run_pathway, where the
+        # queried class embedding is available.
+        if not self.vector_class_conditioned:
+            image_tokens = self.encode_vector(stroke_tokens, stroke_mask, image_tokens)
         if class_ids is not None:
             selected_ids = self._validate_class_ids(class_ids, image.shape[0], image.device)
             selected_texts = self._selected_texts(texts, selected_ids)
@@ -946,6 +1012,8 @@ class FloorPlanDetector(nn.Module):
                 width,
                 selected_ids,
                 selected_texts,
+                stroke_tokens=stroke_tokens,
+                stroke_mask=stroke_mask,
             )
 
         chunk_size = self.class_chunk_size if class_chunk_size is None else class_chunk_size
@@ -959,6 +1027,8 @@ class FloorPlanDetector(nn.Module):
                 width,
                 all_texts,
                 chunk_size,
+                stroke_tokens=stroke_tokens,
+                stroke_mask=stroke_mask,
             )
         return self._forward_all_per_class(
             image_tokens,

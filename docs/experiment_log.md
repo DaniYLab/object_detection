@@ -33,6 +33,7 @@ Do NOT run held-out test until preset/checkpoint/threshold are frozen on val.
 | A1 | shared_no_condition | 4242 | 30 | 0.3610 | 0.1713 | BF16; best AP @ep30 |
 | B | floorplan_base | 4242 | 30 | 0.4151 | 0.2130 | class embedding + FiLM; BF16; best AP @ep30 |
 | V | dual_pathway | 1337 | 30 | 0.5032 | 0.2737 | image + SVG strokes; BF16; V−B = **+10.11 AP50 / +6.65 AP50:95** |
+| V | dual_pathway | 2024 | 30 | 0.4951 | 0.2760 | image + SVG strokes; BF16; V−B = **+8.67 AP50 / +6.17 AP50:95** |
 
 ## Planned comparisons
 
@@ -87,6 +88,27 @@ its variance. The ≥2/3 seeds protocol requirement is satisfied; the core
 research claim (class conditioning improves the pathway architecture) is now
 robust. A0 was run on seed 1337 only.
 
+## Dual-pathway (vector branch) summary — val, full 1,016 images
+
+| Preset | Seed 1337 | Seed 2024 | Mean AP50 | Mean AP50:95 |
+|---|---:|---:|---:|---:|
+| B `floorplan_base` | 0.4021 | 0.4084 | 0.4053 | 0.2108 |
+| V `dual_pathway` | 0.5032 | 0.4951 | 0.4992 | 0.2749 |
+
+Per-seed vector-source effect (V − B):
+
+| Seed | Δ AP50 | Δ AP50:95 |
+|---|---:|---:|
+| 1337 | +0.1011 | +0.0665 |
+| 2024 | +0.0867 | +0.0617 |
+| **Mean** | **+0.0939** | **+0.0641** |
+
+The SVG vector-information gain (**+9.39 AP50 / +6.41 AP50:95 mean**) replicates
+on 2/2 seeds and is ~1.8× the conditioning gain. The claim — in the protocol's
+terms — is that the dual-pathway architecture exploits information the raster
+pipeline discards (exact primitive geometry), at +21% parameters and +11%
+step time. Test evaluation should wait until the vector design is frozen.
+
 ## Held-out test — seed 1337
 
 The user explicitly requested test evaluation after checkpoints/decoder settings had already been selected on validation. No test result was used to alter checkpoint, threshold, top-k, or model config.
@@ -114,5 +136,6 @@ The conditioning gain therefore generalizes to test for seed 1337. This remains 
 - 2026-08-25: Seed 4242 replication completed. A1: 0.3610/0.1713; B: 0.4151/0.2130 (B−A1 = +5.41/+4.17). Three-seed means: A1 0.3548/0.1696, B 0.4085/0.2115; mean conditioning effect **+5.37 AP50 / +4.19 AP50:95**, seed std ≈ 0.005. Core claim confirmed on 3/3 seeds. SVG stroke audit (`docs/stroke_audit.md`) and dual-pathway spec (`docs/dual_pathway_spec.md`) prepared for the next research phase.
 - 2026-08-25: Dual-pathway implemented: `src/data/strokes.py` (12-dim token superset, normalize/sample/pad), `extract_strokes` in metadata.py (schema-v3 `strokes` field, whole-drawing, geometry-only — never semantic/instance ids), `VectorEncoder` (SelfAttention+FFN reusing image-pathway primitives, TypeEmbedding, padding mask), vector cross-attention fusion in `FloorPlanDetector.encode_vector` (image tokens = Query, strokes = K/V, once per image before conditioning), presets `dual_pathway` (6.39M params, +21% over B) and `dual_no_fusion` control. Metadata regenerated with `--include-strokes` (instances unchanged; strokes add ~700 tokens/drawing mean, n_max=1024 random-sampled per epoch at train, linspace-deterministic at eval). 122 tests pass.
 - 2026-08-25: **V (dual_pathway) seed 1337: val AP50=0.5032, AP50:95=0.2737** — vs B seed 1337 (0.4021/0.2072) = **+10.11 AP50 / +6.65 AP50:95** (+25% relative). The vector-information gain is twice the conditioning gain. Training curve: ep5 0.2801, ep10 0.3976, ep15 0.4766, ep20 0.5085, ep30 0.5224 (limited-256-image val); full-val numbers from best_val_ap.pt. Overhead: +11% step time, +0.9 GB VRAM. Claim discipline: the gain comes from an additional information source (SVG vector geometry), not architecture alone — V−B must be replicated on seed 2024 before final claims.
+- 2026-08-25: **V seed 2024 replicated: val AP50=0.4951, AP50:95=0.2760** (V−B = +8.67/+6.17). Two-seed mean vector effect: **+9.39 AP50 / +6.41 AP50:95** — the vector-information claim holds on 2/2 seeds with seed variance (~0.004) far below the effect. V is now the best model in the repo; A1/B/V ladder demonstrates three stacked, individually replicated gains (architecture control → class conditioning → vector information source).
 - The original A1 query-head control was invalid: without class/text signal, a shared 1-channel head produces identical output for every class query. It achieved only AP50=0.0084 at epoch 5. Replaced it with `floorplan_unconditioned`, which keeps the pathway architecture but uses a multi-class 5C head. The revised control trained normally and reached full-val AP50=0.3513.
 - Seed 1337 conclusion: conditioning provides +5.08 AP50 and +3.86 AP50:95 over the same pathway control, and +2.02/+1.64 over A0. This is preliminary until replicated on two more seeds.

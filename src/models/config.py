@@ -149,6 +149,7 @@ class VectorBranchConfig:
     num_heads: int = 8
     fusion: str = "cross_attention"
     feature_dim: int = 12
+    class_conditioned: bool = False
 
     def __post_init__(self) -> None:
         if self.n_max <= 0:
@@ -477,6 +478,17 @@ register_model_preset(
     "dual_pathway",
     ModelConfig(
         vector=VectorBranchConfig(enabled=True),
+    ),
+)
+
+# V2: class-conditioned vector fusion — FiLM modulates the encoded stroke
+# tokens with the queried class embedding before cross-attention, so a
+# "toilet" query attends preferentially to arc-heavy strokes. Requires the
+# class_embedding conditioner (the FiLM source).
+register_model_preset(
+    "dual_pathway_v2",
+    ModelConfig(
+        vector=VectorBranchConfig(enabled=True, class_conditioned=True),
     ),
 )
 

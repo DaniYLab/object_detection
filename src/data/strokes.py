@@ -86,12 +86,15 @@ def sample_strokes(
     n_max: int,
     generator: random.Random | None = None,
 ) -> torch.Tensor:
-    """Randomly subsample stroke tokens to at most ``n_max`` rows.
+    """Subsample stroke tokens to at most ``n_max`` rows, length-weighted.
 
-    Drawings above ``n_max`` primitives are uniformly subsampled without
-    replacement — each epoch sees a different subset of the same drawing,
-    which acts as free augmentation and avoids a deterministic information
-    cut. Deterministic callers pass a seeded ``random.Random``.
+    Drawings above ``n_max`` primitives are subsampled without replacement with
+    probability proportional to the stroke's endpoint diagonal — long strokes
+    carry object identity (walls, symbol outlines) while short hatch/dot marks
+    are noise-dense (see ``docs/vector_branch_analysis.md``). Weights get a
+    floor of 2% of the max weight so short strokes are never fully excluded,
+    and each epoch still sees a different subset of the same drawing (free
+    augmentation). Deterministic callers pass a seeded ``random.Random``.
     """
 
     if n_max <= 0:
@@ -102,8 +105,27 @@ def sample_strokes(
     if count <= n_max:
         return tokens
     rng = generator or random
-    keep = sorted(rng.sample(range(count), n_max))
-    return tokens.index_select(0, torch.tensor(keep, dtype=torch.long))
+    # Endpoint diagonal in normalized coords: dims 0-3 are (x0, y0, x1, y1).
+    dx = (tokens[:, 2] - tokens[:, 0]).abs()
+    dy = (tokens[:, 3] - tokens[:, 1]).abs()
+    lengths = torch.sqrt(dx * dx + dy * dy)
+    max_length = float(lengths.max()) if count else 1.0
+    if max_length <= 0:
+        keep = sorted(rng.sample(range(count), n_max))
+        return tokens.index_select(0, torch.tensor(keep, dtype=torch.long))
+    # Floor keeps short strokes in the lottery; arcs with tiny endpoint
+    # distance (near-full circles) get the radius as a length proxy.
+    radius = tokens[:, 6]
+    effective = torch.maximum(lengths, radius)
+    weights = (effective / max_length).clamp(min=0.02).tolist()
+    keep = sorted(rng.choices(range(count), weights=weights, k=n_max))
+    # rng.choices samples with replacement — deduplicate then fill from the rest.
+    unique_keep = list(dict.fromkeys(keep))
+    if len(unique_keep) < n_max:
+        remaining = sorted(set(range(count)) - set(unique_keep))
+        rng.shuffle(remaining)
+        unique_keep.extend(remaining[: n_max - len(unique_keep)])
+    return tokens.index_select(0, torch.tensor(sorted(unique_keep), dtype=torch.long))
 
 
 def pad_stroke_batch(
