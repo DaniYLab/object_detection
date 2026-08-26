@@ -8,6 +8,7 @@ been selected, yielding one sample per class present in that image. The legacy
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -247,6 +248,7 @@ class FloorPlanQueryDataset(Dataset):
         records: list[ImageRecord] | None = None,
         neg_queries_per_pos: int = 0,
         neg_seed: int = 0,
+        neg_rare_boost: bool = False,
         cache_images: bool = False,
         vector_branch: bool = False,
         vector_n_max: int = 1024,
@@ -256,6 +258,7 @@ class FloorPlanQueryDataset(Dataset):
         self.split = "val" if split == "validation" else split
         self.image_size = int(image_size)
         self.output_stride = int(output_stride)
+        self.neg_rare_boost = bool(neg_rare_boost)
         if self.image_size <= 0:
             raise ValueError("image_size must be positive")
         if self.output_stride <= 0 or self.image_size % self.output_stride != 0:
@@ -335,6 +338,16 @@ class FloorPlanQueryDataset(Dataset):
         if neg_queries_per_pos > 0:
             all_class_names = [name for name in CLASS_NAMES if name in CLASS_TO_IDX]
             rng = __import__("random").Random(neg_seed)
+            # Inverse-frequency weights make rare classes appear as absent
+            # queries far more often: the model rarely sees a rare class as a
+            # positive, so without this it also rarely learns to suppress it
+            # (test shows 40–400 hallucinated predictions per GT on rare
+            # classes — docs/sota_gap_plan.md §2).
+            global_counts = Counter(
+                CLASS_TO_IDX[class_name]
+                for class_name in (name for rec in self.records for name in rec.classes)
+                if class_name in CLASS_TO_IDX
+            )
             for record in self.records:
                 present = set(record.classes)
                 absent = [name for name in all_class_names if name not in present]
@@ -342,7 +355,22 @@ class FloorPlanQueryDataset(Dataset):
                     continue
                 n_pos = sum(1 for name in record.classes if name in CLASS_TO_IDX)
                 n_neg = n_pos * neg_queries_per_pos
-                sampled = rng.choices(absent, k=n_neg) if len(absent) >= 1 else []
+                if neg_rare_boost:
+                    # Inverse-sqrt-frequency weighting makes rare classes the
+                    # dominant absent-query targets. Classes never present in
+                    # the split (stuff-excluded, zero GT) sink to the common
+                    # floor — they are already trivially suppressed and must
+                    # not soak up the boost meant for rare-but-real classes.
+                    floor = 1.0 / math.sqrt(max(1, len(self.records)))
+                    weights = [
+                        1.0 / math.sqrt(global_counts[CLASS_TO_IDX[name]])
+                        if global_counts[CLASS_TO_IDX[name]] > 0
+                        else floor
+                        for name in absent
+                    ]
+                    sampled = rng.choices(absent, weights=weights, k=n_neg)
+                else:
+                    sampled = rng.choices(absent, k=n_neg)
                 for class_name in sampled:
                     self._neg_records.append((record, class_name, False))
                     self._neg_class_ids.append(CLASS_TO_IDX[class_name])

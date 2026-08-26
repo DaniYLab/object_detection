@@ -774,6 +774,7 @@ def _build_runtime_config(
             "limit_train_samples": args.limit_train_samples,
             "limit_val_samples": args.limit_val_samples,
             "neg_queries_per_pos": args.neg_queries_per_pos,
+            "neg_rare_boost": args.neg_rare_boost,
             "negative_query_seed": args.seed,
         },
         "loader": {
@@ -947,6 +948,7 @@ def main(args: argparse.Namespace) -> int:
         manifest_path=manifest_path,
         neg_queries_per_pos=args.neg_queries_per_pos,
         neg_seed=args.seed,
+        neg_rare_boost=args.neg_rare_boost,
         cache_images=args.cache_images,
         vector_branch=vector_branch,
         vector_n_max=vector_n_max,
@@ -1418,6 +1420,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "Number of absent-class (negative) queries to sample per positive query. "
             "0 disables negative sampling (original behaviour). "
             "Recommended: 1 or 2 to teach the model to output empty predictions."
+        ),
+    )
+    parser.add_argument(
+        "--neg-rare-boost",
+        "--neg_rare_boost",
+        dest="neg_rare_boost",
+        action="store_true",
+        help=(
+            "Weight absent-class query sampling by inverse sqrt class frequency so "
+            "rare classes are taught to be suppressed as often as common ones "
+            "(attacks the 40-400:1 test hallucination ratios on rare classes)."
         ),
     )
     parser.add_argument(

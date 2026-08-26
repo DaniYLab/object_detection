@@ -90,6 +90,27 @@ queued behind the current experiment plan.
 train + replicate) and #3 arc-privilege head are the next candidates if the
 vector line continues.
 
+## V2 results (2026-08-26) — #2 + #1 combined
+
+`dual_pathway_v2` (class-conditioned vector FiLM + length-weighted
+truncation) seed 1337 full-val: **AP50=0.5160, AP50:95=0.2742** vs V1
+(0.5032/0.2737) = **+1.28 AP50**.
+
+Per-class against V1 (seed 1337):
+
+- The two worst V1 regressions recovered: `floor_plan_area` 0.265→0.348
+  (+0.083, length-weighted truncation keeping its long boundary strokes) and
+  `elevator` 0.400→0.549 (+0.149). `door_revolving` improved further
+  0.552→0.702 (+0.150).
+- Six mid-tier classes regressed slightly (stair −0.066, oven −0.054,
+  refrigerator −0.048, table −0.034, shower −0.027, plant −0.022) — the
+  class-conditioned FiLM helps classes with distinctive geometry but adds a
+  mild optimization cost elsewhere.
+- Net effect positive (+1.28 AP50) but modest; V2−V1 mixes the fusion change
+  and the truncation change, and is single-seed. If the vector line
+  continues, replicating V2 on seed 2024 and/or ablating the two changes
+  separately would separate the contributions.
+
 ## Caveats
 
 - All analysis is seed-1337 val; per-class deltas vary by seed (door_revolving

@@ -45,6 +45,29 @@ def config_fingerprint(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _configs_equivalent(stored: Any, expected: Any) -> bool:
+    """Semantic config equality that tolerates schema evolution.
+
+    Both sides round-trip through ``ModelConfig`` when possible so added
+    fields with defaults, and list-vs-tuple normalisation, do not register
+    as differences. Falls back to fingerprint equality when either side is
+    not a ``ModelConfig``-compatible mapping.
+    """
+
+    try:
+        from src.models.config import ModelConfig
+
+        left = ModelConfig.from_dict(dict(stored)).to_dict()
+        right = (
+            expected.to_dict()
+            if isinstance(expected, ModelConfig)
+            else ModelConfig.from_dict(dict(expected)).to_dict()
+        )
+        return config_fingerprint(left) == config_fingerprint(right)
+    except Exception:
+        return config_fingerprint(stored) == config_fingerprint(expected)
+
+
 def build_checkpoint(
     *,
     model: torch.nn.Module,
@@ -152,10 +175,17 @@ def _validate_compatibility(
         expected = config_fingerprint(expected_model_config)
         actual = payload.get("model_config_fingerprint")
         if actual != expected:
-            raise CheckpointError(
-                "Model configuration mismatch: "
-                f"checkpoint={actual}, current={expected}"
-            )
+            # Config schemas evolve (new fields with defaults, list/tuple
+            # normalisation). Re-check semantically: round-trip the stored
+            # config through the current schema and compare fingerprints.
+            # This keeps old checkpoints loadable when the only difference is
+            # an added field whose default the old value now implies.
+            stored = payload.get("model_config")
+            if not _configs_equivalent(stored, expected_model_config):
+                raise CheckpointError(
+                    "Model configuration mismatch: "
+                    f"checkpoint={actual}, current={expected}"
+                )
 
     if expected_class_names is not None:
         expected = config_fingerprint(list(expected_class_names))
