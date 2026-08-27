@@ -1,9 +1,9 @@
-"""Sequential train + val-AP evaluation runner for the core ablation presets.
+"""Sequential train + validation-role evaluation runner for core ablations.
 
-Runs each preset to completion, then evaluates the val-AP-selected checkpoint on
-the val split. Writes per-preset evaluation reports under outputs/. This is a
-convenience wrapper around train.py and evaluate.py for unattended runs; it does
-not touch the held-out test split.
+Runs each preset to completion, then evaluates the selected checkpoint on the
+configured validation role (``val_select`` by default). Writes per-preset
+evaluation reports under outputs/. This convenience wrapper around train.py and
+evaluate.py never touches the held-out test role.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 DATA_ROOT = "./data/FloorPlanCAD_original"
-MANIFEST = "./data/FloorPlanCAD_original/splits.json"
+MANIFEST = "./data/FloorPlanCAD_original/splits_v2.json"
 
 
 def _run(cmd: list[str]) -> None:
@@ -36,12 +36,14 @@ def train_and_eval(
     limit_val_ap_images: int,
     neg_queries_per_pos: int,
     precision: str,
+    manifest: str,
+    eval_split: str,
 ) -> None:
     ckpt_dir = f"./checkpoints/{preset}_seed{seed}"
     train_cmd = [
         sys.executable, "-u", "train.py",
         "--data-root", DATA_ROOT,
-        "--manifest", MANIFEST,
+        "--manifest", manifest,
         "--preset", preset,
         "--seed", str(seed),
         "--ckpt-dir", ckpt_dir,
@@ -63,12 +65,12 @@ def train_and_eval(
     # Prefer the val-AP-selected checkpoint; fall back to best (val loss).
     ap_ckpt = Path(ROOT) / ckpt_dir[2:] / "best_val_ap.pt"
     checkpoint = ap_ckpt if ap_ckpt.is_file() else Path(ROOT) / ckpt_dir[2:] / "best.pt"
-    report = f"./outputs/evaluation_val_{preset}_seed{seed}.json"
+    report = f"./outputs/evaluation_{eval_split}_{preset}_seed{seed}.json"
     eval_cmd = [
         sys.executable, "-u", "evaluate.py",
         "--data-root", DATA_ROOT,
-        "--manifest", MANIFEST,
-        "--split", "val",
+        "--manifest", manifest,
+        "--split", eval_split,
         "--checkpoint", str(checkpoint),
         "--report", report,
         "--image-size", "512",
@@ -86,6 +88,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=["centernet_baseline", "shared_no_condition", "floorplan_base"],
     )
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--manifest", default=MANIFEST)
+    parser.add_argument(
+        "--eval-split",
+        default="val_select",
+        choices=["val", "val_select", "val_calibration"],
+        help="Validation role for checkpoint evaluation; never test.",
+    )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=24)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -115,6 +124,8 @@ def main(argv: list[str] | None = None) -> int:
             limit_val_ap_images=args.limit_val_ap_images,
             neg_queries_per_pos=args.neg_queries_per_pos,
             precision=args.precision,
+            manifest=args.manifest,
+            eval_split=args.eval_split,
         )
     print("\nAll runs complete.")
     return 0

@@ -16,6 +16,12 @@ from PIL import Image, ImageDraw
 
 sys.path.insert(0, ".")
 from src.data.constants import CLASS_NAMES
+from src.data.splits import (
+    canonical_split_role,
+    load_split_manifest,
+    manifest_schema_version,
+    resolve_split_manifest_path,
+)
 from src.data.dataset import FloorPlanDataset
 from src.evaluation import CenterNetDecoder
 from src.models import ModelConfig, build_model
@@ -120,7 +126,14 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", "--data_root", dest="data_root", default="./data/FloorPlanCAD_original")
     parser.add_argument("--manifest", default=None)
-    parser.add_argument("--split", default="train", choices=["train", "val", "test"])
+    parser.add_argument(
+        "--split",
+        default="val_select",
+        choices=[
+            "train", "val", "test", "train_new", "val_select",
+            "val_calibration", "test_set",
+        ],
+    )
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--image-size", "--image_size", dest="image_size", type=int, default=512)
     parser.add_argument("--output-stride", "--output_stride", dest="output_stride", type=int, default=8)
@@ -131,12 +144,21 @@ def main() -> None:
     parser.add_argument("--out-dir", "--out_dir", dest="out_dir", default="./outputs")
     args = parser.parse_args()
 
+    manifest_path = resolve_split_manifest_path(args.data_root, args.manifest)
+    canonical_role = args.split
+    if manifest_path is not None:
+        manifest = load_split_manifest(manifest_path)
+        requested_role = (
+            "val" if manifest_schema_version(manifest) == 1 and args.split == "val_select" else args.split
+        )
+        canonical_role = canonical_split_role(manifest, requested_role)
+
     dataset = FloorPlanDataset(
         args.data_root,
-        split=args.split,
+        split=canonical_role,
         image_size=args.image_size,
         output_stride=args.output_stride,
-        manifest_path=args.manifest,
+        manifest_path=str(manifest_path) if manifest_path is not None else args.manifest,
     )
     sample = dataset[args.index]
     class_id = sample["class_id"]
@@ -189,7 +211,7 @@ def main() -> None:
 
     output_dir = Path(args.out_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"viz_centernet_{args.split}_{args.index}_{class_name}.png"
+    output_path = output_dir / f"viz_centernet_{canonical_role}_{args.index}_{class_name}.png"
     canvas.save(output_path)
     print(f"Saved: {output_path}")
 

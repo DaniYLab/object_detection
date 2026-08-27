@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Sequence
 
 import torch
@@ -338,6 +339,77 @@ class HeatmapHead(nn.Module):
         return self.head(features)
 
 
+class LateConditionedHead(nn.Module):
+    """One-pass CenterNet head with class conditioning after the spatial trunk.
+
+    The expensive spatial blocks and the 3x3 feature extraction run once per
+    image. Class-specific FiLM is applied only to the compact head feature map,
+    followed by a shared 1x1 projection to the five CenterNet channels.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        num_classes: int,
+        hidden_dim: int = 128,
+    ) -> None:
+        super().__init__()
+        self.num_classes = num_classes
+        self.hidden_dim = hidden_dim
+        self.feature = nn.Sequential(
+            nn.Conv2d(in_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(hidden_dim), hidden_dim),
+            nn.SiLU(),
+        )
+        self.condition_film = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim * 2),
+        )
+        self.output = nn.Conv2d(hidden_dim, 5, kernel_size=1)
+        if self.output.bias is not None:
+            with torch.no_grad():
+                self.output.bias[0].fill_(math.log(0.01 / 0.99))
+
+    def _apply_condition(
+        self,
+        hidden: torch.Tensor,
+        pooled_condition: torch.Tensor,
+    ) -> torch.Tensor:
+        if pooled_condition.ndim == 2:
+            gamma, beta = self.condition_film(pooled_condition).chunk(2, dim=-1)
+            return hidden * (1.0 + gamma[:, :, None, None]) + beta[:, :, None, None]
+        if pooled_condition.ndim != 3:
+            raise ValueError("pooled_condition must have shape [B,D] or [B,C,D]")
+        batch, classes, dim = pooled_condition.shape
+        if classes != self.num_classes:
+            raise ValueError(
+                f"pooled_condition class dimension must be {self.num_classes}, got {classes}"
+            )
+        gamma, beta = self.condition_film(pooled_condition.reshape(batch * classes, dim)).chunk(
+            2, dim=-1
+        )
+        expanded = hidden[:, None].expand(batch, classes, self.hidden_dim, *hidden.shape[-2:])
+        expanded = expanded.reshape(batch * classes, self.hidden_dim, *hidden.shape[-2:])
+        return expanded * (1.0 + gamma[:, :, None, None]) + beta[:, :, None, None]
+
+    def forward_hidden(
+        self,
+        hidden: torch.Tensor,
+        pooled_condition: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply class FiLM and the shared 1x1 output to precomputed features."""
+        return self.output(self._apply_condition(hidden, pooled_condition))
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        pooled_condition: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return raw outputs as ``[B,5,H,W]`` or ``[B,C,5,H,W]``."""
+        return self.forward_hidden(self.feature(features), pooled_condition)
+
+
 class FloorPlanDetector(nn.Module):
     """Conditioned CenterNet detector with shared or per-class pathways.
 
@@ -360,6 +432,7 @@ class FloorPlanDetector(nn.Module):
         *,
         output_stride: int = 8,
         pathway_mode: str = "shared",
+        conditioning_stage: str = "early",
         conditioner: str | ConditionerConfig | nn.Module | None = None,
         conditioner_cfg: ConditionerConfig | None = None,
         class_texts: Sequence[str] | None = None,
@@ -402,6 +475,7 @@ class FloorPlanDetector(nn.Module):
                 dropout=dropout,
                 fusion_mode=fusion_mode,
                 pathway_mode=pathway_mode,
+                conditioning_stage=conditioning_stage,
                 class_chunk_size=class_chunk_size,
                 attention_chunk_size=attention_chunk_size,
                 head_channels=head_channels,
@@ -453,6 +527,9 @@ class FloorPlanDetector(nn.Module):
         self.depth_per_class = config.depth_per_class
         self.fusion_mode = EarlyFusion._ALIASES.get(config.fusion_mode, config.fusion_mode)
         self.pathway_mode = config.pathway_mode
+        self.conditioning_stage = config.conditioning_stage
+        if self.conditioning_stage == "late" and self.fusion_mode != "none":
+            raise ValueError("late conditioning requires fusion_mode='none'")
         self.class_chunk_size = config.class_chunk_size
         self.class_texts = fixed_texts
 
@@ -509,19 +586,33 @@ class FloorPlanDetector(nn.Module):
             )
 
         self.out_norm = nn.LayerNorm(self.model_dim)
-        self.heatmap_head = HeatmapHead(
-            self.model_dim,
-            out_channels=5,
-            hidden_dim=config.head_channels,
-        )
-
-        # Dual-pathway vector (SVG stroke) branch. Cross-attention fusion uses
+        self.heatmap_head: HeatmapHead | None = None
+        if self.conditioning_stage == "early":
+            self.heatmap_head = HeatmapHead(
+                self.model_dim,
+                out_channels=5,
+                hidden_dim=config.head_channels,
+            )
+        self.late_head: LateConditionedHead | None = None
+        if self.conditioning_stage == "late":
+            if self.pathway_mode != "shared":
+                raise ValueError("late conditioning currently requires pathway_mode='shared'")
+            self.late_head = LateConditionedHead(
+                self.model_dim,
+                self.num_classes,
+                hidden_dim=config.head_channels,
+            )
         # image tokens as Query and encoded strokes as Key/Value so the stride-8
         # spatial layout is preserved; "add" pools strokes per image and adds.
         self.vector_enabled = bool(config.vector.enabled)
         self.vector_n_max = int(config.vector.n_max)
         self.vector_fusion_mode = config.vector.fusion
         self.vector_class_conditioned = bool(config.vector.class_conditioned)
+        if self.conditioning_stage == "late" and self.vector_class_conditioned:
+            raise ValueError(
+                "late conditioning requires class-agnostic vector fusion; "
+                "set vector.class_conditioned=False"
+            )
         self.vector_encoder: VectorEncoder | None = None
         self.vector_cross_attention = None
         if self.vector_enabled:
@@ -720,6 +811,101 @@ class FloorPlanDetector(nn.Module):
             pooled=output.pooled.to(device=reference.device, dtype=reference.dtype),
         )
 
+    def _run_shared_trunk(
+        self,
+        image_tokens: torch.Tensor,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        """Run the class-independent spatial trunk exactly once per image."""
+        if self.shared_fusion is None:
+            raise RuntimeError("shared trunk requires a shared fusion module")
+        if self.shared_fusion.mode != "none":
+            raise RuntimeError("late conditioning trunk cannot apply early fusion")
+        features = image_tokens
+        for block in self.shared_blocks:
+            features = block(features, spatial_shape=(height, width))
+        return self.out_norm(features).transpose(1, 2).reshape(
+            features.shape[0], self.model_dim, height, width
+        )
+
+    @staticmethod
+    def _decode_raw(raw: torch.Tensor) -> dict[str, torch.Tensor]:
+        if raw.ndim == 4:
+            center_logits = raw[:, 0:1]
+            return {
+                "center_heatmap": torch.sigmoid(center_logits),
+                "center_logits": center_logits,
+                "size_map": F.softplus(raw[:, 1:3]),
+                "offset_map": torch.sigmoid(raw[:, 3:5]),
+            }
+        if raw.ndim != 5:
+            raise ValueError("late head output must have shape [B,5,H,W] or [B,C,5,H,W]")
+        center_logits = raw[:, :, 0]
+        batch, classes, _, height, width = raw.shape
+        return {
+            "center_heatmap": torch.sigmoid(center_logits),
+            "center_logits": center_logits,
+            "size_map": F.softplus(raw[:, :, 1:3].reshape(batch, classes * 2, height, width)),
+            "offset_map": torch.sigmoid(
+                raw[:, :, 3:5].reshape(batch, classes * 2, height, width)
+            ),
+        }
+
+    def _run_late_selected(
+        self,
+        features: torch.Tensor,
+        height: int,
+        width: int,
+        class_ids: torch.Tensor,
+        texts: Sequence[str],
+    ) -> dict[str, torch.Tensor]:
+        if self.late_head is None:
+            raise RuntimeError("late head is not initialized")
+        conditioning = self._condition(class_ids, texts, features)
+        return self._decode_raw(self.late_head(features, conditioning.pooled))
+
+    def _forward_all_late(
+        self,
+        features: torch.Tensor,
+        height: int,
+        width: int,
+        class_texts: list[str],
+        chunk_size: int,
+    ) -> dict[str, torch.Tensor]:
+        if self.late_head is None:
+            raise RuntimeError("late head is not initialized")
+        batch = features.shape[0]
+        hidden = self.late_head.feature(features)
+        all_heatmaps, all_logits, all_sizes, all_offsets = [], [], [], []
+        for start in range(0, self.num_classes, chunk_size):
+            end = min(start + chunk_size, self.num_classes)
+            classes = end - start
+            class_ids = torch.arange(start, end, device=features.device).view(1, -1).expand(
+                batch, -1
+            )
+            expanded_ids = class_ids.reshape(-1)
+            expanded_features = hidden[:, None].expand(
+                batch, classes, self.late_head.hidden_dim, height, width
+            ).reshape(batch * classes, self.late_head.hidden_dim, height, width)
+            expanded_texts = [class_texts[index] for _ in range(batch) for index in range(start, end)]
+            conditioning = self._condition(expanded_ids, expanded_texts, expanded_features)
+            raw = self.late_head.forward_hidden(
+                expanded_features,
+                conditioning.pooled,
+            ).reshape(batch, classes, 5, height, width)
+            decoded = self._decode_raw(raw)
+            all_heatmaps.append(decoded["center_heatmap"])
+            all_logits.append(decoded["center_logits"])
+            all_sizes.append(decoded["size_map"])
+            all_offsets.append(decoded["offset_map"])
+        return {
+            "center_heatmap": torch.cat(all_heatmaps, dim=1),
+            "center_logits": torch.cat(all_logits, dim=1),
+            "size_map": torch.cat(all_sizes, dim=1),
+            "offset_map": torch.cat(all_offsets, dim=1),
+        }
+
     def _run_pathway(
         self,
         image_tokens: torch.Tensor,
@@ -762,6 +948,8 @@ class FloorPlanDetector(nn.Module):
             height,
             width,
         )
+        if self.heatmap_head is None:
+            raise RuntimeError("early heatmap head is not initialized")
         raw = self.heatmap_head(features)
         center_logits = raw[:, 0:1]
         return {
@@ -1003,6 +1191,28 @@ class FloorPlanDetector(nn.Module):
         # queried class embedding is available.
         if not self.vector_class_conditioned:
             image_tokens = self.encode_vector(stroke_tokens, stroke_mask, image_tokens)
+        if self.conditioning_stage == "late":
+            trunk_features = self._run_shared_trunk(image_tokens, height, width)
+            if class_ids is not None:
+                selected_ids = self._validate_class_ids(class_ids, image.shape[0], image.device)
+                selected_texts = self._selected_texts(texts, selected_ids)
+                return self._run_late_selected(
+                    trunk_features,
+                    height,
+                    width,
+                    selected_ids,
+                    selected_texts,
+                )
+            chunk_size = self.class_chunk_size if class_chunk_size is None else class_chunk_size
+            if chunk_size <= 0:
+                raise ValueError("class_chunk_size must be positive")
+            return self._forward_all_late(
+                trunk_features,
+                height,
+                width,
+                self._all_class_texts(texts),
+                chunk_size,
+            )
         if class_ids is not None:
             selected_ids = self._validate_class_ids(class_ids, image.shape[0], image.device)
             selected_texts = self._selected_texts(texts, selected_ids)

@@ -85,6 +85,8 @@ def build_checkpoint(
     runtime_config: Mapping[str, Any] | None = None,
     split_manifest_fingerprint: str | None = None,
     metadata_fingerprint: str | None = None,
+    split_manifest_schema_version: int | None = None,
+    split_role_provenance: Mapping[str, Any] | None = None,
     data_generator: torch.Generator | None = None,
 ) -> dict[str, Any]:
     """Build the same complete payload for best, last, and periodic files."""
@@ -112,6 +114,8 @@ def build_checkpoint(
         "class_mapping_fingerprint": config_fingerprint(names),
         "split_manifest_fingerprint": split_manifest_fingerprint,
         "metadata_fingerprint": metadata_fingerprint,
+        "split_manifest_schema_version": split_manifest_schema_version,
+        "split_role_provenance": _plain(dict(split_role_provenance or {})),
         "rng_state": capture_rng_state(data_generator),
     }
 

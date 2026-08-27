@@ -14,8 +14,8 @@ Read-only: no source annotation is modified. Run while training jobs are
 active — this script never imports ``src.data.dataset`` mutations.
 
 Usage:
-    python scripts/data/audit_strokes.py --manifest data/FloorPlanCAD_original/splits.json
-        [--limit N] [--split val] [--output outputs/stroke_audit.json]
+    python scripts/data/audit_strokes.py --data-root data/FloorPlanCAD_original
+        --split val_calibration [--limit N] [--output outputs/stroke_audit.json]
 """
 
 from __future__ import annotations
@@ -34,6 +34,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.data.metadata import _get_attribute, _parse_viewbox  # noqa: E402
+from src.data.splits import (
+    canonical_split_role,
+    load_split_manifest,
+    manifest_schema_version,
+    resolve_split_manifest_path,
+)  # noqa: E402
 
 # Same tokenizer contract as metadata.py
 _PATH_TOKEN_RE = re.compile(
@@ -152,21 +158,32 @@ def quantiles(values: list[int], points=(0.5, 0.9, 0.95, 0.99, 1.0)) -> dict[str
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", default="data/FloorPlanCAD_original/splits.json")
-    parser.add_argument("--split", default="val", choices=["train", "val", "test"])
+    parser.add_argument("--data-root", default="./data/FloorPlanCAD_original")
+    parser.add_argument("--manifest", default=None)
+    parser.add_argument(
+        "--split",
+        default="val_calibration",
+        choices=[
+            "train", "val", "test", "train_new", "val_select",
+            "val_calibration", "test_set",
+        ],
+    )
     parser.add_argument("--limit", type=int, default=0, help="Audit at most N SVGs (0 = all)")
     parser.add_argument("--output", default="outputs/stroke_audit.json")
     args = parser.parse_args(argv)
 
-    manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
-    data_root = Path(args.manifest).parent
-    # Manifest source splits are train/test; "val" maps to the train split
-    # (val is carved out of train at dataset-construction time).
-    source_split = "train" if args.split == "val" else args.split
+    manifest_path = resolve_split_manifest_path(args.data_root, args.manifest)
+    if manifest_path is None:
+        raise FileNotFoundError("No split manifest found")
+    manifest = load_split_manifest(manifest_path)
+    version = manifest_schema_version(manifest)
+    requested_role = "val" if version == 1 and args.split == "val_calibration" else args.split
+    canonical_role = canonical_split_role(manifest, requested_role)
+    data_root = Path(args.data_root)
+    records = manifest.get("splits", {}).get(canonical_role, [])
     svg_paths = [
         data_root / Path(entry["image_path"]).with_suffix(".svg")
-        for entry in manifest["image_index"]
-        if entry["source_split"] == source_split
+        for entry in records
     ]
     if args.limit:
         svg_paths = svg_paths[: args.limit]
@@ -199,7 +216,11 @@ def main(argv: list[str] | None = None) -> int:
         coverage[str(n_max)] = covered / total_svgs if total_svgs else 0.0
 
     report = {
-        "split": args.split,
+        "requested_split": args.split,
+        "split": canonical_role,
+        "manifest_schema_version": version,
+        "manifest": str(manifest_path),
+        "manifest_fingerprint": manifest.get("fingerprint"),
         "num_svgs": total_svgs,
         "files_failed": files_failed,
         "total_parse_failures": total_parse_failures,

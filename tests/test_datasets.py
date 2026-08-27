@@ -14,7 +14,7 @@ from src.data.dataset import (
     image_collate_fn,
     query_collate_fn,
 )
-from src.data.splits import build_split_manifest, write_split_manifest
+from src.data.splits import build_split_manifest, build_split_manifest_v2, write_split_manifest
 from src.data.transforms import ResizeNormalize
 
 
@@ -111,7 +111,48 @@ def test_query_dataset_expands_only_after_image_split(tmp_path: Path) -> None:
     assert len(val) == sum(len(record.classes) for record in val.records)
 
 
-def test_query_targets_alias_common_constructor_and_collate(tmp_path: Path) -> None:
+def test_v2_roles_use_image_level_records_and_transform_policy(tmp_path: Path) -> None:
+    for index in range(12):
+        _add_sample(
+            tmp_path / "train_set_1",
+            f"train{index:02d}",
+            {"door_single": [[4, 4, 20, 16]]},
+        )
+    _add_sample(
+        tmp_path / "test_set",
+        "test00",
+        {"table": [[8, 4, 32, 20]]},
+    )
+    manifest_path = tmp_path / "splits_v2.json"
+    write_split_manifest(build_split_manifest_v2(tmp_path), manifest_path)
+
+    datasets = {
+        role: FloorPlanImageDataset(
+            tmp_path,
+            split=role,
+            image_size=64,
+            manifest_path=manifest_path,
+        )
+        for role in ("train_new", "val_select", "val_calibration", "test_set")
+    }
+    role_ids = {role: {record.image_id for record in dataset.records} for role, dataset in datasets.items()}
+    assert role_ids["train_new"].isdisjoint(role_ids["val_select"])
+    assert role_ids["train_new"].isdisjoint(role_ids["val_calibration"])
+    assert role_ids["val_select"].isdisjoint(role_ids["val_calibration"])
+    assert role_ids["test_set"] == {"test_set/test00"}
+    assert datasets["train_new"].transform is not None
+    assert datasets["val_select"].transform is not None
+
+    query = FloorPlanQueryDataset(
+        tmp_path,
+        split="val_calibration",
+        image_size=64,
+        output_stride=8,
+        transform=ResizeNormalize(64),
+        manifest_path=manifest_path,
+    )
+    assert {record.image_id for record in query.records} == role_ids["val_calibration"]
+    assert len(query) == sum(len(record.classes) for record in query.records)
     manifest_path = _make_dataset(tmp_path)
     assert FloorPlanDataset is FloorPlanQueryDataset
     dataset = FloorPlanDataset(

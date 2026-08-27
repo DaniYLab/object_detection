@@ -15,8 +15,10 @@ from torch.utils.data import DataLoader, Subset
 from src.data.constants import CLASS_NAMES, NUM_CLASSES
 from src.data.dataset import FloorPlanImageDataset, image_collate_fn
 from src.data.splits import (
+    canonical_split_role,
     image_index_fingerprint,
     load_split_manifest,
+    manifest_schema_version,
     resolve_split_manifest_path,
 )
 from src.evaluation import (
@@ -202,7 +204,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--data-root", "--data_root", dest="data_root", default="./data/FloorPlanCAD_original")
     parser.add_argument("--manifest", default=None)
-    parser.add_argument("--split", choices=["val", "test"], default="test")
+    parser.add_argument(
+        "--split",
+        choices=["train", "val", "test", "train_new", "val_select", "val_calibration", "test_set"],
+        default="test",
+    )
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--checkpoint")
     source.add_argument("--predictions-json")
@@ -257,9 +263,19 @@ def main(argv: list[str] | None = None) -> int:
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
     manifest_path = resolve_split_manifest_path(args.data_root, args.manifest)
+    manifest: dict[str, Any] | None = None
     manifest_fingerprint = None
+    manifest_schema = None
+    canonical_role = args.split
+    role_fingerprint = None
+    role_purpose = None
     if manifest_path is not None:
-        manifest_fingerprint = load_split_manifest(manifest_path).get("fingerprint")
+        manifest = load_split_manifest(manifest_path)
+        manifest_fingerprint = manifest.get("fingerprint")
+        manifest_schema = manifest_schema_version(manifest)
+        canonical_role = canonical_split_role(manifest, args.split)
+        role_fingerprint = manifest.get("role_fingerprints", {}).get(canonical_role)
+        role_purpose = manifest.get("roles", {}).get(canonical_role, {}).get("purpose")
 
     # The model is loaded first so its config decides whether the dataset
     # carries stroke tokens for the dual-pathway vector branch.
@@ -340,7 +356,9 @@ def main(argv: list[str] | None = None) -> int:
                 predictions,
                 metadata={
                     "checkpoint_sha256": source_metadata["sha256"],
-                    "split": args.split,
+                    "split": canonical_role,
+                    "role_fingerprint": role_fingerprint,
+                    "manifest_fingerprint": manifest_fingerprint,
                     "class_names": list(CLASS_NAMES),
                 },
             )
@@ -358,10 +376,15 @@ def main(argv: list[str] | None = None) -> int:
         "source": source_metadata,
         "data": {
             "root": str(Path(args.data_root)),
-            "split": args.split,
+            "requested_split": args.split,
+            "split": canonical_role,
+            "role": canonical_role,
+            "role_purpose": role_purpose,
+            "manifest_schema_version": manifest_schema,
             "num_images": len(selected_dataset),
             "manifest": str(manifest_path) if manifest_path is not None else None,
             "manifest_fingerprint": manifest_fingerprint,
+            "role_fingerprint": role_fingerprint,
             "image_index_fingerprint": image_index_fingerprint(dataset.records),
             "class_names": list(CLASS_NAMES),
         },

@@ -12,8 +12,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.data.splits import (  # noqa: E402
     DEFAULT_SEED,
+    DEFAULT_VAL_CALIBRATION_FRACTION,
     DEFAULT_VAL_FRACTION,
+    DEFAULT_VAL_SELECT_FRACTION,
     build_split_manifest,
+    build_split_manifest_v2,
     write_split_manifest,
 )
 
@@ -36,6 +39,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Manifest path (default: <data-root>/splits.json)",
     )
+    parser.add_argument(
+        "--schema-version",
+        "--protocol",
+        dest="schema_version",
+        type=int,
+        choices=[1, 2],
+        default=1,
+        help="Manifest protocol: 1 for legacy train/val/test, 2 for role hierarchy.",
+    )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument(
         "--val-fraction",
@@ -43,6 +55,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
         dest="val_fraction",
         type=float,
         default=DEFAULT_VAL_FRACTION,
+    )
+    parser.add_argument(
+        "--val-select-fraction",
+        type=float,
+        default=DEFAULT_VAL_SELECT_FRACTION,
+    )
+    parser.add_argument(
+        "--val-calibration-fraction",
+        type=float,
+        default=DEFAULT_VAL_CALIBRATION_FRACTION,
     )
     parser.add_argument(
         "--strict",
@@ -75,17 +97,28 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
     data_root = Path(args.data_root)
-    output_path = Path(args.output) if args.output else data_root / "splits.json"
+    output_path = Path(args.output) if args.output else data_root / (
+        "splits_v2.json" if args.schema_version == 2 else "splits.json"
+    )
     if output_path.exists() and not args.force and not args.validate_only:
         print(f"Refusing to replace existing manifest without --force: {output_path}", file=sys.stderr)
         return 1
 
-    manifest = build_split_manifest(
-        data_root,
-        seed=args.seed,
-        val_fraction=args.val_fraction,
-        strict=args.strict,
-    )
+    if args.schema_version == 2:
+        manifest = build_split_manifest_v2(
+            data_root,
+            seed=args.seed,
+            val_select_fraction=args.val_select_fraction,
+            val_calibration_fraction=args.val_calibration_fraction,
+            strict=args.strict,
+        )
+    else:
+        manifest = build_split_manifest(
+            data_root,
+            seed=args.seed,
+            val_fraction=args.val_fraction,
+            strict=args.strict,
+        )
     if not args.validate_only:
         write_split_manifest(manifest, output_path)
         print(f"Wrote image-level split manifest: {output_path}")
@@ -93,8 +126,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Manifest validated in memory; no files written.")
 
     distribution = manifest["class_distribution"]
-    for split_name in ("train", "val", "test"):
-        counts = distribution[split_name]
+    for split_name, counts in distribution.items():
         print(
             f"{split_name:>5}: images={counts['images']} "
             f"queries={counts['queries']} instances={counts['instances']}"

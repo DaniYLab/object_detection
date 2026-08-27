@@ -114,6 +114,12 @@ def test_training_checkpoint_wrapper_builds_complete_schema_v2_payload() -> None
         runtime_config=runtime_config,
         split_fingerprint="split-fingerprint",
         metadata_fingerprint="metadata-fingerprint",
+        manifest_schema_version=2,
+        split_role_provenance={
+            "training_role": "train_new",
+            "selection_role": "val_select",
+            "calibration_role": "val_calibration",
+        },
         data_generator=generator,
     )
 
@@ -127,6 +133,8 @@ def test_training_checkpoint_wrapper_builds_complete_schema_v2_payload() -> None
     assert payload["output_stride"] == 8
     assert payload["split_manifest_fingerprint"] == "split-fingerprint"
     assert payload["metadata_fingerprint"] == "metadata-fingerprint"
+    assert payload["split_manifest_schema_version"] == 2
+    assert payload["split_role_provenance"]["selection_role"] == "val_select"
     assert payload["global_step"] == 20
     assert payload["metrics"]["val"]["val_loss"] == 0.5
 
@@ -142,6 +150,24 @@ def test_training_checkpoint_wrapper_builds_complete_schema_v2_payload() -> None
             runtime_config={"scheduler": {"total_steps": 11}},
             split_fingerprint="split-fingerprint",
             metadata_fingerprint="metadata-fingerprint",
+        )
+    with pytest.raises(CheckpointError, match="Split manifest schema mismatch"):
+        train.validate_exact_resume_compatibility(
+            payload,
+            runtime_config=runtime_config,
+            split_fingerprint="split-fingerprint",
+            metadata_fingerprint="metadata-fingerprint",
+            manifest_schema_version=1,
+            split_role_provenance=payload["split_role_provenance"],
+        )
+    with pytest.raises(CheckpointError, match="Split role provenance mismatch"):
+        train.validate_exact_resume_compatibility(
+            payload,
+            runtime_config=runtime_config,
+            split_fingerprint="split-fingerprint",
+            metadata_fingerprint="metadata-fingerprint",
+            manifest_schema_version=2,
+            split_role_provenance={"training_role": "train", "selection_role": "val"},
         )
 
 

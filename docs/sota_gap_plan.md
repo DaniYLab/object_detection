@@ -1,14 +1,16 @@
-# Deep Research: Path to Beating the SOTA Table
+# Deep Research: Path to an Aligned Benchmark Result
 
-**Date:** 2026-08-26 · **Goal:** exceed the source SOTA table (F1 0.806) —
-see `docs/SOTA.md`. Web search was unavailable this session; analysis is
-grounded in our own measurements plus the SOTA table the user supplied.
+**Date:** 2026-08-26 · **Goal:** reach or exceed the source SOTA table only after
+reproducing its exact metric/protocol. Until then, the table is reference-only;
+our box AP numbers must not be described as beating its segmentation F1.
 
-## 1. Where we actually stand (category-level, with caveats)
+## 1. Where we actually stand (diagnostic only, not a benchmark comparison)
 
-Mapping our 30-class test AP50 into the SOTA table's 8 categories (macro-mean;
-NOT directly comparable — their metric is F1 from segmentation-style matching,
-ours is detection AP50 — but it locates the gaps):
+The following aggregation maps historical V box AP50 into broad categories only to
+locate failure modes. It is **not directly comparable** with source-table F1:
+the metrics, labels, manifests and evaluator differ. In particular, the historical
+B and V test reports use different manifest fingerprints, so their test delta is
+not a controlled comparison:
 
 | Category | V test AP50 (macro) | SOTA F1 | Gap |
 |---|---:|---:|---:|
@@ -20,15 +22,20 @@ ours is detection AP50 — but it locates the gaps):
 | Equipment | 0.186 | 0.926 | −0.74 |
 | Parking lot | 0.799 | 0.539 | **+0.26** |
 
-We already beat SOTA on Parking lot. Furniture is closest (−0.11). The
-catastrophic gaps (Stair, Equipment, Window) are concentrated in a specific
-failure mode — see §2.
+The `Parking lot` row is only a diagnostic box-AP aggregation and must not be
+read as beating the source SOTA. Furniture is the closest diagnostic category;
+Stair, Equipment and Window show the largest diagnostic gaps. These observations
+are historical and must not drive future tuning because test has been exposed.
 
-## 2. Root cause: rare-class hallucination collapse
+## 2. Historical diagnostics (quarantined, not a root-cause claim)
 
-The per-class failure pattern on test is systematic:
+The following per-class table records an exploratory held-out observation from
+an already exposed test run. It is retained for auditability only. Because test
+has influenced discussion in this project and the historical vector reports use
+a different manifest, these observations must not be treated as a confirmed
+root cause or used to prioritize new experiments.
 
-| Class | val AP50 | test AP50 | test preds : GT |
+| Class | val AP50 | historical test AP50 | historical test preds : GT |
 |---|---:|---:|---:|
 | column | 0.772 | 0.350 | 39:1 |
 | bathtub | 0.532 | 0.289 | 90:1 |
@@ -38,59 +45,86 @@ The per-class failure pattern on test is systematic:
 | ramp | 0.000 | 0.000 | 300:1 |
 | escalator_stair | 0.049 | 0.060 | 403:1 |
 
-Good classes run 9–36 preds per GT; failing classes run 40–400:1. These
-classes have 20–641 test GT but only 3–190 val GT (elevator: 11 val / 40
-test; door_revolving: 6/36). Diagnosis:
-
-1. **The negative-query mechanism overfits to val composition.** With
-   neg_queries_per_pos=1, the model learns "which absent classes to suppress
-   for images like val's". On test it hallucinates the rare classes it has
-   almost never been told to suppress.
-2. **Rare classes are also starved of positives** (ramp: 20 GT total in
-   train) — the classifier never firms up.
-3. **Small-object penalty**: column test median rel-size 0.084 vs val 0.118
-   — the 64×64 heatmap is size-biased toward the val distribution it saw.
+Possible explanations include rare-class positive scarcity, split-composition
+shift, and small-object sensitivity. They are hypotheses only. Future tests must
+be designed from training-pool statistics and validation-only diagnostics under
+the new split hierarchy, not from these held-out numbers.
 
 ## 3. What this implies for the plan
 
-The gap is NOT primarily architectural. V's vector branch already delivers
-the largest single gain (+9.7 test AP50). The remaining gap decomposes into:
-
-- **~60% rare-class calibration/suppression** (fixable without new science)
-- **~25% small-object resolution** (stride-8 heatmap, 512 resize)
-- **~15% training budget** (30 epochs, no pretrain, small models)
+The vector branch delivers the largest confirmed gain on matching validation
+manifests (+9.39 AP50 / +6.41 AP50:95 mean across two seeds). The historical
+cross-manifest test delta is not a controlled claim. Remaining hypotheses include
+rare-class positive starvation, small-object resolution, and training budget, but
+these must be tested on a new validation hierarchy rather than selected from test
+failure patterns.
 
 ## 4. Prioritized attack plan
 
-### Phase 1 — calibration & sampling (no architecture change, ~1 day)
-1. **Per-class score calibration on val**: replace the global 0.05 threshold
-   with per-class thresholds chosen on val (protocol-compliant). Directly
-   attacks the 40–400:1 pred ratios — elevator needs a much higher bar.
-2. **Neg-query oversampling for rare classes**: weight negative sampling so
-   rare classes are queried-absent as often as common ones.
-3. **Class-balanced sampler power tuning** (balance_power 0.5 → 0.75) so
-   rare classes get more gradient.
+### Phase 1 — completed diagnostic experiments
 
-### Phase 2 — resolution (architecture-light, ~2 days)
-4. **Stride-4 heatmap variant**: double output resolution; targets and
-   decoder already parameterised by stride. Expect the largest single gain
-   for small symbols (sink, column, window).
-5. **TTA: H-flip + 90° rotations at eval** (drawings are rotation-agnostic
-   by construction; we already train with rot90 augmentation).
+1. **Global/per-class threshold calibration:** completed on validation. All
+   classes retained threshold `0.05`; no AP improvement.
+2. **Rare-negative boost:** completed with a corrected zero-count floor and a
+   full-validation gate. It reduced AP and greatly increased prediction count;
+   reject this family of naive inverse-frequency sampling schemes.
+3. **Class-balanced sampler power:** not yet run under the new validation
+   hierarchy; do not tune it from the historical test table.
 
-### Phase 3 — capacity & pretraining (~1 week)
-6. **Pretrained backbone** (ConvNeXt-T / ResNet-18 ImageNet init) into the
-   existing stride-8 encoder — the SOTA table's models are all pretrained.
-7. **Longer schedule (60–90 epochs) + EMA weights**.
-8. **Vector branch stays as-is** — it is our differentiator and its gain
-   already generalizes.
+### Phase 2 — next accuracy experiments
+
+4. **Hybrid stride-4 head:** first run a stride-4 collision/target audit, then
+   compare a selective small-object refinement against the stride-8 anchor.
+5. **Local/hierarchical attention:** reduce the 4096-token global attention
+   cost while preserving a global context token. Measure AP and latency together.
+6. **Sparse vector fusion:** compare dense cross-attention with geometry raster
+   features or spatially indexed local fusion.
+
+### Phase 3 — speed and capacity
+
+7. **Shared vector/image trunk with late conditioning — completed speed track:**
+   `dual_pathway_late`, seed 1337, was trained on `train_new` and selected on
+   `val_select` under the frozen schema-v2 manifest. It reduces parameters by
+   11.86% versus V2 and reduces synchronized all-class inference latency by
+   9.87x (chunk 4) to 15.17x (chunk 35), with 59.08% to 87.28% lower peak
+   allocated inference memory. Selected-query training speed is effectively
+   unchanged. The late model is not capacity matched to V2 and is not a pure
+   stage-placement ablation: it also removes V2 early fusion and
+   class-conditioned vector FiLM.
+8. **One-pass student distilled from V:** compare image-only and lightweight
+   image+SVG students against V as the quality teacher. This remains the next
+   accuracy-preserving speed experiment.
+9. **Pretraining, longer schedule and EMA:** test independently only after the
+   speed/quality anchors and new validation hierarchy are fixed.
+
+### Latest schema-v2 result
+
+`dual_pathway_late` seed 1337 achieved full-role AP50/AP50:95 of
+`0.1598/0.0668` on `val_select` and `0.1553/0.0646` on `val_calibration`.
+Per-class calibration changed no thresholds from 0.05 and produced no metric gain;
+the global validation-only sweep also selected 0.05. The checkpoint was
+`best_val_ap.pt`. `test_set` was not accessed. Because historical V2 quality
+reports use a different manifest, this result must not be compared to them as a
+controlled quality delta; run a same-manifest V2 control before making an
+architecture-quality claim.
 
 ### Success gate
-Re-evaluate the 8-category macro after each phase; the target is to pass
-SOTA's weighted F1 0.798 on their protocol, or (more honestly) to document
-our own 8-category detection-AP50 numbers against their F1 as a
-"conservative comparison" — we already win Parking lot and are close on
-Furniture, so Phase 1–2 alone may close Door/Appliance.
+
+Do not use the unresolved source-table numbers as an optimization target until
+its paper, labels, split, operating point, and evaluator are recovered. The
+next internal gate is instead:
+
+1. establish a new image-level `train_new` / `val_select` /
+   `val_calibration` hierarchy and freeze its manifest;
+2. report quality and synchronized latency on the same validation protocol;
+3. require at least two seeds for an architecture claim and a pre-specified
+   ablation/control for each causal question;
+4. select one final checkpoint and decoder using validation only;
+5. run the untouched test set once for the frozen final report.
+
+Only after the source protocol is reproduced may we report an aligned F1/
+Weighted-F1 comparison. Until then, report our own AP50/AP50:95 and latency as
+an independent detection track, with the source table labeled reference-only.
 
 ## 5. Caveats
 

@@ -28,8 +28,10 @@ from src.data.strokes import (
 )
 from src.data.splits import (
     ImageRecord,
+    canonical_split_role,
     image_index_fingerprint,
     load_split_manifest,
+    manifest_schema_version,
     records_for_split,
     resolve_split_manifest_path,
     validate_image_records,
@@ -51,7 +53,7 @@ SPLIT_DIRS = {
 def _default_transform(image_size: int = 512, split: str = "test") -> Callable[..., object]:
     """Return paired random train or deterministic evaluation preprocessing."""
 
-    if split == "train":
+    if split in {"train", "train_new"}:
         return PairedTrainTransform(image_size=image_size)
     return ResizeNormalize(image_size=image_size)
 
@@ -70,12 +72,31 @@ def _dataset_fingerprints(
     root: Path,
     manifest_path: str | Path | None,
     records: list[ImageRecord],
-) -> tuple[Path | None, str | None, str]:
+    split: str,
+) -> tuple[Path | None, str | None, str, int | None, str, str | None]:
     resolved = resolve_split_manifest_path(root, manifest_path)
     manifest_fingerprint: str | None = None
+    schema_version: int | None = None
+    role = "val" if split == "validation" else split
+    role_fingerprint: str | None = None
     if resolved is not None:
-        manifest_fingerprint = load_split_manifest(resolved).get("fingerprint")
-    return resolved, manifest_fingerprint, image_index_fingerprint(records)
+        manifest = load_split_manifest(resolved)
+        schema_version = manifest_schema_version(manifest)
+        role = canonical_split_role(manifest, split)
+        manifest_fingerprint = manifest.get("fingerprint")
+        role_fingerprint = manifest.get("role_fingerprints", {}).get(role)
+    return (
+        resolved,
+        manifest_fingerprint,
+        image_index_fingerprint(records),
+        schema_version,
+        role,
+        role_fingerprint,
+    )
+
+
+def _canonical_split_without_manifest(split: str) -> str:
+    return "val" if split == "validation" else split
 
 
 def _instances_as_tensors(
@@ -119,10 +140,16 @@ class FloorPlanImageDataset(Dataset):
         vector_n_max: int = 1024,
     ) -> None:
         self.root = Path(root)
-        self.split = "val" if split == "validation" else split
+        self.requested_split = split
         self.image_size = int(image_size)
         if self.image_size <= 0:
             raise ValueError("image_size must be positive")
+        selected_manifest = resolve_split_manifest_path(self.root, manifest_path)
+        if selected_manifest is not None:
+            manifest = load_split_manifest(selected_manifest)
+            self.split = canonical_split_role(manifest, split)
+        else:
+            self.split = _canonical_split_without_manifest(split)
         self.transform = transform or _default_transform(self.image_size, self.split)
         self.strict_metadata = strict_metadata
         self.vector_branch = vector_branch
@@ -132,17 +159,24 @@ class FloorPlanImageDataset(Dataset):
                 self.root,
                 records,
                 strict=strict_metadata,
-                manifest_path=manifest_path,
+                manifest_path=selected_manifest,
             )
         else:
             self.records = records_for_split(
                 self.root,
                 self.split,
-                manifest_path=manifest_path,
+                manifest_path=selected_manifest,
                 strict=strict_metadata,
             )
-        self.manifest_path, self.split_manifest_fingerprint, self.metadata_fingerprint = (
-            _dataset_fingerprints(self.root, manifest_path, self.records)
+        (
+            self.manifest_path,
+            self.split_manifest_fingerprint,
+            self.metadata_fingerprint,
+            self.split_manifest_schema_version,
+            self.split_role,
+            self.split_role_fingerprint,
+        ) = _dataset_fingerprints(
+            self.root, selected_manifest, self.records, self.split
         )
         self.index = self.records
         if not self.records:
@@ -255,12 +289,18 @@ class FloorPlanQueryDataset(Dataset):
         vector_seed: int = 0,
     ) -> None:
         self.root = Path(root)
-        self.split = "val" if split == "validation" else split
+        self.requested_split = split
         self.image_size = int(image_size)
         self.output_stride = int(output_stride)
         self.neg_rare_boost = bool(neg_rare_boost)
         if self.image_size <= 0:
             raise ValueError("image_size must be positive")
+        selected_manifest = resolve_split_manifest_path(self.root, manifest_path)
+        if selected_manifest is not None:
+            manifest = load_split_manifest(selected_manifest)
+            self.split = canonical_split_role(manifest, split)
+        else:
+            self.split = _canonical_split_without_manifest(split)
         if self.output_stride <= 0 or self.image_size % self.output_stride != 0:
             raise ValueError(
                 f"image_size ({self.image_size}) must be divisible by "
@@ -297,17 +337,24 @@ class FloorPlanQueryDataset(Dataset):
                 self.root,
                 records,
                 strict=strict_metadata,
-                manifest_path=manifest_path,
+                manifest_path=selected_manifest,
             )
         else:
             self.records = records_for_split(
                 self.root,
                 self.split,
-                manifest_path=manifest_path,
+                manifest_path=selected_manifest,
                 strict=strict_metadata,
             )
-        self.manifest_path, self.split_manifest_fingerprint, self.metadata_fingerprint = (
-            _dataset_fingerprints(self.root, manifest_path, self.records)
+        (
+            self.manifest_path,
+            self.split_manifest_fingerprint,
+            self.metadata_fingerprint,
+            self.split_manifest_schema_version,
+            self.split_role,
+            self.split_role_fingerprint,
+        ) = _dataset_fingerprints(
+            self.root, selected_manifest, self.records, self.split
         )
 
         # Build positive query index.

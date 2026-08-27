@@ -15,7 +15,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.data.constants import CLASS_NAMES
-from src.data.splits import load_split_manifest
+from src.data.splits import (
+    load_split_manifest,
+    manifest_schema_version,
+    resolve_split_manifest_path,
+)
 from src.data.targets import gaussian_radius
 
 
@@ -81,7 +85,10 @@ def audit_dataset(
     unknown_semantic_paths = 0
     empty_or_invalid_paths = 0
 
-    for split_name in ("train", "val", "test"):
+    split_names = tuple(manifest.get("splits", {}).keys())
+    if not split_names:
+        raise ValueError("Split manifest contains no split roles")
+    for split_name in split_names:
         records = manifest.get("splits", {}).get(split_name, [])
         split_class_counts: Counter[str] = Counter()
         split_instances = 0
@@ -188,7 +195,12 @@ def audit_dataset(
         "schema": {"name": "floorplancad_data_audit", "version": 1},
         "data_root": str(data_root),
         "manifest": str(manifest_path),
+        "manifest_schema_version": manifest_schema_version(manifest),
         "manifest_fingerprint": manifest.get("fingerprint"),
+        "roles": {
+            str(name): dict(manifest.get("roles", {}).get(name, {}))
+            for name in split_summary
+        },
         "settings": {
             "image_size": image_size,
             "output_stride": output_stride,
@@ -246,7 +258,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
     data_root = Path(args.data_root)
-    manifest_path = Path(args.manifest) if args.manifest else data_root / "splits.json"
+    manifest_path = resolve_split_manifest_path(args.data_root, args.manifest)
+    if manifest_path is None:
+        raise FileNotFoundError("No split manifest found")
     if args.image_size <= 0 or args.image_size % args.output_stride != 0:
         raise ValueError("image_size must be positive and divisible by output_stride")
     report = audit_dataset(

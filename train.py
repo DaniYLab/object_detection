@@ -35,6 +35,7 @@ from src.data import (
     split_manifest_fingerprint,
     validate_metadata_sources,
 )
+from src.data.splits import canonical_split_role, manifest_schema_version
 from src.evaluation import CenterNetDecoder, compute_coco_metrics
 from src.models import (
     ModelConfig,
@@ -163,6 +164,15 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("limit_val_ap_images cannot be negative")
 
 
+def _training_roles(manifest: Mapping[str, Any]) -> tuple[str, str]:
+    version = manifest_schema_version(manifest)
+    if version == 1:
+        return "train", "val"
+    if version == 2:
+        return "train_new", "val_select"
+    raise ValueError(f"Unsupported split manifest version: {version!r}")
+
+
 def _resolve_training_manifest(
     data_root: str | Path,
     manifest_path: str | Path | None,
@@ -183,11 +193,12 @@ def _resolve_training_manifest(
         )
 
     manifest = load_split_manifest(resolved)
-    val_records = manifest.get("splits", {}).get("val", [])
+    _train_role, selection_role = _training_roles(manifest)
+    val_records = manifest.get("splits", {}).get(selection_role, [])
     if not val_records:
         raise RuntimeError(
-            f"Validation split is empty in image-level manifest: {resolved}. "
-            "Rebuild the manifest with a non-zero validation fraction."
+            f"Selection role {selection_role!r} is empty in image-level manifest: {resolved}. "
+            "Rebuild the manifest with a non-zero selection fraction."
         )
     fingerprint = manifest.get("fingerprint") or split_manifest_fingerprint(manifest)
     return resolved, manifest, str(fingerprint)
@@ -634,6 +645,7 @@ def validate_ap(
     limit_images: int = 0,
     precision: str = "fp32",
     vector_n_max: int = 0,
+    selection_role: str = "val",
 ) -> dict[str, float]:
     """Run image-level detection evaluation on the val split.
 
@@ -647,7 +659,7 @@ def validate_ap(
     model.eval()
     val_dataset = FloorPlanImageDataset(
         data_root,
-        split="val",
+        split=selection_role,
         image_size=image_size,
         manifest_path=manifest_path,
         vector_branch=vector_n_max > 0,
@@ -756,6 +768,11 @@ def _build_runtime_config(
     val_metadata_fingerprint: str,
     vector_branch: bool = False,
     vector_n_max: int = 0,
+    manifest_schema_version: int | None = None,
+    training_role: str = "train",
+    selection_role: str = "val",
+    training_role_fingerprint: str | None = None,
+    selection_role_fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Capture every setting that affects an exact epoch-boundary resume."""
 
@@ -767,6 +784,11 @@ def _build_runtime_config(
             "device_type": device.type,
         },
         "data": {
+            "manifest_schema_version": manifest_schema_version,
+            "training_role": training_role,
+            "selection_role": selection_role,
+            "training_role_fingerprint": training_role_fingerprint,
+            "selection_role_fingerprint": selection_role_fingerprint,
             "train_queries": train_size,
             "val_queries": val_size,
             "train_metadata_fingerprint": train_metadata_fingerprint,
@@ -822,6 +844,8 @@ def validate_exact_resume_compatibility(
     runtime_config: Mapping[str, Any],
     split_fingerprint: str,
     metadata_fingerprint: str,
+    manifest_schema_version: int | None = None,
+    split_role_provenance: Mapping[str, Any] | None = None,
 ) -> None:
     """Reject exact resumes whose data or schedule-affecting settings changed."""
 
@@ -837,6 +861,21 @@ def validate_exact_resume_compatibility(
             f"checkpoint={checkpoint.get('metadata_fingerprint')}, "
             f"current={metadata_fingerprint}"
         )
+
+    if manifest_schema_version is not None:
+        actual_schema = checkpoint.get("split_manifest_schema_version")
+        if actual_schema != manifest_schema_version:
+            raise CheckpointError(
+                "Split manifest schema mismatch: "
+                f"checkpoint={actual_schema}, current={manifest_schema_version}"
+            )
+    if split_role_provenance is not None:
+        actual_roles = checkpoint.get("split_role_provenance")
+        if actual_roles != dict(split_role_provenance):
+            raise CheckpointError(
+                "Split role provenance mismatch for exact resume: "
+                f"checkpoint={actual_roles}, current={dict(split_role_provenance)}"
+            )
 
     checkpoint_runtime = checkpoint.get("runtime_config")
     if checkpoint_runtime != dict(runtime_config):
@@ -872,6 +911,8 @@ def build_training_checkpoint(
     split_fingerprint: str,
     metadata_fingerprint: str,
     data_generator: torch.Generator,
+    manifest_schema_version: int | None = None,
+    split_role_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the complete schema-v2 payload shared by all checkpoint files."""
 
@@ -891,6 +932,8 @@ def build_training_checkpoint(
         output_stride=model_config.output_stride,
         split_manifest_fingerprint=split_fingerprint,
         metadata_fingerprint=metadata_fingerprint,
+        split_manifest_schema_version=manifest_schema_version,
+        split_role_provenance=split_role_provenance,
         data_generator=data_generator,
     )
 
@@ -930,11 +973,15 @@ def main(args: argparse.Namespace) -> int:
         checkpoint = load_checkpoint(checkpoint_path, map_location="cpu")
 
     model_config = resolve_model_config_from_args(args)
-    manifest_path, _manifest, manifest_fingerprint = _resolve_training_manifest(
+    manifest_path, manifest, manifest_fingerprint = _resolve_training_manifest(
         args.data_root,
         args.manifest,
     )
-    print(f"Preset: {args.preset} | Manifest: {manifest_path}")
+    train_role, selection_role = _training_roles(manifest)
+    print(
+        f"Preset: {args.preset} | Manifest: {manifest_path} | "
+        f"roles: {train_role} -> {selection_role}"
+    )
 
     # Both query datasets are derived from the same image-level manifest. Test is
     # intentionally untouched during training and validation.
@@ -942,7 +989,7 @@ def main(args: argparse.Namespace) -> int:
     vector_n_max = int(getattr(model_config.vector, "n_max", 1024))
     train_base = FloorPlanQueryDataset(
         args.data_root,
-        split="train",
+        split=train_role,
         image_size=model_config.image_size,
         output_stride=model_config.output_stride,
         manifest_path=manifest_path,
@@ -956,7 +1003,7 @@ def main(args: argparse.Namespace) -> int:
     )
     val_base = FloorPlanQueryDataset(
         args.data_root,
-        split="val",
+        split=selection_role,
         image_size=model_config.image_size,
         output_stride=model_config.output_stride,
         manifest_path=manifest_path,
@@ -1075,6 +1122,11 @@ def main(args: argparse.Namespace) -> int:
         val_metadata_fingerprint=val_base.metadata_fingerprint,
         vector_branch=vector_branch,
         vector_n_max=vector_n_max,
+        manifest_schema_version=manifest_schema_version(manifest),
+        training_role=train_role,
+        selection_role=selection_role,
+        training_role_fingerprint=manifest.get("role_fingerprints", {}).get(train_role),
+        selection_role_fingerprint=manifest.get("role_fingerprints", {}).get(selection_role),
     )
 
     start_epoch = 1
@@ -1089,6 +1141,17 @@ def main(args: argparse.Namespace) -> int:
                 runtime_config=runtime_config,
                 split_fingerprint=manifest_fingerprint,
                 metadata_fingerprint=combined_metadata_fingerprint,
+                manifest_schema_version=manifest_schema_version(manifest),
+                split_role_provenance={
+                    "training_role": train_role,
+                    "selection_role": selection_role,
+                    "calibration_role": "val_calibration"
+                    if manifest_schema_version(manifest) == 2
+                    else None,
+                    "training_role_fingerprint": manifest.get("role_fingerprints", {}).get(train_role),
+                    "selection_role_fingerprint": manifest.get("role_fingerprints", {}).get(selection_role),
+                    "calibration_role_fingerprint": manifest.get("role_fingerprints", {}).get("val_calibration"),
+                },
             )
         resume_state = restore_training_state(
             checkpoint,
@@ -1207,6 +1270,7 @@ def main(args: argparse.Namespace) -> int:
                 limit_images=args.limit_val_ap_images,
                 precision=precision,
                 vector_n_max=vector_n_max if vector_branch else 0,
+                selection_role=selection_role,
             )
             print(
                 f"  => Val AP50={val_ap_metrics['val_ap50']:.4f} | "
@@ -1241,6 +1305,17 @@ def main(args: argparse.Namespace) -> int:
             runtime_config=runtime_config,
             split_fingerprint=manifest_fingerprint,
             metadata_fingerprint=combined_metadata_fingerprint,
+            manifest_schema_version=manifest_schema_version(manifest),
+            split_role_provenance={
+                "training_role": train_role,
+                "selection_role": selection_role,
+                "calibration_role": "val_calibration"
+                if manifest_schema_version(manifest) == 2
+                else None,
+                "training_role_fingerprint": manifest.get("role_fingerprints", {}).get(train_role),
+                "selection_role_fingerprint": manifest.get("role_fingerprints", {}).get(selection_role),
+                "calibration_role_fingerprint": manifest.get("role_fingerprints", {}).get("val_calibration"),
+            },
             data_generator=data_generator,
         )
 

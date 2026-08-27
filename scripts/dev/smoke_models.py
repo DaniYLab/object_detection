@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -123,6 +124,20 @@ def _sync(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _percentile(values: list[float], percentile: float) -> float:
+    """Return a linearly interpolated percentile for recorded durations."""
+    if not values:
+        raise ValueError("cannot compute a percentile from no durations")
+    if not 0.0 <= percentile <= 100.0:
+        raise ValueError("percentile must be in [0, 100]")
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * percentile / 100.0
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + fraction * (ordered[upper] - ordered[lower])
+
+
 def _autocast_context(device: torch.device, amp_dtype: str):
     if amp_dtype == "fp32":
         return contextlib.nullcontext()
@@ -142,8 +157,14 @@ def _profile_preset(
     warmup_steps: int,
     profile_steps: int,
     amp_dtype: str,
+    vector_tokens: int,
 ) -> dict[str, Any]:
-    """Profile selected-query training and all-class inference."""
+    """Profile selected-query training and all-class inference.
+
+    Batch size, precision, warmup, and iteration count are explicit so reports
+    can be compared across presets. Vector-enabled presets receive synthetic
+    whole-drawing tokens to ensure their vector encoder is included in timing.
+    """
 
     config = get_model_preset(preset).with_overrides(
         image_size=image_size,
@@ -152,6 +173,20 @@ def _profile_preset(
     model = build_model(config).to(device)
     images = torch.randn(batch_size, 3, image_size, image_size, device=device)
     class_ids = torch.arange(batch_size, device=device) % config.num_classes
+    stroke_tokens = None
+    stroke_mask = None
+    if isinstance(model, FloorPlanDetector) and model.vector_enabled:
+        if vector_tokens <= 0:
+            raise ValueError("--profile-vector-tokens must be positive")
+        stroke_tokens = torch.randn(
+            batch_size,
+            vector_tokens,
+            model.vector_encoder.feature_dim,
+            device=device,
+        )
+        stroke_mask = torch.ones(
+            batch_size, vector_tokens, dtype=torch.bool, device=device
+        )
     total_params = sum(parameter.numel() for parameter in model.parameters())
     trainable_params = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
@@ -160,7 +195,15 @@ def _profile_preset(
     def training_step() -> None:
         model.zero_grad(set_to_none=True)
         with _autocast_context(device, amp_dtype):
-            outputs = model(images, class_ids=class_ids)
+            if isinstance(model, FloorPlanDetector):
+                outputs = model(
+                    images,
+                    class_ids=class_ids,
+                    stroke_tokens=stroke_tokens,
+                    stroke_mask=stroke_mask,
+                )
+            else:
+                outputs = model(images, class_ids=class_ids)
             loss = (
                 outputs["center_logits"].float().square().mean()
                 + outputs["size_map"].float().mean()
@@ -175,11 +218,14 @@ def _profile_preset(
     if device.type == "cuda":
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
-    started = time.perf_counter()
+    train_durations = []
     for _ in range(profile_steps):
+        started = time.perf_counter()
         training_step()
-    _sync(device)
-    train_seconds = (time.perf_counter() - started) / profile_steps
+        _sync(device)
+        train_durations.append(time.perf_counter() - started)
+    train_seconds = statistics.median(train_durations)
+    train_p95_seconds = _percentile(train_durations, 95.0)
     train_peak_allocated = None
     train_peak_reserved = None
     if device.type == "cuda":
@@ -192,7 +238,12 @@ def _profile_preset(
     def inference_step() -> None:
         with torch.no_grad(), _autocast_context(device, amp_dtype):
             if isinstance(model, FloorPlanDetector):
-                model(images, class_chunk_size=class_chunk_size)
+                model(
+                    images,
+                    class_chunk_size=class_chunk_size,
+                    stroke_tokens=stroke_tokens,
+                    stroke_mask=stroke_mask,
+                )
             else:
                 model(images)
 
@@ -202,11 +253,14 @@ def _profile_preset(
     if device.type == "cuda":
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
-    started = time.perf_counter()
+    inference_durations = []
     for _ in range(profile_steps):
+        started = time.perf_counter()
         inference_step()
-    _sync(device)
-    inference_seconds = (time.perf_counter() - started) / profile_steps
+        _sync(device)
+        inference_durations.append(time.perf_counter() - started)
+    inference_seconds = statistics.median(inference_durations)
+    inference_p95_seconds = _percentile(inference_durations, 95.0)
     inference_peak_allocated = None
     inference_peak_reserved = None
     if device.type == "cuda":
@@ -220,26 +274,36 @@ def _profile_preset(
         "image_size": image_size,
         "batch_size": batch_size,
         "class_chunk_size": class_chunk_size,
+        "vector_tokens": vector_tokens if stroke_tokens is not None else None,
         "num_classes": config.num_classes,
         "total_parameters": total_params,
         "trainable_parameters": trainable_params,
+        "timing": {
+            "warmup_steps": warmup_steps,
+            "profile_steps": profile_steps,
+            "summary": "median and interpolated p95 over synchronized iterations",
+        },
         "selected_query_training": {
             "seconds_per_step": train_seconds,
+            "p95_seconds_per_step": train_p95_seconds,
             "images_per_second": batch_size / train_seconds,
             "peak_allocated_gib": train_peak_allocated,
             "peak_reserved_gib": train_peak_reserved,
         },
         "all_class_inference": {
             "seconds_per_step": inference_seconds,
+            "p95_seconds_per_step": inference_p95_seconds,
             "seconds_per_image": inference_seconds / batch_size,
+            "p95_seconds_per_image": inference_p95_seconds / batch_size,
             "images_per_second": batch_size / inference_seconds,
             "peak_allocated_gib": inference_peak_allocated,
             "peak_reserved_gib": inference_peak_reserved,
         },
     }
     print(
-        f"{preset}: train={train_seconds:.3f}s/step, "
-        f"all-class={inference_seconds / batch_size:.3f}s/image, "
+        f"{preset}: train={train_seconds:.3f}s/step (p95={train_p95_seconds:.3f}), "
+        f"all-class={inference_seconds / batch_size:.3f}s/image "
+        f"(p95={inference_p95_seconds / batch_size:.3f}), "
         f"params={total_params / 1e6:.1f}M"
     )
     if train_peak_allocated is not None:
@@ -276,8 +340,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--profile-batch-size", type=int, default=1)
-    parser.add_argument("--profile-warmup-steps", type=int, default=1)
-    parser.add_argument("--profile-steps", type=int, default=2)
+    parser.add_argument("--profile-warmup-steps", type=int, default=20)
+    parser.add_argument("--profile-steps", type=int, default=100)
+    parser.add_argument(
+        "--profile-vector-tokens",
+        type=int,
+        default=1024,
+        help="Valid synthetic SVG stroke tokens for vector-enabled profiles.",
+    )
     parser.add_argument("--class-chunk-size", type=int, default=4)
     parser.add_argument(
         "--amp-dtype",
@@ -298,7 +368,7 @@ def _selected_presets(args: argparse.Namespace) -> list[str]:
             if get_model_preset(name).conditioner.kind != "pretrained_text"
         ]
     if args.profile:
-        return ["centernet_baseline", "floorplan_base"]
+        return ["centernet_baseline", "floorplan_base", "dual_pathway"]
     return ["floorplan_base", "per_class_fixed_byte_text_film", "centernet_shared"]
 
 
@@ -316,6 +386,8 @@ def main() -> None:
         raise ValueError("--profile-warmup-steps cannot be negative")
     if args.profile_steps <= 0:
         raise ValueError("--profile-steps must be positive")
+    if args.profile_vector_tokens <= 0:
+        raise ValueError("--profile-vector-tokens must be positive")
     if args.class_chunk_size <= 0:
         raise ValueError("--class-chunk-size must be positive")
 
@@ -334,6 +406,7 @@ def main() -> None:
                 warmup_steps=args.profile_warmup_steps,
                 profile_steps=args.profile_steps,
                 amp_dtype=args.amp_dtype,
+                vector_tokens=args.profile_vector_tokens,
             )
             for preset in presets
         ]

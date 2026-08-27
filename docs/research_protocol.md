@@ -13,13 +13,40 @@ Tài liệu này định nghĩa cách kiểm chứng Conditioned Reflex/Conditio
 ## 2. Split bắt buộc
 
 1. Chia ở **image level** trước khi expand `(image, class)`.
-2. `train` và `val` chỉ lấy từ `train_set_1` + `train_set_2`.
-3. Default validation fraction: 10%, seed 1337.
-4. Toàn bộ `test_set` được giữ nguyên cho báo cáo cuối cùng.
-5. Mỗi run phải lưu split-manifest fingerprint. Không so sánh hai run dùng manifest khác nhau như cùng một benchmark.
+2. `train_new`, `val_select` và `val_calibration` chỉ lấy từ `train_set_1` + `train_set_2` trong schema-v2.
+3. `train_new` dùng để training; `val_select` dùng để chọn checkpoint/kiến trúc; `val_calibration` dùng để chọn threshold, top-k, TTA và decoder settings.
+4. Toàn bộ `test_set` được giữ nguyên và chỉ dùng cho báo cáo cuối cùng sau khi mọi lựa chọn đã freeze.
+5. Mỗi run phải lưu split-manifest fingerprint và role/image-index fingerprint. Không so sánh hai run dùng manifest hoặc role khác nhau như cùng một benchmark.
 6. Không dùng test loss/AP để chọn checkpoint, threshold, decoder settings hoặc hyperparameters.
 
-## 3. Metadata benchmark
+### 2.1. Quy tắc sau exploratory held-out evaluation
+
+Một số checkpoint lịch sử đã được chạy trên `test_set` theo yêu cầu của giai đoạn
+trước. Các con số đó được giữ nguyên như **historical held-out results**, nhưng
+không được dùng để chọn bất kỳ thí nghiệm mới nào.
+
+Từ giai đoạn tiếp theo:
+
+1. Không chạy lại test sau mỗi ablation hoặc tuning step.
+2. Nếu validation cũ đã được dùng đồng thời để chọn checkpoint và decoder, tạo
+   một manifest validation mới từ training pool, vẫn split ở image level.
+3. Manifest mới nên tách tối thiểu thành `train_new`, `val_select` và
+   `val_calibration`:
+   - `val_select`: chọn checkpoint và kiến trúc;
+   - `val_calibration`: chọn threshold, top-k, TTA và decoder settings;
+   - `test_set`: chỉ dùng cho báo cáo final sau khi mọi lựa chọn đã freeze.
+4. Mỗi báo cáo phải ghi rõ split role, manifest fingerprint và liệu kết quả là
+   exploratory hay final.
+5. Không dùng prediction count, per-class AP hoặc lỗi quan sát từ test để ưu tiên
+   class, đặt hyperparameter hoặc thiết kế ablation tiếp theo.
+
+### 2.2. Quy tắc benchmark khác metric
+
+Bảng segmentation/F1 trong `docs/SOTA.md` là một benchmark track riêng. Không
+được chuyển box AP thành segmentation F1 bằng cách tô đầy bounding box rồi gọi
+đó là kết quả tương đương. Nếu chưa xác định được evaluator nguồn, chỉ báo cáo
+kết quả đó là reference-only hoặc proxy metric.
+
 
 Mỗi report phải ghi:
 
@@ -92,5 +119,7 @@ Báo cáo chính thức nên dùng nhiều seed. Một run đơn chỉ là smoke
 - Không gọi spatial gated convolution là Mamba/SSM.
 - Không gọi lightweight random-init text encoder là open-vocabulary language understanding.
 - Không gọi fixed class prompts là runtime text-query detection.
-- Không ghi mAP/baseline numbers nếu chưa chạy evaluator trên untouched test split.
+- Không ghi **final held-out** mAP/baseline numbers nếu chưa chạy evaluator trên
+  untouched test split; validation AP có thể được báo cáo với role và provenance
+  đầy đủ, nhưng không được trình bày như kết quả cuối cùng hay như benchmark F1.
 - Không so trực tiếp kết quả cũ dùng `test_set` làm validation với benchmark v2.

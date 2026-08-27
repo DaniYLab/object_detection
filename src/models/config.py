@@ -179,6 +179,7 @@ class ModelConfig:
     dropout: float = 0.1
     fusion_mode: str = "film"
     pathway_mode: str = "shared"
+    conditioning_stage: str = "early"
     class_chunk_size: int = 8
     attention_chunk_size: int | None = None
     head_channels: int = 128
@@ -225,6 +226,10 @@ class ModelConfig:
         self.pathway_mode = aliases.get(self.pathway_mode, self.pathway_mode)
         if self.pathway_mode not in {"shared", "per_class"}:
             raise ValueError(f"unknown pathway_mode: {self.pathway_mode}")
+        if self.conditioning_stage not in {"early", "late"}:
+            raise ValueError(f"unknown conditioning_stage: {self.conditioning_stage!r}")
+        if self.conditioning_stage == "late" and self.conditioner.kind == "none":
+            raise ValueError("late conditioning requires a class-specific conditioner")
         if self.output_stride != 8:
             raise ValueError("FloorPlanDetector currently supports output_stride=8 only")
         if self.image_size <= 0 or self.image_size % self.output_stride != 0:
@@ -489,6 +494,15 @@ register_model_preset(
     "dual_pathway_v2",
     ModelConfig(
         vector=VectorBranchConfig(enabled=True, class_conditioned=True),
+    ),
+)
+
+register_model_preset(
+    "dual_pathway_late",
+    ModelConfig(
+        fusion_mode="none",
+        conditioning_stage="late",
+        vector=VectorBranchConfig(enabled=True, class_conditioned=False),
     ),
 )
 
