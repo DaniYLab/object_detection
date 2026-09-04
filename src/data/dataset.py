@@ -279,6 +279,7 @@ class FloorPlanQueryDataset(Dataset):
         strict_metadata: bool = False,
         collision_policy: CollisionPolicy = "largest",
         min_overlap: float = 0.7,
+        head_stride: int | None = None,
         records: list[ImageRecord] | None = None,
         neg_queries_per_pos: int = 0,
         neg_seed: int = 0,
@@ -309,6 +310,15 @@ class FloorPlanQueryDataset(Dataset):
         if neg_queries_per_pos < 0:
             raise ValueError("neg_queries_per_pos cannot be negative")
         self.output_size = self.image_size // self.output_stride
+        self.head_stride = int(head_stride) if head_stride is not None else self.output_stride
+        if self.head_stride <= 0 or self.image_size % self.head_stride != 0:
+            raise ValueError(
+                f"image_size ({self.image_size}) must be divisible by "
+                f"head_stride ({self.head_stride})"
+            )
+        if self.head_stride > self.output_stride:
+            raise ValueError("head_stride must be <= output_stride (a finer head upsamples the trunk)")
+        self.head_size = self.image_size // self.head_stride
         self.transform = transform or _default_transform(self.image_size, self.split)
         self.strict_metadata = strict_metadata
         self.collision_policy = collision_policy
@@ -560,7 +570,7 @@ class FloorPlanQueryDataset(Dataset):
         target_maps, target_stats = generate_centernet_targets(
             boxes,
             image_size=(int(image_tensor.shape[-2]), int(image_tensor.shape[-1])),
-            output_stride=self.output_stride,
+            output_stride=self.head_stride,
             min_overlap=self.min_overlap,
             collision_policy=self.collision_policy,
         )

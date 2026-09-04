@@ -2,10 +2,22 @@
 
 ## Provenance của bảng nguồn
 
-Repository hiện **không xác định được paper/source** của bảng này. Không có
-title, authors, URL, bibliography hoặc định nghĩa evaluator; `[42]` và `[5]`
-chỉ là citation indices chưa được resolve. Vì vậy toàn bộ bảng được xem là
-user-supplied reference cho đến khi source paper và code đánh giá được xác minh.
+**Đã xác định** (2026-08-27): bảng nguồn đến từ bài báo **FloorPlanCAD** của
+Fan et al., ICCV 2021 — arXiv:2105.07147 (https://arxiv.org/abs/2105.07147),
+dataset tại https://floorplancad.github.io/. `[42]` = HRNet (Wang et al., TPAMI
+2020); `[5]` = DeepLabv3+ (Chen et al., ECCV 2018). Các cột F1/Weighted F1 khớp
+chính xác Table của bài: HRNet-W18 0.656/0.683, W48 0.666/0.693, DeepLab-R50
+0.680/0.705, R101 0.688/0.714, Ours 0.806/0.798.
+
+Bản chất metric (đây chính là lý do KHÔNG được đặt cạnh box AP):
+
+- F1 của bài là **entity-level** (từng graphic primitive — line/arc/curve trong
+  SVG), KHÔNG phải pixel mask cũng không phải bounding box.
+- Weighted F1 trọng số theo `log(1 + L)` (L = độ dài entity), giảm ảnh hưởng
+  của các nét quá dài.
+- Các baseline pixel (HRNet/DeepLab) được chuyển thành entity label bằng
+  majority sample dọc theo entity, không đo trực tiếp bằng mask.
+- Task semantic không dùng confidence threshold; IoU>0.5 chỉ dùng cho matching.
 
 ## Bảng được cung cấp
 
@@ -90,11 +102,19 @@ delta như một controlled comparison; xem `docs/experiment_log.md`.
 
 **Không.** Việc đặt `0.4021 AP50` cạnh `0.806 F1` và kết luận model kém hơn là sai vì:
 
-1. Bảng SOTA dùng **F1 theo 8 broad categories**, có `Wall` và `Parking lot`; repository báo **bounding-box AP** trên 30 object classes.
-2. Benchmark hiện tại dùng `stuff_policy=exclude`, nên `wall` có **0 GT instance** và bị loại khỏi AP macro.
-3. F1 phụ thuộc một operating threshold cụ thể; AP tích phân precision–recall qua score ranking và IoU thresholds.
-4. Chưa xác nhận cùng split, resize, label grouping, instance/stuff semantics, post-processing hoặc matching rule.
-5. HRNet/DeepLab thường là semantic-segmentation architectures; detector hiện tại là object detection.
+1. Bảng SOTA dùng **entity-level F1** theo 8 broad categories (thực ra bài gốc
+   dùng 30 class: 28 thing + wall + parking), có `Wall` và `Parking lot`;
+   repository báo **bounding-box AP** trên 30 object classes.
+2. F1 nguồn là **entity-level** (graphic primitive), không phải pixel mask cũng
+   không phải box; Weighted F1 lại còn trọng số theo `log(1+độ dài entity)`.
+3. Benchmark hiện tại dùng `stuff_policy=exclude`, nên `wall` có **0 GT instance**
+   trong MỌI role của manifest v2 và bị loại khỏi AP macro.
+4. F1 phụ thuộc một operating threshold cụ thể; AP tích phân precision–recall
+   qua score ranking và IoU thresholds.
+5. Chưa xác nhận cùng split, resize, label grouping, instance/stuff semantics,
+   post-processing hoặc matching rule.
+6. HRNet/DeepLab thường là semantic-segmentation architectures; detector hiện
+   tại là object detection.
 
 Vì vậy, bảng SOTA chỉ dùng làm **tham khảo task khác**, không được dùng để claim repository đạt hoặc không đạt SOTA.
 
@@ -122,6 +142,54 @@ capacity-matched or pure conditioning-stage ablation. Historical V2 quality
 reports use a different manifest and therefore do not provide a controlled
 quality delta.
 
+
+## Benchmark object-detection thực sự (cùng task với repo)
+
+Bài FloorPlanCAD (Table instance/panoptic symbol detection) cũng báo kết quả
+object detection — đây mới là nhóm comparator **cùng task** (instance/box
+detection) với CenterNet của repo, khác hẳn cột entity-F1 segmentation:
+
+| Detector | AP50 | mAP |
+|---|---:|---:|
+| Faster R-CNN R101 | 0.602 | 0.452 |
+| FCOS | 0.624 | 0.453 |
+| YOLOv3 | 0.639 | 0.413 |
+
+Đây là target "chạm/vượt benchmark" hợp lệ cho một detector. Cần lưu ý: để so
+được công bằng vẫn phải xác minh split, class grouping, input resolution và
+matching rule của bài; trước khi xác minh, các số trên chỉ là mục tiêu tham
+khảo cùng task, không phải baseline tái lập tại repo.
+
+
+## Related work — ArchCAD-400K / DPSS (arXiv:2503.22346)
+
+Bài kế nhiệm trực tiếp của FloorPlanCAD: *ArchCAD-400K: An Open Large-Scale
+Architectural CAD Dataset and New Baseline for Panoptic Symbol Spotting*
+(Luo et al., arXiv:2503.22346, 2025). Nó dùng đúng FloorPlanCAD làm benchmark
+phụ và xác nhận chéo provenance bảng SOTA của repo: baseline DeepLabv3+ (R101)
+trên FloorPlanCAD semantic spotting = **F1 68.8 / wF1 71.4**, khớp chính xác
+0.688 / 0.714 trong bảng nguồn.
+
+**Đề xuất DPSS (Dual-Pathway Symbol Spotter)** — image branch (HRNetV2-W48) +
+point-cloud primitive branch (PointTransformerV2) + adaptive gated fusion +
+DETR/Mask2Former decoder. Đây chính là dạng dual-pathway image+vector mà repo
+đang theo, độc lập xác nhận hướng kiến trúc là đúng.
+
+Benchmark ladder cùng task (FloorPlanCAD, no priors):
+
+| Track | DeepLabv3+ | Faster R-CNN | SymPointV2 | DINO | DPSS |
+|---|---:|---:|---:|---:|---:|
+| Semantic F1 | 68.8 | — | 87.0 | — | **92.0** |
+| Semantic wF1 | 71.4 | — | — | — | **93.2** |
+| Instance mAP | — | — | 57.5 | 47.5 | **61.5** |
+| Instance AP50 | — | 0.602 | — | 0.649 | — |
+
+Ghi chú: instance "mAP" của bài là symbol-spotting matching riêng, không trực
+tiếp là COCO AP50:95 của repo; AP50 (Faster R-CNN 0.602, DINO 0.649) là đích
+gần nhất cho một box detector. Khoảng cách kiến trúc đáng lưu ý: DPSS dùng
+point-transformer primitive encoder + DETR/Mask2Former decoder, thay vì
+CenterNet heatmap box-decoder — giới hạn của repo có thể nằm ở decoder lẫn
+vector-encoder, cần test độc lập trên validation (không suy từ test).
 
 Chọn một trong hai hướng:
 

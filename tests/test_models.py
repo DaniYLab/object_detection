@@ -216,3 +216,42 @@ def test_direct_constructor_exposes_late_conditioning_stage() -> None:
     assert model.conditioning_stage == "late"
     assert model.late_head is not None
     assert model.heatmap_head is None
+
+
+def test_thin_head_upsamples_to_finer_grid_and_round_trips() -> None:
+    cfg = ModelConfig(
+        image_size=32,
+        output_stride=8,
+        head_stride=4,
+        model_dim=16,
+        num_classes=3,
+        depth_per_class=1,
+        num_heads=4,
+        dropout=0.0,
+        pathway_mode="shared",
+        class_chunk_size=2,
+        head_channels=16,
+        vae=VAEConfig(latent_channels=8, block_out_channels=(8, 12, 16)),
+        conditioner=ConditionerConfig(kind="class_embedding", max_length=12, embedding_dim=8),
+    )
+    assert cfg.head_size == 8  # 32 // 4
+    # Round-trip preserves head_stride.
+    assert ModelConfig.from_dict(cfg.to_dict()) == cfg
+
+    model = FloorPlanDetector(config=cfg).eval()
+    with torch.no_grad():
+        selected = model(
+            torch.randn(2, 3, 32, 32),
+            class_ids=torch.tensor([0, 1]),
+        )
+        all_classes = model(torch.randn(2, 3, 32, 32), class_chunk_size=2)
+    # Trunk is stride-8 (4x4) but head grid is stride-4 (8x8).
+    assert selected["center_heatmap"].shape == (2, 1, 8, 8)
+    assert selected["size_map"].shape == (2, 2, 8, 8)
+    assert all_classes["center_heatmap"].shape == (2, 3, 8, 8)
+    assert all_classes["size_map"].shape == (2, 6, 8, 8)
+
+
+def test_thin_head_rejects_coarser_grid() -> None:
+    with pytest.raises(ValueError, match="head_stride"):
+        ModelConfig(output_stride=8, head_stride=16)

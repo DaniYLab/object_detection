@@ -223,15 +223,184 @@ respectively. Selected-query training is effectively unchanged (1.04x and 1.01x
 lower step time for late mode). These are synchronized synthetic profiles, not an
 end-to-end dataloader throughput claim.
 
+### Same-manifest V2 control (controls for the late comparison)
+
+To make the late quality gap a controlled claim, `dual_pathway_v2` was retrained
+on the same schema-v2 manifest, seed 1337, 30 epochs, BF16, batch 24, balanced
+sampler, one absent-class negative query per positive. Checkpoint dir
+`checkpoints/dual_pathway_v2_seed1337_v2manifest/` is distinct from the legacy
+run. Full `val_select` (1,016 images, 8,476 GT boxes):
+
+| Model | Epochs | AP50 | AP50:95 |
+|---|---:|---:|---:|
+| V2 control (`best_val_ap.pt`) | 30 | **0.4883** | **0.2779** |
+| V2 control (`epoch_005.pt`, budget-matched) | 5 | 0.2309 | 0.0924 |
+| Late (`best_val_ap.pt`) | 5 | 0.1598 | 0.0668 |
+
+Budget-matched (5 epochs, same manifest/seed/config): late − V2 = **−0.0711 AP50 /
+−0.0256 AP50:95**. The gap is structural (late drops V2 early fusion +
+class-conditioned vector FiLM and is 11.86% smaller), not undertraining.
+
+Ceiling: V2@30 reaches 0.4883/0.2779 on `val_select`. This is below the legacy
+`a916b9fa...` V2 val number (0.5160/0.2742 on a different manifest) — a manifest
+effect, not a regression, and confirms results must be compared only within one
+manifest. Both manifests contain 1,016 validation images but differ in assignment
+and provenance.
+
+### One-pass student distillation (response-based KD)
+
+`dual_pathway_late` was distilled from the frozen V2 control teacher
+(`checkpoints/dual_pathway_v2_seed1337_v2manifest/best_val_ap.pt`) with
+response-only KD (center-logits soft targets + masked size/offset MSE). Two
+configurations were tested at 5 epochs on `val_select`, seed 1337, same
+manifest/loader:
+
+| Config | Full `val_select` AP50 | Full AP50:95 | limited-256 AP50 |
+|---|---:|---:|---:|
+| Late non-KD (baseline) | 0.1598 | 0.0668 | 0.1879 |
+| KD center full-map (w=2.0) | — (stopped at ep5, limited 0.1535) | — | 0.1535 |
+| KD center-gated (w=1.0) | 0.1550 | 0.0664 | 0.2213 |
+
+Conclusion: **response-only distillation does not close the structural gap.**
+Full-map center KD hurt (limited-256 0.1535 < 0.1879); gating center KD to
+positive cells reverse that on the 256-image subset (0.2213 > 0.1879) but the
+full-role result is a null (0.1550 ≈ 0.1598). The limited-256 subset is not a
+reliable selection signal — full-role is the only trustworthy metric.
+
+The −7 AP50 gap is structural: the late student lacks V2's class-conditioned
+vector FiLM and early token-level fusion, so a class-agnostic response head
+cannot absorb V2's class-specific soft targets. Response-only KD is rejected as
+the mechanism to recover it; a future attempt would need feature-level KD on the
+post-FiLM hidden, the class-conditioned vector encoding, or additional student
+capacity — none of which preserve the current pure one-pass property for free.
+
+### Per-class diagnosis of the V2 control (val_select, splits_v2, seed 1337)
+
+Full-role `val_select` diagnostic of `best_val_ap.pt` (AP50 0.4883, GT-weighted
+AP50 0.6778). Macro AP is dragged down by a small set of thin/rare classes, not
+by an across-the-board weakness:
+
+- **Thin-object bottleneck (the largest lever):** `stair` (214 GT, not rare) is
+  only 0.104, `ramp` 0.122, `escalator_stair` 0.036. These share a signature:
+  median min-side ≈ 5.1 px (< stride 8) and extreme aspect ratio (stair 7.0,
+  ramp 20.0); 60–100% of their boxes have a side below the 8 px stride-8 cell.
+  A CenterNet stride-8 heatmap cannot place a peak on an object thinner than one
+  cell, so the box is missed regardless of how well the vector branch sees the
+  parallel-line geometry. This matches the source-table "Stair" category being
+  the lowest. `escalator_stair` (172 px median side) is a different symptom —
+  large but zig-zag, likely split/inconsistent annotation.
+- **Small-but-not-thin classes can still do well:** `plant` (median side 15.1 px,
+  AP50 0.891) and `parking` (20.8 px, 0.899) prove small size alone is not the
+  issue — only sub-stride thin extent is.
+- **Rare-class variance:** `door_revolving` (4 GT), `window_bay` (3), `ramp` (6)
+  have too few GT for stable single-seed AP.
+
+Conclusion: the highest-value quality lever is a **stride-4 (or hybrid
+thin-object) head**, not more vector encoding — the image path already sees the
+geometry at 8 px resolution, but the detection grid cannot resolve sub-cell
+thin objects. The DPSS paper reaches the same conclusion via its point-based
+primitive branch; here the primitive branch exists but the box head resolution
+is the binding constraint.
+
+Collision/target audit for stride 4 (val_select, 8,476 valid boxes):
+
+- 6.8% of boxes have min-side < 8 px (< 1 stride-8 cell); 100% of those are
+  ≥ 1 stride-4 cell, i.e. stride 4 would resolve all of them.
+- **33.6% of boxes have gaussian radius == 0 at stride 8** (radius from
+  CornerNet min_overlap=0.7 collapses for sub-cell boxes), so a third of targets
+  are bare 1-pixel peaks with no gaussian support for focal learning.
+- Collisions at stride 8 are negligible (22 total, mostly toilet), so stride 4
+  does not add a collision problem.
+- Cost: stride 4 is 128×128 = 16,384 tokens/image (4× the 4,096 at stride 8),
+  which stresses the global self-attention trunk (O(n²), OOM risk).
+
+Decision: resolution is the binding constraint. A cheap counter-hypothesis was
+tested first — widening the gaussian via `--min-overlap` — and refuted by a
+10-second check: for any box whose shorter output edge is 1 cell, the CornerNet
+radius stays < 1 (0.47→0.95 across min_overlap ∈ [0.2, 0.7]) and `int(...)` still
+truncates to 0. A height-1 output cell physically cannot host a Gaussian bump, so
+`min_overlap` cannot recover the 33.6% radius==0 set (it only reshapes the wider
+boxes that already have radius ≥ 1). The `--min-overlap` knob is retained and
+wired/tuned for that valid, weaker effect.
+
+The real fix is a **hybrid stride-4 head**: keep the stride-8 trunk (4,096 tokens,
+global attention — unchanged, no OOM) and upsample the trunk feature map to a
+128×128 CenterNet head, so sub-cell thin objects (stair/ramp) gain a ≥1-cell
+heatmap and a non-degenerate Gaussian. This targets the 6.8% sub-cell + 33.6%
+radius==0 sets without the 16,384-token global-attention blowup of a full stride-4
+trunk.
+
+### Hybrid stride-4 thin-object head (head_stride=4)
+
+`dual_pathway_v2_thin` keeps the stride-8 trunk (4,096 tokens, global attention
+unchanged) but bilinearly upsamples the trunk feature map to a 128x128 grid
+before the CenterNet head, so sub-cell thin objects gain a >=1-cell heatmap and
+a non-degenerate Gaussian. Same manifest/seed/config/budget (30 epochs) as the
+V2 control. Full `val_select` (1,016 images, 8,476 GT boxes):
+
+| Model | AP50 | AP50:95 |
+|---|---:|---:|
+| V2 control (stride-8 head, seed 1337) | 0.4883 | 0.2779 |
+| Thin (stride-4 head, seed 1337) | 0.4950 | 0.3091 |
+| Thin (stride-4 head, seed 2024) | 0.4882 | 0.3035 |
+| Thin mean (2 seeds) | 0.4916 | 0.3063 |
+| Δ thin − V2 (seed 1337) | +0.0067 | **+0.0312** |
+| Δ thin − V2 (seed 2024, vs seed-1337 V2) | −0.0001 | **+0.0256** |
+
+**Two-seed replication verdict:** the thin-head AP50:95 gain replicates on
+2/2 seeds (+2.6 to +3.1 points vs the V2 control), with seed-to-seed AP50:95
+std ≈ 0.003 — the effect is ~10× its variance. AP50 is neutral (mean +0.3
+points; seed 2024 AP50 ≈ the seed-1337 V2 control). Caveat: the V2 control
+exists only for seed 1337, so the seed-2024 delta is read against the seed-1337
+control; the thin seeds are mutually consistent, and the AP50:95 claim is
+robust under either reading. The hybrid stride-4 head is the repo's first
+architecture-level, same-manifest quality improvement replicated on ≥2 seeds.
+
+The thin head improves AP50:95 by +3.1 points (box localization) and AP50 by
++0.7. Per-class, the hypothesis target **stair** jumps from 0.104 to 0.304
+(**+0.201**, 214 GT — not rare), and shower +0.097, sink +0.100,
+floor_plan_area +0.134. Thin-but-not-rare `stair` is the largest and most
+decisive single-class gain. Some larger classes regress (column −0.095,
+bathtub −0.076, oven −0.073) and rare thin classes are noise (ramp −0.102 on 6
+GT, elevator −0.075 on 15 GT). `escalator` (min-side ~23 px, not thin) is
+unchanged (−0.012), consistent with it being a representation problem, not a
+resolution one.
+
+### min_overlap sweep (gaussian radius width)
+
+`--min-overlap` controls the CornerNet gaussian radius. Lower = wider gaussian.
+Budget-matched 5-epoch runs on `dual_pathway_v2`, seed 1337, same
+manifest/loader; full `val_select`:
+
+| Config | AP50 | AP50:95 |
+|---|---:|---:|
+| mo=0.7 (baseline, V2 control) | 0.2309 | 0.0924 |
+| **mo=0.5** | **0.2897** | **0.1233** |
+| **mo=0.3** | **0.2925** | **0.1268** |
+| Δ mo0.3 − mo0.7 | **+0.0616** | **+0.0344** |
+| Δ mo0.5 − mo0.7 | **+0.0588** | **+0.0309** |
+
+**30-epoch verification (the decisive check):** V2 + mo=0.5 trained to the full
+30-epoch budget reaches full-role `val_select` **0.4965/0.2820** vs the mo=0.7
+control 0.4883/0.2779 — only **+0.8 AP50 / +0.4 AP50:95** survives at
+convergence. The large 5-epoch gain (+5.9 AP50) was almost entirely a
+faster-early-convergence effect, not a higher ceiling, mirroring the KD
+lesson in the opposite direction. `min_overlap` is therefore a training-speed
+knob, not a quality lever, at this budget; the thin head remains the only
+verified quality lever (+3.1 AP50:95 at 30 epochs). Future short-budget
+screening results must always be re-verified at full budget before adoption.
+
 ### Interpretation and comparison boundary
 
-The late run establishes a strong speed/memory result, but its quality is currently
-well below the historical V2 numbers. Those V2 numbers were generated under the
-legacy manifest (`splits.json`, fingerprint `a916b9fa...`), so the quality gap is
-not a controlled architecture comparison. A direct quality claim requires a V2
-control trained and evaluated under the same schema-v2 manifest. The late result
-should therefore be reported as a speed-oriented architecture experiment, not as a
-pure causal test of moving conditioning later and not as a parameter-matched result.
+The late run establishes a strong speed/memory result. Budget-matched quality on
+the same manifest is now quantified: late@5ep (0.1598/0.0668) vs V2@5ep
+(0.2309/0.0924) — a −7.1 AP50 / −2.6 AP50:95 structural gap. V2@30
+(0.4883/0.2779) is the same-manifest quality ceiling next to which the late track
+should be judged. The quality gap is not a controlled architecture claim until a
+same-manifest V2 control exists; that control has now been produced. The late
+result should therefore be reported as a speed-oriented architecture experiment
+with a known quality cost, not as a pure causal test of moving conditioning later
+and not as a parameter-matched result.
 
 ## Decisions / observations
 

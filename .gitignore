@@ -53,3 +53,4 @@ runs/
 .env
 *.env
 secrets/
+Resource

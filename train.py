@@ -51,6 +51,7 @@ from src.training.checkpoint import (
     restore_training_state,
     save_checkpoint,
 )
+from src.training.distillation import distillation_loss
 from src.training.losses import centernet_loss, focal_loss, l1_loss_masked
 from src.training.reproducibility import (
     make_generator,
@@ -152,6 +153,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("grad_clip must be positive")
     if args.balance_power < 0:
         raise ValueError("balance_power cannot be negative")
+    if not 0 < args.min_overlap < 1:
+        raise ValueError("min_overlap must be between 0 and 1")
     if args.limit_train_samples < 0 or args.limit_val_samples < 0:
         raise ValueError("sample limits cannot be negative")
     if args.log_interval <= 0:
@@ -162,6 +165,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("val_ap_chunk_size must be positive")
     if args.limit_val_ap_images < 0:
         raise ValueError("limit_val_ap_images cannot be negative")
+    if min(args.kd_center_weight, args.kd_size_weight, args.kd_offset_weight) < 0:
+        raise ValueError("KD weights cannot be negative")
+    if args.kd_temperature <= 0:
+        raise ValueError("kd_temperature must be positive")
 
 
 def _training_roles(manifest: Mapping[str, Any]) -> tuple[str, str]:
@@ -447,9 +454,17 @@ def train_one_epoch(
     log_interval: int = 20,
     precision: str = "fp32",
     scaler: Any | None = None,
+    teacher: nn.Module | None = None,
+    kd_center_weight: float = 1.0,
+    kd_size_weight: float = 0.5,
+    kd_offset_weight: float = 0.5,
+    kd_temperature: float = 2.0,
 ) -> dict[str, float]:
     model.train()
+    if teacher is not None:
+        teacher.eval()
     total_loss = focal_sum = size_sum = offset_sum = pos_sum = grad_sum = 0.0
+    kd_sum = 0.0
     target_stats = TargetStats()
     start_time = time.time()
 
@@ -494,6 +509,31 @@ def train_one_epoch(
                 size_w=size_w,
                 offset_w=offset_w,
             )
+            if teacher is not None:
+                with torch.no_grad():
+                    teacher_predictions = _forward_query_batch(
+                        teacher,
+                        image,
+                        class_ids,
+                        batch.get("texts", ()),
+                        stroke_tokens=stroke_tokens,
+                        stroke_mask=stroke_mask,
+                    )
+                kd = distillation_loss(
+                    predictions,
+                    teacher_predictions,
+                    targets,
+                    temperature=kd_temperature,
+                    center_weight=kd_center_weight,
+                    size_weight=kd_size_weight,
+                    offset_weight=kd_offset_weight,
+                )
+                losses = dict(losses)
+                losses["total"] = losses["total"] + kd["kd_total"]
+                losses["kd_center"] = kd["kd_center"]
+                losses["kd_size"] = kd["kd_size"]
+                losses["kd_offset"] = kd["kd_offset"]
+                losses["kd_total"] = kd["kd_total"]
 
         if scaler is not None:
             previous_scale = float(scaler.get_scale())
@@ -517,6 +557,8 @@ def train_one_epoch(
         offset_sum += losses["offset_l1"].item()
         pos_sum += losses["num_pos"].item()
         grad_sum += float(grad_norm)
+        if teacher is not None:
+            kd_sum += losses["kd_total"].item()
 
         if (step + 1) % log_interval == 0:
             elapsed = time.time() - start_time
@@ -546,6 +588,8 @@ def train_one_epoch(
         "num_pos": pos_sum / batch_count,
         "grad_norm": grad_sum / batch_count,
     }
+    if teacher is not None:
+        metrics["kd_total"] = kd_sum / batch_count
     metrics.update(_target_stat_metrics(target_stats))
     return metrics
 
@@ -677,7 +721,7 @@ def validate_ap(
         pin_memory=device.type == "cuda",
     )
     decoder = CenterNetDecoder(
-        stride=getattr(model, "output_stride", 8),
+        stride=getattr(model, "head_stride", getattr(model, "output_stride", 8)),
         threshold=threshold,
         topk=topk,
         peak_kernel=peak_kernel,
@@ -797,6 +841,7 @@ def _build_runtime_config(
             "limit_val_samples": args.limit_val_samples,
             "neg_queries_per_pos": args.neg_queries_per_pos,
             "neg_rare_boost": args.neg_rare_boost,
+            "min_overlap": args.min_overlap,
             "negative_query_seed": args.seed,
         },
         "loader": {
@@ -992,11 +1037,13 @@ def main(args: argparse.Namespace) -> int:
         split=train_role,
         image_size=model_config.image_size,
         output_stride=model_config.output_stride,
+        head_stride=model_config.head_stride,
         manifest_path=manifest_path,
         neg_queries_per_pos=args.neg_queries_per_pos,
         neg_seed=args.seed,
         neg_rare_boost=args.neg_rare_boost,
         cache_images=args.cache_images,
+        min_overlap=args.min_overlap,
         vector_branch=vector_branch,
         vector_n_max=vector_n_max,
         vector_seed=args.seed,
@@ -1006,9 +1053,11 @@ def main(args: argparse.Namespace) -> int:
         split=selection_role,
         image_size=model_config.image_size,
         output_stride=model_config.output_stride,
+        head_stride=model_config.head_stride,
         manifest_path=manifest_path,
         neg_queries_per_pos=0,
         cache_images=args.cache_images,
+        min_overlap=args.min_overlap,
         vector_branch=vector_branch,
         vector_n_max=vector_n_max,
     )
@@ -1089,6 +1138,40 @@ def main(args: argparse.Namespace) -> int:
         )
     parameter_count = sum(parameter.numel() for parameter in model.parameters()) / 1e6
     print(f"Model params: {parameter_count:.1f}M")
+
+    teacher: nn.Module | None = None
+    if args.teacher_checkpoint:
+        teacher_payload = load_checkpoint(args.teacher_checkpoint, map_location="cpu")
+        teacher_config_value = teacher_payload.get("model_config")
+        if not isinstance(teacher_config_value, dict):
+            raise CheckpointError(
+                "Teacher checkpoint does not contain a serializable model_config"
+            )
+        teacher_config = ModelConfig.from_dict(teacher_config_value)
+        if teacher_config.image_size != model_config.image_size:
+            raise ValueError(
+                "teacher and student image_size must match "
+                f"(teacher={teacher_config.image_size}, student={model_config.image_size})"
+            )
+        teacher = build_model(teacher_config)
+        restore_training_state(
+            teacher_payload,
+            model=teacher,
+            expected_model_config=teacher_config,
+            expected_class_names=CLASS_NAMES,
+            expected_output_stride=teacher_config.output_stride,
+            weights_only=True,
+            strict=True,
+        )
+        teacher.to(device).eval()
+        for parameter in teacher.parameters():
+            parameter.requires_grad_(False)
+        teacher_params = sum(parameter.numel() for parameter in teacher.parameters()) / 1e6
+        print(
+            f"Teacher: {teacher_payload.get('preset')} ({teacher_params:.1f}M) from "
+            f"{args.teacher_checkpoint} | KD T={args.kd_temperature:g} "
+            f"w={args.kd_center_weight:g}/{args.kd_size_weight:g}/{args.kd_offset_weight:g}"
+        )
 
     optimizer = torch.optim.AdamW(
         (parameter for parameter in model.parameters() if parameter.requires_grad),
@@ -1214,6 +1297,11 @@ def main(args: argparse.Namespace) -> int:
             log_interval=args.log_interval,
             precision=precision,
             scaler=scaler,
+            teacher=teacher,
+            kd_center_weight=args.kd_center_weight,
+            kd_size_weight=args.kd_size_weight,
+            kd_offset_weight=args.kd_offset_weight,
+            kd_temperature=args.kd_temperature,
         )
         global_step += len(train_loader)
         val_metrics = validate(
@@ -1509,6 +1597,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--min-overlap",
+        "--min_overlap",
+        dest="min_overlap",
+        type=float,
+        default=0.7,
+        help=(
+            "CenterNet gaussian-radius min_overlap. Lower values widen the "
+            "Gaussian for sub-cell boxes (33.6% of boxes have radius 0 at "
+            "min_overlap=0.7), giving thin objects non-degenerate heatmap "
+            "support without changing the trunk resolution."
+        ),
+    )
+    parser.add_argument(
         "--limit-train-samples",
         "--limit_train_samples",
         dest="limit_train_samples",
@@ -1598,6 +1699,46 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "metadata source hashes. Raises an error if any file has changed "
             "since the metadata was built. Slow for large datasets."
         ),
+    )
+    # P3-A: Response-based knowledge distillation from a frozen teacher.
+    parser.add_argument(
+        "--teacher-checkpoint",
+        "--teacher_checkpoint",
+        dest="teacher_checkpoint",
+        default=None,
+        help=(
+            "Path to a frozen teacher checkpoint (weights only) used for "
+            "response-based distillation. The teacher config is read from the "
+            "checkpoint, so it may differ from the student preset."
+        ),
+    )
+    parser.add_argument(
+        "--kd-center-weight",
+        "--kd_center_weight",
+        dest="kd_center_weight",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--kd-size-weight",
+        "--kd_size_weight",
+        dest="kd_size_weight",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--kd-offset-weight",
+        "--kd_offset_weight",
+        dest="kd_offset_weight",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--kd-temperature",
+        "--kd_temperature",
+        dest="kd_temperature",
+        type=float,
+        default=2.0,
     )
     return parser
 

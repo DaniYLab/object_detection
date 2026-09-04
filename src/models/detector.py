@@ -431,6 +431,7 @@ class FloorPlanDetector(nn.Module):
         text_cfg: TextEncoderConfig | None = None,
         *,
         output_stride: int = 8,
+        head_stride: int = 8,
         pathway_mode: str = "shared",
         conditioning_stage: str = "early",
         conditioner: str | ConditionerConfig | nn.Module | None = None,
@@ -467,6 +468,7 @@ class FloorPlanDetector(nn.Module):
             config = ModelConfig(
                 image_size=int(image_size),
                 output_stride=output_stride,
+                head_stride=head_stride,
                 model_dim=model_dim,
                 num_classes=num_classes,
                 class_texts=tuple(class_texts) if class_texts is not None else None,
@@ -521,7 +523,9 @@ class FloorPlanDetector(nn.Module):
         self.config = config
         self.image_size = config.image_size
         self.output_stride = config.output_stride
+        self.head_stride = config.head_stride
         self.latent_size = config.latent_size
+        self.head_size = config.head_size
         self.model_dim = config.model_dim
         self.num_classes = config.num_classes
         self.depth_per_class = config.depth_per_class
@@ -829,6 +833,25 @@ class FloorPlanDetector(nn.Module):
             features.shape[0], self.model_dim, height, width
         )
 
+    def _resolve_head_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Upsample stride-8 trunk features to the head's finer grid.
+
+        The trunk always runs at ``output_stride`` (8); when ``head_stride`` is
+        finer, only the compact CenterNet head operates at higher resolution.
+        Using ``scale_factor`` (rather than a square ``head_size``) preserves
+        rectangular inputs. This resolves sub-cell thin objects without raising
+        the trunk's token count or global self-attention cost.
+        """
+        factor = self.output_stride // self.head_stride
+        if factor > 1:
+            return F.interpolate(
+                features,
+                scale_factor=float(factor),
+                mode="bilinear",
+                align_corners=False,
+            )
+        return features
+
     @staticmethod
     def _decode_raw(raw: torch.Tensor) -> dict[str, torch.Tensor]:
         if raw.ndim == 4:
@@ -877,6 +900,7 @@ class FloorPlanDetector(nn.Module):
             raise RuntimeError("late head is not initialized")
         batch = features.shape[0]
         hidden = self.late_head.feature(features)
+        height, width = hidden.shape[-2], hidden.shape[-1]
         all_heatmaps, all_logits, all_sizes, all_offsets = [], [], [], []
         for start in range(0, self.num_classes, chunk_size):
             end = min(start + chunk_size, self.num_classes)
@@ -948,6 +972,7 @@ class FloorPlanDetector(nn.Module):
             height,
             width,
         )
+        features = self._resolve_head_features(features)
         if self.heatmap_head is None:
             raise RuntimeError("early heatmap head is not initialized")
         raw = self.heatmap_head(features)
@@ -1120,17 +1145,18 @@ class FloorPlanDetector(nn.Module):
                 stroke_tokens=expanded_strokes,
                 stroke_mask=expanded_mask,
             )
+            head_h, head_w = output["center_heatmap"].shape[-2], output["center_heatmap"].shape[-1]
             all_heatmaps.append(
-                output["center_heatmap"].reshape(batch, classes_in_chunk, height, width)
+                output["center_heatmap"].reshape(batch, classes_in_chunk, head_h, head_w)
             )
             all_logits.append(
-                output["center_logits"].reshape(batch, classes_in_chunk, height, width)
+                output["center_logits"].reshape(batch, classes_in_chunk, head_h, head_w)
             )
             all_sizes.append(
-                output["size_map"].reshape(batch, classes_in_chunk * 2, height, width)
+                output["size_map"].reshape(batch, classes_in_chunk * 2, head_h, head_w)
             )
             all_offsets.append(
-                output["offset_map"].reshape(batch, classes_in_chunk * 2, height, width)
+                output["offset_map"].reshape(batch, classes_in_chunk * 2, head_h, head_w)
             )
         return {
             "center_heatmap": torch.cat(all_heatmaps, dim=1),
@@ -1193,6 +1219,7 @@ class FloorPlanDetector(nn.Module):
             image_tokens = self.encode_vector(stroke_tokens, stroke_mask, image_tokens)
         if self.conditioning_stage == "late":
             trunk_features = self._run_shared_trunk(image_tokens, height, width)
+            trunk_features = self._resolve_head_features(trunk_features)
             if class_ids is not None:
                 selected_ids = self._validate_class_ids(class_ids, image.shape[0], image.device)
                 selected_texts = self._selected_texts(texts, selected_ids)

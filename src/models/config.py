@@ -171,6 +171,7 @@ class ModelConfig:
     architecture: str = "floorplan_detector"
     image_size: int = 512
     output_stride: int = 8
+    head_stride: int = 8
     model_dim: int = 256
     num_classes: int = 35
     class_texts: tuple[str, ...] | None = None
@@ -234,6 +235,17 @@ class ModelConfig:
             raise ValueError("FloorPlanDetector currently supports output_stride=8 only")
         if self.image_size <= 0 or self.image_size % self.output_stride != 0:
             raise ValueError("image_size must be positive and divisible by output_stride")
+        if self.head_stride <= 0:
+            raise ValueError("head_stride must be positive")
+        if self.head_stride not in {4, 8}:
+            raise ValueError("head_stride must be 4 or 8")
+        if self.head_stride > self.output_stride:
+            raise ValueError(
+                "head_stride must be <= output_stride; the head grid may be finer "
+                "(upsample the stride-8 trunk) but not coarser"
+            )
+        if self.image_size % self.head_stride != 0:
+            raise ValueError("image_size must be divisible by head_stride")
         if self.model_dim <= 0 or self.model_dim % self.num_heads != 0:
             raise ValueError("model_dim must be positive and divisible by num_heads")
         if self.num_classes <= 0:
@@ -250,6 +262,10 @@ class ModelConfig:
     @property
     def latent_size(self) -> int:
         return self.image_size // self.output_stride
+
+    @property
+    def head_size(self) -> int:
+        return self.image_size // self.head_stride
 
     @property
     def latent_channels(self) -> int:
@@ -493,6 +509,18 @@ register_model_preset(
 register_model_preset(
     "dual_pathway_v2",
     ModelConfig(
+        vector=VectorBranchConfig(enabled=True, class_conditioned=True),
+    ),
+)
+
+# Hybrid thin-object variant: keep the stride-8 trunk (4,096 tokens, global
+# attention unchanged) but run the CenterNet head on a 128x128 grid so sub-cell
+# thin objects (stair/ramp/escalator) get a >=1-cell heatmap and a
+# non-degenerate Gaussian. The trunk feature map is bilinearly upsampled.
+register_model_preset(
+    "dual_pathway_v2_thin",
+    ModelConfig(
+        head_stride=4,
         vector=VectorBranchConfig(enabled=True, class_conditioned=True),
     ),
 )

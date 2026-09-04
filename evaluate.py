@@ -331,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         assert model is not None and checkpoint is not None and config is not None
         decoder = CenterNetDecoder(
-            stride=config.output_stride,
+            stride=getattr(config, "head_stride", config.output_stride),
             threshold=args.threshold,
             topk=args.topk,
             peak_kernel=args.peak_kernel,
@@ -392,7 +392,7 @@ def main(argv: list[str] | None = None) -> int:
             "threshold": args.threshold,
             "topk_per_class": args.topk,
             "peak_kernel": args.peak_kernel,
-            "output_stride": 8,
+            "output_stride": getattr(config, "head_stride", 8) if config is not None else 8,
         },
         "metrics": metrics,
     }

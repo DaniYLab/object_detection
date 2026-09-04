@@ -8,6 +8,7 @@ from .checkpoint import (
     restore_training_state,
     save_checkpoint,
 )
+from .distillation import distillation_loss
 from .losses import centernet_loss, focal_loss, l1_loss_masked
 from .reproducibility import (
     capture_rng_state,
@@ -23,6 +24,7 @@ __all__ = [
     "build_checkpoint",
     "capture_rng_state",
     "centernet_loss",
+    "distillation_loss",
     "focal_loss",
     "l1_loss_masked",
     "load_checkpoint",
