@@ -64,7 +64,7 @@ class ParallelBoxLoss(nn.Module):
     Loss = λ1 * IoU_loss + λ2 * BCE_loss
     """
 
-    def __init__(self, iou_weight: float = 1.0, bce_weight: float = 0.5):
+    def __init__(self, iou_weight: float = 1.0, bce_weight: float = 0.1):
         super().__init__()
         self.iou_weight = iou_weight
         self.bce_weight = bce_weight
@@ -249,6 +249,10 @@ def train_one_epoch(
         # Backward
         optimizer.zero_grad()
         loss_dict['loss'].backward()
+
+        # Gradient clipping to prevent explosion
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
         optimizer.step()
 
         # Accumulate
@@ -280,7 +284,7 @@ def main():
     parser.add_argument('--preset', type=str, default='tiny', choices=['tiny', 'small', 'base', 'large'])
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=5)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--lr', type=float, default=1e-5)  # Lower LR to prevent NaN
     parser.add_argument('--data_root', type=str, default='data/FloorPlanCAD_original')
     parser.add_argument('--output_dir', type=str, default='checkpoints/floorplan_llm')
     args = parser.parse_args()
