@@ -142,6 +142,7 @@ class DualStreamCenterNet(nn.Module):
         image: torch.Tensor,
         stroke_tokens: torch.Tensor,
         stroke_mask: torch.Tensor,
+        class_id: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """Forward pass.
 
@@ -149,13 +150,22 @@ class DualStreamCenterNet(nn.Module):
             image: [B, 3, 512, 512]
             stroke_tokens: [B, N, 12]
             stroke_mask: [B, N]
+            class_id: Optional single class to predict (for training with QueryDataset)
+                     If None, predict all classes (for evaluation)
 
         Returns:
-            {
-                'heatmap': [B, num_classes, H, W],
-                'size': [B, num_classes, 2, H, W],
-                'offset': [B, num_classes, 2, H, W],
-            }
+            If class_id is given:
+                {
+                    'heatmap': [B, 1, H, W],
+                    'size': [B, 2, H, W],
+                    'offset': [B, 2, H, W],
+                }
+            If class_id is None:
+                {
+                    'heatmap': [B, num_classes, H, W],
+                    'size': [B, num_classes, 2, H, W],
+                    'offset': [B, num_classes, 2, H, W],
+                }
         """
         # Encode with dual-stream
         img_tokens, svg_tokens = self.encoder(image, stroke_tokens, stroke_mask)
@@ -167,7 +177,16 @@ class DualStreamCenterNet(nn.Module):
         # Upsample to 64x64 (stride-8 resolution)
         features = self.upsample(features)  # [B, 256, 64, 64]
 
-        # Decode per class with CenterNet heads
+        # Single-class mode (training with QueryDataset)
+        if class_id is not None:
+            output = self.heads[class_id](features)  # [B, 5, H, W]
+            return {
+                'heatmap': output[:, 0:1],  # [B, 1, H, W]
+                'size': output[:, 1:3],      # [B, 2, H, W]
+                'offset': output[:, 3:5],    # [B, 2, H, W]
+            }
+
+        # All-class mode (evaluation)
         B, _, H, W = features.shape
 
         heatmaps = []

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from src.data.dataset import FloorPlanQueryDataset
+from src.data.dataset import FloorPlanQueryDataset, query_collate_fn
 from src.models.dual_stream_centernet import build_dual_stream_centernet
 from src.training.losses import focal_loss, l1_loss_masked
 
@@ -72,12 +72,15 @@ def train_one_epoch(
         image = batch['image'].to(device)
         stroke_tokens = batch['stroke_tokens'].to(device)
         stroke_mask = batch['stroke_mask'].to(device)
-        target_heatmap = batch['target_heatmap'].to(device)
-        target_size = batch['target_size'].to(device)
-        target_offset = batch['target_offset'].to(device)
+        target_heatmap = batch['center_heatmap'].to(device)
+        target_size = batch['size_map'].to(device)
+        target_offset = batch['offset_map'].to(device)
+
+        # Get class_id (batch has same class due to QueryDataset sampling)
+        class_id = batch['class_ids'][0]
 
         # Forward
-        output = model(image, stroke_tokens, stroke_mask)
+        output = model(image, stroke_tokens, stroke_mask, class_id=class_id)
 
         # Compute loss
         loss_dict = criterion(
@@ -153,30 +156,31 @@ def main():
     model = model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"\n✓ Model: {args.preset} ({total_params:,} params)")
+    print(f"\n[OK] Model: {args.preset} ({total_params:,} params)")
 
     # Dataset
-    print("\n✓ Loading dataset...")
+    print("\n[OK] Loading dataset...")
     dataset = FloorPlanQueryDataset(
         root=args.data_root,
         split='train_new',
         manifest_path=f'{args.data_root}/splits_v2.json',
         vector_branch=True,
     )
-    print(f"✓ Dataset: {len(dataset)} samples")
+    print(f"[OK] Dataset: {len(dataset)} samples")
 
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=0,
+        collate_fn=query_collate_fn,
     )
 
     # Loss and optimizer
     criterion = CenterNetLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
-    print(f"\n✓ Training setup complete")
+    print(f"\n[OK] Training setup complete")
     print(f"  Batches per epoch: {len(dataloader)}")
 
     # Training loop
