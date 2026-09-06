@@ -46,7 +46,6 @@ desktop.ini
 
 # Logs
 *.log
-logs/
 wandb/
 runs/
 
