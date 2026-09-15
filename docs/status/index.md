@@ -11,9 +11,9 @@ The September 5–6 real-time training status files were moved to
 `docs/archive/superseded_status_20260906/`. They describe historical processes
 and must not be interpreted as active jobs or current architecture claims.
 
-As of 2026-09-15, the immediate gates are:
+As of 2026-09-15, the immediate work is:
 
-- review at least 100 floor-plan records from the 200-record room pack;
-- complete the blinded 40-record second-review subset and measure agreement;
+- run the bake-off directly on ArchCAD primitive/semantic/instance GT;
+- use junction and `incident_to` metrics for HEAT-style structure output;
 - recover source-drawing provenance before publication evaluation;
-- only then run the deterministic/HEAT-style/RoomFormer-style bake-off.
+- keep room annotation and RoomFormer-style polygon evaluation as a separate optional extension.

@@ -1,6 +1,10 @@
 """Canonical Drawing Graph public API."""
 
 from src.drawing_graph.archcad import compile_archcad_graph, load_archcad_graph
+from src.drawing_graph.archcad_metrics import (
+    evaluate_archcad_prediction,
+    summarize_archcad_metrics,
+)
 from src.drawing_graph.annotation_store import AnnotationConflictError, RoomGoldStore
 from src.drawing_graph.agreement import (
     RegionMatch,
@@ -48,6 +52,7 @@ __all__ = [
     "classify_archcad_task",
     "compare_room_gold_records",
     "execute_query",
+    "evaluate_archcad_prediction",
     "evaluate_structure_prediction",
     "infer_raster_free_space_candidates",
     "load_archcad_graph",
@@ -57,5 +62,6 @@ __all__ = [
     "validate_room_gold_record",
     "summarize_room_gold_records",
     "summarize_room_gold_agreement",
+    "summarize_archcad_metrics",
     "summarize_structure_metrics",
 ]

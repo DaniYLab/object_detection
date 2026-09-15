@@ -20,7 +20,7 @@ Biến bản vẽ raster/vector/CAD thành **Canonical Drawing Graph (CDG)** có
 10. `../../outputs/drawing_graph/oracle_archcad_floor_plan_100_qa.summary.json` — 1.000 executable QA và supervision boundary.
 11. `../../outputs/drawing_graph/archcad_caption_audit.json` — audit 205.479 caption QA của release.
 12. `../../outputs/drawing_graph/archcad_provenance_audit.json` — audit mapping chunk → source drawing.
-13. `../../outputs/drawing_graph/research_gates_v0.json` — trạng thái machine-readable của ba cổng gold/agreement/provenance.
+13. `../../outputs/drawing_graph/research_gates_v0.json` — trạng thái machine-readable của direct-GT, room extension và provenance gates.
 14. `../../src/drawing_graph/` — contract CDG-v0 thực thi được.
 
 ## Trạng thái
@@ -33,6 +33,7 @@ Biến bản vẽ raster/vector/CAD thành **Canonical Drawing Graph (CDG)** có
 | ArchCAD oracle compiler giữ toàn bộ semantics | Hoàn thành v0 | `archcad.py` |
 | Evidence-producing query executor | Hoàn thành v0 | `queries.py` |
 | Audit 100 chunk | Hoàn thành | 100/100 graph valid; 966/966 contract checks đúng |
+| Direct ArchCAD GT scoreboard | Hoàn thành v1 | primitive geometry/semantic, instance bbox/class, junction và incidence |
 | Source-drawing-disjoint split | Blocked bởi dữ liệu nguồn | JSON local không có `source_drawing_id` |
 | Enclosed wall-face candidates | Hoàn thành v0 | 0.96 candidate/chunk; chưa được gọi là room |
 | Door–wall attachment candidates | Hoàn thành v0 | 1.52 candidate links/chunk, có contact-point evidence |
@@ -45,8 +46,8 @@ Biến bản vẽ raster/vector/CAD thành **Canonical Drawing Graph (CDG)** có
 | Executable QA feasibility | Hoàn thành v0 | 1.000 query/100 chunk; 600 raw-semantic oracle, 400 heuristic-only |
 | Released caption QA audit | Hoàn thành | 205.479 QA; chỉ 217 relation/room-like, 6 record sai kiểu |
 | OCR/dimension/legend branch | Chưa bắt đầu | Thực hiện sau structure oracle |
-| Learned structural parser | Chưa bắt đầu | Chỉ bắt đầu sau P1 go/no-go |
-| Structure bake-off evaluator | Hoàn thành scaffold | CDG region/connectivity metrics; chưa có gold để chạy |
+| Learned structural parser | Chưa bắt đầu | Có thể bắt đầu feasibility trên direct GT; publication vẫn chờ provenance |
+| Structure bake-off evaluator | Sẵn sàng | Dùng trực tiếp primitive/semantic/instance GT, không chờ room annotation |
 
 ## Kết quả P1 đầu tiên
 
@@ -60,16 +61,16 @@ Audit seed 1337 trên 100 ArchCAD chunk:
 - Bảo toàn các lớp trước đây bị detector lọc bỏ, gồm 2,854 wall primitives, 1,178 concrete-beam, 784 axis/grid, 393 rebar và 182 foundation trong mẫu.
 - 100/100 graph cảnh báo thiếu source-drawing provenance. Vì vậy kết quả này chứng minh compiler feasibility, chưa chứng minh khả năng generalization.
 
-## Thứ tự công việc bắt buộc
+## Thứ tự công việc hiện tại
 
-1. Review 200-record room gold pack theo `room_gold_annotation_protocol.md`; không promote candidate hint thành nhãn.
-2. Double-annotate 20% và đo polygon IoU/relation agreement.
-3. Phục hồi provenance và dựng split theo source drawing/project.
-4. Mở rộng query set trên graph gold thành contains, adjacent, connected-by và path.
-5. Chỉ train/so sánh learned structural parser khi gold/provenance gates đã qua.
+1. Chạy oracle sanity ceiling trên direct ArchCAD GT để khóa evaluator.
+2. So sánh raster detector, raster+vector parser và HEAT-style graph parser trên primitive/instance/junction metrics.
+3. Phục hồi provenance và dựng split theo source drawing/project song song; trước đó chỉ gọi kết quả là within-release feasibility.
+4. Giữ room/connectivity annotation như extension tùy chọn, không chặn bake-off chính.
+5. Chỉ thêm RoomFormer-style polygon arm khi có dataset chứa room-polygon GT thật; không dùng wall-cycle candidates làm GT.
 
-Protocol thực thi nằm tại `room_gold_annotation_protocol.md`; thiết kế so sánh
-deterministic/HEAT-style/RoomFormer-style nằm tại `structure_bakeoff_protocol.md`.
+Protocol direct-GT nằm tại `structure_bakeoff_protocol.md`. Protocol room annotation
+ở `room_gold_annotation_protocol.md` chỉ phục vụ scoreboard region/connectivity riêng.
 
 Overlay audit đầu tiên cho thấy face kín có thể là lõi thang/shaft thay vì room. Vì vậy CDG-v0 cố ý dùng nhãn `enclosed_wall_face_candidate` với confidence 0.5. Không được đổi thành room ground truth nếu chưa có classification/audit.
 

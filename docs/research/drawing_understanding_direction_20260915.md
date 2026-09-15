@@ -218,7 +218,7 @@ QA phải sinh từ graph bằng chương trình để đáp án chính xác và
 
 ### P2 — Baseline cấu trúc (2–4 tuần)
 
-- So sánh deterministic geometry, HEAT-style graph và RoomFormer-style polygon decoder.
+- So sánh raster detector, raster+vector parser và HEAT-style graph trực tiếp trên primitive/semantic/instance/junction GT. RoomFormer-style polygon decoder thuộc scoreboard room riêng vì ArchCAD JSON không có room polygon.
 - Giữ detector hiện tại làm symbol head baseline.
 - Cold-train trên split sạch; không reuse checkpoint nhiễm leakage để báo số chính.
 
@@ -257,7 +257,7 @@ QA phải sinh từ graph bằng chương trình để đáp án chính xác và
 
 1. **Oracle-CDG feasibility:** đã đạt 100 ArchCAD chunk → graph → 1.000 executable QA, nhưng 400 query topology vẫn chỉ là candidate. Bước kế tiếp là thay chúng bằng human-gold room/connectivity queries.
 2. **Source leakage audit:** tìm hoặc phục hồi `source_drawing_id`; đo duplicate/near-neighbor giữa split ở cấp chunk và bản vẽ.
-3. **Structure baseline bake-off:** deterministic compiler vs HEAT-style edge model vs RoomFormer-style polygon model trên cùng subset và cùng graph metrics.
+3. **Structure baseline bake-off:** dùng trực tiếp ArchCAD primitive/semantic/instance GT để so raster detector, raster+vector parser và HEAT-style junction/edge model. RoomFormer-style polygon model được hoãn sang dataset có room-polygon GT thật.
 
 Chưa nên làm ngay: train MLLM 3B từ đầu, sinh box bằng token, mở rộng detector 21 lớp rồi coi AP là reading score, hoặc joint-train toàn pipeline trước khi có graph oracle.
 

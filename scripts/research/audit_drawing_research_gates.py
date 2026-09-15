@@ -25,6 +25,9 @@ def evaluate_gates(
     provenance_ready = bool(provenance.get("source_drawing_id_available")) and bool(
         provenance.get("drawing_disjoint_split_possible")
     )
+    direct_gt_ready = bool(provenance.get("modality_id_sets_identical")) and int(
+        provenance.get("common_modality_id_count", 0)
+    ) > 0
     return {
         "schema_version": "drawing-research-gates-v0",
         "gates": {
@@ -51,15 +54,21 @@ def evaluate_gates(
                     provenance.get("source_drawing_id_available")
                 ),
             },
+            "direct_archcad_ground_truth": {
+                "passed": direct_gt_ready,
+                "aligned_sample_count": int(
+                    provenance.get("common_modality_id_count", 0)
+                ),
+                "contract": "primitive geometry + semantic + instance",
+            },
         },
-        "structure_bakeoff_ready": primary_ready and secondary_ready,
-        "publication_evaluation_ready": (
-            primary_ready and secondary_ready and provenance_ready
-        ),
+        "structure_bakeoff_ready": direct_gt_ready,
+        "room_connectivity_extension_ready": primary_ready and secondary_ready,
+        "publication_evaluation_ready": direct_gt_ready and provenance_ready,
         "next_action": (
-            "run_structure_bakeoff"
-            if primary_ready and secondary_ready
-            else "complete_human_room_review_and_independent_agreement"
+            "run_direct_archcad_structure_bakeoff"
+            if direct_gt_ready
+            else "restore_aligned_archcad_modalities"
         ),
     }
 

@@ -22,9 +22,9 @@ Tài liệu nguồn của hướng nghiên cứu:
 - [`outputs/drawing_graph/oracle_archcad_floor_plan_100_qa.summary.json`](outputs/drawing_graph/oracle_archcad_floor_plan_100_qa.summary.json): 1.000 executable QA kèm evidence và ranh giới supervision.
 - [`outputs/drawing_graph/archcad_caption_audit.json`](outputs/drawing_graph/archcad_caption_audit.json): audit toàn bộ caption QA đi kèm release.
 - [`outputs/drawing_graph/archcad_provenance_audit.json`](outputs/drawing_graph/archcad_provenance_audit.json): bằng chứng local rằng public release thiếu chunk-to-drawing mapping.
-- [`outputs/drawing_graph/research_gates_v0.json`](outputs/drawing_graph/research_gates_v0.json): tổng hợp machine-readable của gold/agreement/provenance gates.
+- [`outputs/drawing_graph/research_gates_v0.json`](outputs/drawing_graph/research_gates_v0.json): tổng hợp machine-readable của direct-GT, room extension và provenance gates.
 - [`docs/research/archcad_provenance_recovery_20260915.md`](docs/research/archcad_provenance_recovery_20260915.md): kết luận phục hồi provenance và contract cần yêu cầu upstream.
-- [`docs/research/structure_bakeoff_protocol.md`](docs/research/structure_bakeoff_protocol.md): protocol/evaluator chung cho deterministic, HEAT-style và RoomFormer-style.
+- [`docs/research/structure_bakeoff_protocol.md`](docs/research/structure_bakeoff_protocol.md): protocol direct-GT cho primitive, instance và HEAT-style junction/incidence outputs.
 
 CDG-v0 đã có deterministic ArchCAD compiler, validator và evidence-producing query executor trong `src/drawing_graph/`. ArchCAD object detector 21 lớp vẫn là scaffold phụ; compiler graph cố ý bảo toàn cả wall, beam, grid, foundation, glass và rebar.
 
@@ -47,9 +47,9 @@ Không báo cáo generalization trên split ArchCAD hiện tại cho đến khi 
 
 Mọi topology do heuristic tạo ở CDG-v0 dùng relation namespace `candidate_*`. Overlay audit đã bác bỏ việc coi enclosed wall cycles là room ground truth; chúng hiện chỉ là structural features cho bước phân loại/raster-assisted extraction tiếp theo.
 
-Raster/opening-closure baseline cũng không qua room-oracle gate (33% coverage trên 100 floor-plan candidates, không có occupied-space candidate chắc chắn). Hướng chính hiện chuyển sang review gold pack thủ công và phục hồi provenance; không train room parser bằng pseudo-label này.
+Raster/opening-closure baseline cũng không qua room-oracle gate (33% coverage trên 100 floor-plan candidates, không có occupied-space candidate chắc chắn). Bake-off chính vì vậy dùng trực tiếp ArchCAD primitive/semantic/instance ground truth; room annotation chỉ là extension tùy chọn và không chặn structure feasibility. Provenance vẫn phải được phục hồi trước khi báo cáo generalization.
 
-Workbench review local đã có tại `tools/room_gold_annotator/`; chạy `python scripts/research/serve_room_gold_annotator.py --open-browser`. Dữ liệu được validate khi lưu, có backup/atomic replace và chỉ record `reviewed` mới được compile thành quan hệ CDG thật.
+Workbench review local tại `tools/room_gold_annotator/` được giữ cho nghiên cứu room/connectivity về sau; nó không tham gia direct-GT bake-off.
 
 ## Contracts chính
 
