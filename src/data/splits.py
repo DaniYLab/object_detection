@@ -22,6 +22,7 @@ TEST_SOURCE_DIRS = ("test_set",)
 ALL_SOURCE_DIRS = TRAIN_SOURCE_DIRS + TEST_SOURCE_DIRS
 SPLIT_MANIFEST_VERSION = 1
 SPLIT_MANIFEST_VERSION_V2 = 2
+SPLIT_MANIFEST_VERSION_V3 = 3
 V2_SPLIT_ROLES = ("train_new", "val_select", "val_calibration", "test_set")
 V2_ROLE_PURPOSES = {
     "train_new": "training",
@@ -181,12 +182,12 @@ def canonical_split_role(manifest: Mapping[str, Any], requested: str) -> str:
                 f"choose one of {V1_SPLIT_ROLES}"
             )
         return role
-    if version == SPLIT_MANIFEST_VERSION_V2:
+    if version in {SPLIT_MANIFEST_VERSION_V2, SPLIT_MANIFEST_VERSION_V3}:
         if requested == "test":
             requested = "test_set"
         if requested not in V2_SPLIT_ROLES:
             raise ValueError(
-                f"split {requested!r} is ambiguous or invalid for v2 manifest; "
+                f"split {requested!r} is ambiguous or invalid for v{version} manifest; "
                 f"choose one of {V2_SPLIT_ROLES}"
             )
         return requested
@@ -778,11 +779,24 @@ def _validate_split_manifest_v1(manifest: Mapping[str, Any]) -> None:
         if record.source_split != "test":
             raise ValueError(f"{record.image_id} is not from the untouched test source")
 
-def _validate_split_manifest_v2(manifest: Mapping[str, Any]) -> None:
-    """Validate role-based v2 manifest structure and provenance."""
+def _validate_split_manifest_v2(
+    manifest: Mapping[str, Any],
+    *,
+    enforce_quotas: bool = True,
+) -> None:
+    """Validate role-based v2 manifest structure and provenance.
 
-    if manifest_schema_version(manifest) != SPLIT_MANIFEST_VERSION_V2:
-        raise ValueError("v2 validator received a non-v2 manifest")
+    ``enforce_quotas`` checks that each validation role holds exactly the number
+    of records its fraction implies. v3 manifests relax this because a role now
+    holds every physical member of its assigned content groups, so its count is
+    the quota applied to *split units* then expanded — deliberately not equal to
+    the fraction of raw images. The structural checks (partition, leakage,
+    provenance, fingerprints) always apply.
+    """
+
+    version = manifest_schema_version(manifest)
+    if version not in {SPLIT_MANIFEST_VERSION_V2, SPLIT_MANIFEST_VERSION_V3}:
+        raise ValueError("v2/v3 validator received an unsupported manifest")
     fingerprint = manifest.get("fingerprint")
     if not isinstance(fingerprint, str) or not fingerprint:
         raise ValueError("v2 manifest requires a non-empty fingerprint")
@@ -841,21 +855,25 @@ def _validate_split_manifest_v2(manifest: Mapping[str, Any]) -> None:
             raise ValueError(f"manifest.fractions.{role} must be finite and non-negative")
     if sum(float(fractions[role]) for role in ("val_select", "val_calibration")) >= 1:
         raise ValueError("v2 validation fractions must sum to less than one")
-    train_count = sum(record.source_split == "train" for record in indexed)
-    expected_sizes = {
-        "val_select": _validation_quota(train_count, float(fractions["val_select"])),
-        "val_calibration": _validation_quota(
-            train_count, float(fractions["val_calibration"])
-        ),
-    }
-    for role, expected_size in expected_sizes.items():
-        if len(records[role]) != expected_size:
+
+    if enforce_quotas:
+        train_count = sum(record.source_split == "train" for record in indexed)
+        expected_sizes = {
+            "val_select": _validation_quota(train_count, float(fractions["val_select"])),
+            "val_calibration": _validation_quota(
+                train_count, float(fractions["val_calibration"])
+            ),
+        }
+        for role, expected_size in expected_sizes.items():
+            if len(records[role]) != expected_size:
+                raise ValueError(
+                    f"manifest.splits.{role} has {len(records[role])} records; "
+                    f"expected {expected_size} for its fraction"
+                )
+        if len(records["train_new"]) != train_count - sum(expected_sizes.values()):
             raise ValueError(
-                f"manifest.splits.{role} has {len(records[role])} records; "
-                f"expected {expected_size} for its fraction"
+                "manifest.splits.train_new does not contain the remaining train images"
             )
-    if len(records["train_new"]) != train_count - sum(expected_sizes.values()):
-        raise ValueError("manifest.splits.train_new does not contain the remaining train images")
 
     role_fingerprints = manifest.get("role_fingerprints")
     if not isinstance(role_fingerprints, Mapping):
@@ -863,8 +881,31 @@ def _validate_split_manifest_v2(manifest: Mapping[str, Any]) -> None:
     expected_fingerprints = split_role_fingerprints(records)
     if dict(role_fingerprints) != expected_fingerprints:
         raise ValueError("manifest role_fingerprints do not match split contents")
-    if manifest.get("protocol") != "floorplan_detection_validation_hierarchy_v2":
-        raise ValueError("manifest.protocol is invalid for v2")
+    if version == SPLIT_MANIFEST_VERSION_V2:
+        if manifest.get("protocol") != "floorplan_detection_validation_hierarchy_v2":
+            raise ValueError("manifest.protocol is invalid for v2")
+
+
+def _validate_split_manifest_v3(manifest: Mapping[str, Any]) -> None:
+    """Validate a content-deduplicated v3 manifest."""
+
+    if manifest_schema_version(manifest) != SPLIT_MANIFEST_VERSION_V3:
+        raise ValueError("v3 validator received a non-v3 manifest")
+    # Quota arithmetic is intentionally not enforced: roles hold expanded group
+    # members. Every structural check still runs.
+    _validate_split_manifest_v2(manifest, enforce_quotas=False)
+    if manifest.get("protocol") != "floorplan_detection_validation_hierarchy_v3_content_dedup":
+        raise ValueError("manifest.protocol is invalid for v3")
+    dedup = manifest.get("dedup")
+    if not isinstance(dedup, Mapping):
+        raise ValueError("v3 manifest requires a dedup block")
+    for key in ("unit", "scope", "duplicate_groups", "split_units"):
+        if key not in dedup:
+            raise ValueError(f"v3 manifest dedup block missing {key!r}")
+    if dedup["unit"] != "png_sha256":
+        raise ValueError("v3 dedup.unit must be 'png_sha256'")
+    if dedup["scope"] != "training_pool_only":
+        raise ValueError("v3 dedup.scope must be 'training_pool_only'")
 
 
 def validate_split_manifest(manifest: Mapping[str, Any]) -> None:
@@ -875,6 +916,8 @@ def validate_split_manifest(manifest: Mapping[str, Any]) -> None:
         _validate_split_manifest_v1(manifest)
     elif version == SPLIT_MANIFEST_VERSION_V2:
         _validate_split_manifest_v2(manifest)
+    elif version == SPLIT_MANIFEST_VERSION_V3:
+        _validate_split_manifest_v3(manifest)
     else:
         raise ValueError(f"Unsupported split manifest version: {version!r}")
 def write_split_manifest(manifest: Mapping[str, Any], path: str | Path) -> None:

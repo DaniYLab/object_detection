@@ -416,3 +416,93 @@ and not as a parameter-matched result.
 - 2026-08-26: **Historical held-out test run for vector models.** V: test AP50=0.4868, AP50:95=0.2837; V2: 0.4851/0.2759. Later protocol audit found that these vector reports use manifest `a916b9fa...` while the historical B report uses `f83fcffd...` with a different GT count, so the previously stated V−B test delta is withdrawn as a controlled claim. V/V2 remain comparable to each other on their shared manifest, but this exposed test observation must not guide future model selection. Also fixed checkpoint config forward compatibility through semantic ModelConfig comparison.
 - The original A1 query-head control was invalid: without class/text signal, a shared 1-channel head produces identical output for every class query. It achieved only AP50=0.0084 at epoch 5. Replaced it with `floorplan_unconditioned`, which keeps the pathway architecture but uses a multi-class 5C head. The revised control trained normally and reached full-val AP50=0.3513.
 - Seed 1337 conclusion: conditioning provides +5.08 AP50 and +3.86 AP50:95 over the same pathway control, and +2.02/+1.64 over A0. This is preliminary until replicated on two more seeds.
+
+## Protocol audit — 2026-09-13 (documentation falsification + resume analysis)
+
+**Context.** A fresh read of the whole `docs/` tree, the full session transcript
+(14,690 lines / 135 real user turns) and `Resource/` was done to re-derive the
+true state before further training. Result: the docs written on 2026-09-05/06
+contain fabricated numbers and are now archived to
+`docs/archive/fabricated_20260905/`. `experiment_log.md` remains the only
+authoritative results record.
+
+### Falsified claims (each verified against code or checkpoints)
+
+| Claim in archived docs | Verified reality |
+|---|---|
+| "thin-head is image-only, 15M params" | `dual_pathway_v2_thin` = **6,785,797 params, vector branch enabled** |
+| "ResNet18 dual-pathway ~0.8 s/batch" | That model was never trained; **no speed measurement exists** |
+| "sequential = 35 x 5.8ms = 203ms" | All-class chunk-35 latency is **5.83 ms** (line 217). 203 ms multiplies a *selected-query training step* by 35 — inflated **35x** |
+| "FloorPlanLLM ViT 56.5M is the current architecture" | No such model in the tree; ViT line was never evaluated |
+| cites `image_encoder.py`, `centernet_heads.py`, `audit_stride8_collisions.py` | **Files do not exist** |
+| "hybrid 15-20x speedup" | Built on the fabricated 203 ms baseline; target void |
+| "Cross-attention Selector (trainable)" | `ReasoningSelector` has **0 parameters**; pure if/else heuristic |
+
+### Convergence audit (the actionable finding)
+
+Every top run stopped at a hard **30-epoch cap**. Reading
+`checkpoint["metrics"]["val_ap50_95"]` (which had never been inspected before)
+shows validation AP was **still rising** at the cap:
+
+| Model | ep20 | ep25 | ep30 | Δ(25→30) |
+|---|---:|---:|---:|---:|
+| thin s1337 | 0.2932 | 0.3320 | **0.3389** | +0.0069 |
+| thin s2024 | 0.2895 | 0.3154 | **0.3296** | +0.0142 |
+| V2 s1337 | 0.2670 | 0.2899 | **0.3057** | +0.0158 |
+
+Caveat: these trajectory numbers come from the **256-image periodic subset**
+(`limit_val_ap_images=256`), so they are a monitoring signal, not the official
+full-role metric. Re-running the full 1,016-image `val_select` evaluation of
+`epoch_030.pt` reproduces exactly **0.4950 / 0.3091**, identical to the stored
+`best_val_ap.pt` report — confirming `best_val_ap.pt` **is** epoch 30 (there is
+no earlier converged checkpoint) and that the 256-subset overestimates the full
+role by ~+3 AP50:95 (0.3389 vs 0.3091).
+
+Therefore the honest convergence statement is: the only available trajectory
+signal (256-subset, measured every epoch) was still rising at the cap, but the
+full-role metric at epoch 30 is 0.3091 and no full-role measurement exists past
+that point. Whether the full role keeps improving beyond 30 epochs is an **open
+question**, not an established fact. The model has **never been trained past 30
+epochs**.
+
+### Exact-resume constraint discovered
+
+`validate_exact_resume_compatibility` compares `runtime_config` byte-for-byte, and
+`_build_runtime_config` embeds `optimization.epochs` and
+`scheduler.total_steps`. Therefore extending 30 → 100 epochs **cannot** use
+exact resume: the stored `total_steps=38010` would differ from the rebuilt
+`100*1267=126700` and the call would raise `CheckpointError`.
+
+Two viable routes:
+1. **`--weights-only`** from `epoch_030.pt` with `--epochs 100`: starts a fresh
+   optimizer/scheduler at epoch 1 of a 100-epoch cosine. Clean, but discards the
+   optimizer state and re-runs warmup.
+2. **Cold restart at 100 epochs** from scratch: maximally clean single-schedule
+   run, costs the 30 epochs already spent.
+
+Selection between these is a training-budget decision, not a correctness one.
+
+## Clean-split implementation audit — 2026-09-15
+
+- Built schema-v3 manifest `405db7a8706367f8d79ebf03d744d43fddb5068e9d76b978911a43d8adc4b8c1`:
+  10,161 training-pool images collapse to 9,236 SHA-256 split units (549 duplicate
+  groups, 925 redundant slots). Expanded roles are train 7,536, val-select 1,289,
+  val-calibration 1,336; no content group crosses those three roles. The frozen
+  5,502-image test role is byte-identical to v2 and retains 610 images that share
+  content with the training pool, explicitly reported rather than silently moved.
+- Rebuilding in validate-only mode reproduced the same fingerprint exactly. The full
+  test suite passes (152 tests).
+- Diagnostic evaluation of the v2-trained thin checkpoint on v3 val-select produced
+  AP50=0.5450 / AP50:95=0.3344 (1,289 images). **This is not a clean baseline:** 350
+  v3 val-select images (27.15%) were members of v2 `train_new`, so the checkpoint may
+  have trained on them. The number is retained only as evidence that cross-manifest
+  evaluation is invalid. A cold control training run on v3 is required before Phase 6/7
+  comparisons.
+- Completed the Phase-7 multi-scale data path with auditable requested/applied scale.
+  Zoom-out uses padding; zoom-in uses a box-preserving feasible crop. This fixes the
+  incomplete implementation that ignored factors below 1.0 and could drop boxes without
+  synchronising labels. CLI/runtime config remains `--scale-range LOW HIGH`, with
+  `(1.0, 1.0)` as the exact control. The same affine map is now applied to normalized
+  SVG endpoints, arc centres/radii, and arc direction vectors; previously all geometric
+  augmentation (including the pre-existing flips/rotations) moved the raster and boxes
+  but left the dual-pathway stroke coordinates in the original frame.

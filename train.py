@@ -843,6 +843,7 @@ def _build_runtime_config(
             "neg_rare_boost": args.neg_rare_boost,
             "min_overlap": args.min_overlap,
             "negative_query_seed": args.seed,
+            "scale_range": [float(args.scale_range[0]), float(args.scale_range[1])],
         },
         "loader": {
             "batch_size": args.batch_size,
@@ -1047,6 +1048,7 @@ def main(args: argparse.Namespace) -> int:
         vector_branch=vector_branch,
         vector_n_max=vector_n_max,
         vector_seed=args.seed,
+        scale_range=tuple(args.scale_range),
     )
     val_base = FloorPlanQueryDataset(
         args.data_root,
@@ -1607,6 +1609,23 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "Gaussian for sub-cell boxes (33.6% of boxes have radius 0 at "
             "min_overlap=0.7), giving thin objects non-degenerate heatmap "
             "support without changing the trunk resolution."
+        ),
+    )
+    parser.add_argument(
+        "--scale-range",
+        "--scale_range",
+        dest="scale_range",
+        type=float,
+        nargs=2,
+        default=(1.0, 1.0),
+        metavar=("LOW", "HIGH"),
+        help=(
+            "Zoom-crop augmentation range for the training split. A factor z>1 "
+            "keeps 1/z of each side and resizes it to the full canvas, so objects "
+            "appear larger — this lets a sub-stride thin object (stair/ramp, "
+            "median min-side ~5px) sometimes exceed one output cell. "
+            "(1.0, 1.0) disables it. NOTE: a uniform zoom followed by the fixed "
+            "square resize would be a no-op; this crops instead."
         ),
     )
     parser.add_argument(

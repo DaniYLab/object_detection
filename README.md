@@ -1,6 +1,55 @@
-# FloorPlanCAD Object Detection
+# Drawing Understanding from Floor Plans and CAD
 
-Repository này triển khai các baseline **CenterNet stride 8** cho FloorPlanCAD, gồm một detector có thể condition theo class/text và một shared CenterNet control baseline. Code hiện tại dùng CNN trainable của project, `GatedSpatialMixer2D`, self-attention và FFN; không dùng Mamba/SSM, không dùng VAE pretrained và không mặc định có pretrained language semantics.
+Hướng nghiên cứu chính của repository là **đọc bản vẽ thành cấu trúc có thể kiểm chứng**:
+
+```text
+PNG/SVG/CAD
+  -> geometry + symbols + text
+  -> Canonical Drawing Graph (CDG)
+  -> grounded reasoning / executable queries
+  -> answer + graph evidence
+```
+
+Các baseline CenterNet stride 8 trên FloorPlanCAD được giữ làm **symbol-perception baseline**, không còn là mục tiêu cuối. Đích đánh giá chính gồm structural graph, room/region, OCR grounding, relations và executable QA; AP box là một metric thành phần.
+
+Tài liệu nguồn của hướng nghiên cứu:
+
+- [`docs/research/README.md`](docs/research/README.md): trạng thái và thứ tự triển khai.
+- [`docs/research/drawing_understanding_direction_20260915.md`](docs/research/drawing_understanding_direction_20260915.md): đánh giá, kiến trúc và roadmap có cổng go/no-go.
+- [`outputs/drawing_graph/oracle_archcad_100_report.json`](outputs/drawing_graph/oracle_archcad_100_report.json): oracle audit đầu tiên trên dữ liệu ArchCAD thật.
+- [`outputs/drawing_graph/archcad_task_manifest.json`](outputs/drawing_graph/archcad_task_manifest.json): task-selection manifest cho toàn bộ 41.097 chunk; không phải evaluation split.
+- [`outputs/drawing_graph/room_gold_pack_v0.validation.json`](outputs/drawing_graph/room_gold_pack_v0.validation.json): trạng thái kiểm định pack room/connectivity 200 mẫu.
+- [`outputs/drawing_graph/oracle_archcad_floor_plan_100_qa.summary.json`](outputs/drawing_graph/oracle_archcad_floor_plan_100_qa.summary.json): 1.000 executable QA kèm evidence và ranh giới supervision.
+- [`outputs/drawing_graph/archcad_caption_audit.json`](outputs/drawing_graph/archcad_caption_audit.json): audit toàn bộ caption QA đi kèm release.
+- [`outputs/drawing_graph/archcad_provenance_audit.json`](outputs/drawing_graph/archcad_provenance_audit.json): bằng chứng local rằng public release thiếu chunk-to-drawing mapping.
+- [`outputs/drawing_graph/research_gates_v0.json`](outputs/drawing_graph/research_gates_v0.json): tổng hợp machine-readable của gold/agreement/provenance gates.
+- [`docs/research/archcad_provenance_recovery_20260915.md`](docs/research/archcad_provenance_recovery_20260915.md): kết luận phục hồi provenance và contract cần yêu cầu upstream.
+- [`docs/research/structure_bakeoff_protocol.md`](docs/research/structure_bakeoff_protocol.md): protocol/evaluator chung cho deterministic, HEAT-style và RoomFormer-style.
+
+CDG-v0 đã có deterministic ArchCAD compiler, validator và evidence-producing query executor trong `src/drawing_graph/`. ArchCAD object detector 21 lớp vẫn là scaffold phụ; compiler graph cố ý bảo toàn cả wall, beam, grid, foundation, glass và rebar.
+
+## Hướng nghiên cứu chính
+
+1. **P0 — Task/schema/protocol:** CDG-v0, validator, query contract và provenance gate.
+2. **P1 — Oracle graph:** compile semantic CAD primitives trước khi dùng ML.
+3. **P2 — Structural parser:** so sánh geometry rules, HEAT-style graph và polygon decoder.
+4. **P3 — Multitask parser:** structure + symbol + text, raster/vector fusion.
+5. **P4 — Grounded reasoning:** graph/proposal selector + frozen reasoner + deterministic executor.
+6. **P5 — Cross-domain:** FloorPlanCAD, CAD chuẩn hóa và floor plan ngoài tự nhiên/scan.
+
+Chạy oracle audit tái lập:
+
+```bash
+python scripts/research/audit_archcad_graph.py --limit 100 --sample-graphs 5
+```
+
+Không báo cáo generalization trên split ArchCAD hiện tại cho đến khi phục hồi được `source_drawing_id`/project của mỗi chunk.
+
+Mọi topology do heuristic tạo ở CDG-v0 dùng relation namespace `candidate_*`. Overlay audit đã bác bỏ việc coi enclosed wall cycles là room ground truth; chúng hiện chỉ là structural features cho bước phân loại/raster-assisted extraction tiếp theo.
+
+Raster/opening-closure baseline cũng không qua room-oracle gate (33% coverage trên 100 floor-plan candidates, không có occupied-space candidate chắc chắn). Hướng chính hiện chuyển sang review gold pack thủ công và phục hồi provenance; không train room parser bằng pseudo-label này.
+
+Workbench review local đã có tại `tools/room_gold_annotator/`; chạy `python scripts/research/serve_room_gold_annotator.py --open-browser`. Dữ liệu được validate khi lưu, có backup/atomic replace và chỉ record `reviewed` mới được compile thành quan hệ CDG thật.
 
 ## Contracts chính
 

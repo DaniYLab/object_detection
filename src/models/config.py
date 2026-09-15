@@ -116,7 +116,12 @@ class ConditionerConfig:
             "pretrained": "pretrained_text",
         }
         self.kind = aliases.get(self.kind, self.kind)
-        if self.kind not in {"none", "class_embedding", "lightweight_text", "pretrained_text"}:
+        if self.kind not in {
+            "none",
+            "class_embedding",
+            "lightweight_text",
+            "pretrained_text",
+        }:
             raise ValueError(f"unknown conditioner kind: {self.kind}")
         if self.max_length <= 0:
             raise ValueError("max_length must be positive")
@@ -215,7 +220,9 @@ class ModelConfig:
             "baseline": "centernet_baseline",
             "shared_centernet": "centernet_baseline",
         }
-        self.architecture = architecture_aliases.get(self.architecture, self.architecture)
+        self.architecture = architecture_aliases.get(
+            self.architecture, self.architecture
+        )
         if self.architecture not in {
             "floorplan_detector",
             "floorplan_unconditioned",
@@ -223,7 +230,11 @@ class ModelConfig:
         }:
             raise ValueError(f"unknown model architecture: {self.architecture}")
 
-        aliases = {"shared_pathway": "shared", "class": "per_class", "per-class": "per_class"}
+        aliases = {
+            "shared_pathway": "shared",
+            "class": "per_class",
+            "per-class": "per_class",
+        }
         self.pathway_mode = aliases.get(self.pathway_mode, self.pathway_mode)
         if self.pathway_mode not in {"shared", "per_class"}:
             raise ValueError(f"unknown pathway_mode: {self.pathway_mode}")
@@ -232,9 +243,13 @@ class ModelConfig:
         if self.conditioning_stage == "late" and self.conditioner.kind == "none":
             raise ValueError("late conditioning requires a class-specific conditioner")
         if self.output_stride != 8:
-            raise ValueError("FloorPlanDetector currently supports output_stride=8 only")
+            raise ValueError(
+                "FloorPlanDetector currently supports output_stride=8 only"
+            )
         if self.image_size <= 0 or self.image_size % self.output_stride != 0:
-            raise ValueError("image_size must be positive and divisible by output_stride")
+            raise ValueError(
+                "image_size must be positive and divisible by output_stride"
+            )
         if self.head_stride <= 0:
             raise ValueError("head_stride must be positive")
         if self.head_stride not in {4, 8}:
@@ -302,7 +317,9 @@ MODEL_PRESETS: dict[str, ModelConfig] = {}
 PRESET_REGISTRY = MODEL_PRESETS
 
 
-def register_model_preset(name: str, config: ModelConfig, *, overwrite: bool = False) -> None:
+def register_model_preset(
+    name: str, config: ModelConfig, *, overwrite: bool = False
+) -> None:
     """Register a named configuration without exposing mutable shared state."""
     if not name or not isinstance(name, str):
         raise ValueError("preset name must be a non-empty string")
@@ -333,7 +350,9 @@ register_preset = register_model_preset
 register_model_preset("floorplan_base", ModelConfig())
 register_model_preset(
     "floorplan_shared",
-    ModelConfig(pathway_mode="shared", conditioner=ConditionerConfig(kind="class_embedding")),
+    ModelConfig(
+        pathway_mode="shared", conditioner=ConditionerConfig(kind="class_embedding")
+    ),
 )
 register_model_preset(
     "shared_class_embedding_film",
@@ -356,7 +375,9 @@ register_model_preset(
         class_chunk_size=2,
         head_channels=64,
         vae=VAEConfig(latent_channels=32, block_out_channels=(16, 24, 32)),
-        conditioner=ConditionerConfig(kind="lightweight_text", max_length=24, embedding_dim=32),
+        conditioner=ConditionerConfig(
+            kind="lightweight_text", max_length=24, embedding_dim=32
+        ),
     ),
 )
 register_model_preset(
@@ -545,3 +566,21 @@ register_model_preset(
     ),
 )
 
+# ── ArchCAD-400K presets (21 countable object classes) ─────────────────────────
+
+register_model_preset(
+    "archcad_base",
+    ModelConfig(
+        num_classes=21,
+        conditioner=ConditionerConfig(kind="class_embedding"),
+    ),
+)
+
+register_model_preset(
+    "archcad_dual_pathway_thin",
+    ModelConfig(
+        num_classes=21,
+        head_stride=4,
+        vector=VectorBranchConfig(enabled=True, class_conditioned=True),
+    ),
+)

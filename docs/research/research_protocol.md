@@ -1,5 +1,7 @@
 # Research Protocol
 
+> **Status từ 2026-09-15:** protocol chính của repository đã chuyển sang Drawing Understanding/CDG. Xem `docs/research/README.md` và `drawing_understanding_direction_20260915.md`. Các quy tắc detector bên dưới vẫn bắt buộc cho symbol baseline, nhưng AP detector không còn là tiêu chí thành công cuối.
+
 Tài liệu này định nghĩa cách kiểm chứng Conditioned Reflex/Conditioned CenterNet mà không làm rò rỉ test set. Nó là protocol cho các thí nghiệm tương lai; repository không ghi kết quả nếu chưa thực sự chạy training và evaluation.
 
 ## 1. Định nghĩa bài toán

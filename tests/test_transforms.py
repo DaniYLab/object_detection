@@ -68,3 +68,40 @@ def test_eval_resize_normalize_is_deterministic() -> None:
     assert torch.equal(tensor_a, tensor_b)
     assert torch.equal(boxes_a, boxes_b)
     assert torch.equal(boxes_a, torch.tensor([[4.0, 4.0, 20.0, 32.0]]))
+
+
+def test_scale_zoom_out_shrinks_boxes_and_records_factor() -> None:
+    image = Image.new("RGB", (100, 100), "white")
+    transform = PairedTrainTransform(
+        image_size=100,
+        horizontal_flip_probability=0.0,
+        vertical_flip_probability=0.0,
+        rotation_probability=0.0,
+        photometric_probability=0.0,
+        scale_range=(0.5, 0.5),
+        rng=random.Random(3),
+    )
+    _, boxes = transform(image, [[20, 20, 40, 40]])
+    assert torch.allclose(boxes[:, 2:] - boxes[:, :2], torch.tensor([[10.0, 10.0]]))
+    assert transform.last_scale_requested == 0.5
+    assert transform.last_scale_factor == (0.5, 0.5)
+
+
+def test_scale_zoom_in_preserves_all_boxes_and_records_applied_factor() -> None:
+    image = Image.new("RGB", (100, 100), "white")
+    source = torch.tensor([[10.0, 10.0, 30.0, 30.0], [60.0, 60.0, 90.0, 90.0]])
+    transform = PairedTrainTransform(
+        image_size=100,
+        horizontal_flip_probability=0.0,
+        vertical_flip_probability=0.0,
+        rotation_probability=0.0,
+        photometric_probability=0.0,
+        scale_range=(2.0, 2.0),
+        rng=random.Random(7),
+    )
+    _, boxes = transform(image, source)
+    assert boxes.shape == source.shape
+    assert transform.last_scale_requested == 2.0
+    assert 1.0 < transform.last_scale_factor[0] <= 1.25
+    assert 1.0 < transform.last_scale_factor[1] <= 1.25
+    assert bool((boxes[:, 2:] > boxes[:, :2]).all())

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
 import torch
@@ -210,6 +210,13 @@ class PairedTrainTransform(ResizeNormalize):
     Geometry is applied to image and boxes together. Photometric changes never
     alter boxes. Set probabilities to ``0`` or ``1`` and pass a seeded
     ``random.Random`` instance for deterministic synthetic tests.
+
+    ``scale_range`` adds random scale augmentation before the final square
+    resize: the drawing is zoomed by a factor drawn uniformly from the range and
+    the boxes are scaled with it. This is the mechanism that lets a sub-stride
+    thin object (e.g. a stair whose min-side is below one stride-8 output cell)
+    appear sometimes above and sometimes below that cell across epochs. The
+    default ``(1.0, 1.0)`` is a no-op, so existing behaviour is unchanged.
     """
 
     horizontal_flip_probability: float = 0.5
@@ -219,7 +226,20 @@ class PairedTrainTransform(ResizeNormalize):
     brightness: float = 0.10
     contrast: float = 0.10
     saturation: float = 0.05
+    scale_range: tuple[float, float] = (1.0, 1.0)
+    scale_probability: float = 1.0
     rng: random.Random | None = None
+    last_scale_requested: float = field(default=1.0, init=False)
+    last_scale_factor: tuple[float, float] = field(
+        default=(1.0, 1.0), init=False
+    )
+    last_input_size: tuple[int, int] = field(default=(0, 0), init=False)
+    last_output_size: tuple[int, int] = field(default=(0, 0), init=False)
+    last_coordinate_matrix: torch.Tensor = field(
+        default_factory=lambda: torch.eye(3, dtype=torch.float32),
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         for name in (
@@ -227,6 +247,7 @@ class PairedTrainTransform(ResizeNormalize):
             "vertical_flip_probability",
             "rotation_probability",
             "photometric_probability",
+            "scale_probability",
         ):
             value = float(getattr(self, name))
             if not 0 <= value <= 1:
@@ -235,6 +256,13 @@ class PairedTrainTransform(ResizeNormalize):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
+        low, high = (float(self.scale_range[0]), float(self.scale_range[1]))
+        if not (math.isfinite(low) and math.isfinite(high)):
+            raise ValueError("scale_range bounds must be finite")
+        if low <= 0 or high <= 0:
+            raise ValueError("scale_range bounds must be positive")
+        if low > high:
+            raise ValueError(f"scale_range low must be <= high, got {self.scale_range}")
 
     def _random(self) -> random.Random:
         # The module implements the same random()/uniform()/choice API.
@@ -249,15 +277,30 @@ class PairedTrainTransform(ResizeNormalize):
         transformed_boxes = as_boxes(boxes)
         validate_half_open_boxes(transformed_boxes, image.size)
         rng = self._random()
+        self.last_input_size = image.size
+        coordinate_matrix = torch.eye(3, dtype=torch.float32)
+
+        def compose(matrix: Sequence[Sequence[float]]) -> None:
+            nonlocal coordinate_matrix
+            coordinate_matrix = torch.tensor(matrix, dtype=torch.float32) @ coordinate_matrix
 
         if rng.random() < self.horizontal_flip_probability:
+            compose(((-1, 0, image.width), (0, 1, 0), (0, 0, 1)))
             transformed_boxes = horizontal_flip_boxes(transformed_boxes, image.width)
             image = TF.hflip(image)
         if rng.random() < self.vertical_flip_probability:
+            compose(((1, 0, 0), (0, -1, image.height), (0, 0, 1)))
             transformed_boxes = vertical_flip_boxes(transformed_boxes, image.height)
             image = TF.vflip(image)
         if rng.random() < self.rotation_probability:
             k = rng.choice((1, 2, 3))
+            old_w, old_h = image.size
+            rotation_matrices = {
+                1: ((0, -1, old_h), (1, 0, 0), (0, 0, 1)),
+                2: ((-1, 0, old_w), (0, -1, old_h), (0, 0, 1)),
+                3: ((0, 1, 0), (-1, 0, old_w), (0, 0, 1)),
+            }
+            compose(rotation_matrices[k])
             transformed_boxes, expected_size = rotate_boxes_90(
                 transformed_boxes, image.size, k
             )
@@ -279,11 +322,93 @@ class PairedTrainTransform(ResizeNormalize):
                     image, rng.uniform(max(0.0, 1.0 - self.saturation), 1.0 + self.saturation)
                 )
 
+        # A uniform resize followed by the fixed square resize below would be a
+        # mathematical no-op. Change the field of view instead: z > 1 crops and
+        # magnifies, while z < 1 pads and shrinks. Crops are constrained to retain
+        # every supplied box, preserving the transform's image/annotation contract.
+        self.last_scale_requested = 1.0
+        self.last_scale_factor = (1.0, 1.0)
+        if self.scale_probability > 0 and rng.random() < self.scale_probability:
+            low, high = float(self.scale_range[0]), float(self.scale_range[1])
+            requested = rng.uniform(low, high)
+            self.last_scale_requested = requested
+            width, height = image.size
+            if requested < 1.0:
+                canvas_w = max(width, int(round(width / requested)))
+                canvas_h = max(height, int(round(height / requested)))
+                left = rng.randint(0, canvas_w - width)
+                top = rng.randint(0, canvas_h - height)
+                image = TF.pad(
+                    image,
+                    [left, top, canvas_w - width - left, canvas_h - height - top],
+                    fill=255,
+                )
+                compose(((1, 0, left), (0, 1, top), (0, 0, 1)))
+                transformed_boxes = transformed_boxes + torch.tensor(
+                    [left, top, left, top], dtype=transformed_boxes.dtype
+                )
+                self.last_scale_factor = (width / canvas_w, height / canvas_h)
+            elif requested > 1.0:
+                # Reduce an infeasible zoom until the complete box extent fits.
+                feasible = requested
+                if transformed_boxes.numel():
+                    extent_w = float(
+                        transformed_boxes[:, 2].max()
+                        - transformed_boxes[:, 0].min()
+                    )
+                    extent_h = float(
+                        transformed_boxes[:, 3].max()
+                        - transformed_boxes[:, 1].min()
+                    )
+                    if extent_w > 0:
+                        feasible = min(feasible, width / extent_w)
+                    if extent_h > 0:
+                        feasible = min(feasible, height / extent_h)
+                feasible = max(1.0, feasible)
+                crop_w = min(width, max(1, int(math.ceil(width / feasible))))
+                crop_h = min(height, max(1, int(math.ceil(height / feasible))))
+
+                if transformed_boxes.numel():
+                    min_x = float(transformed_boxes[:, 0].min())
+                    min_y = float(transformed_boxes[:, 1].min())
+                    max_x = float(transformed_boxes[:, 2].max())
+                    max_y = float(transformed_boxes[:, 3].max())
+                    left_min = max(0, int(math.ceil(max_x - crop_w)))
+                    left_max = min(width - crop_w, int(math.floor(min_x)))
+                    top_min = max(0, int(math.ceil(max_y - crop_h)))
+                    top_max = min(height - crop_h, int(math.floor(min_y)))
+                else:
+                    left_min, left_max = 0, width - crop_w
+                    top_min, top_max = 0, height - crop_h
+                # Rounding can make a theoretically feasible crop one pixel too
+                # small. In that case retain the original field of view.
+                if left_min <= left_max and top_min <= top_max:
+                    left = rng.randint(left_min, left_max)
+                    top = rng.randint(top_min, top_max)
+                    image = TF.crop(image, top, left, crop_h, crop_w)
+                    compose(((1, 0, -left), (0, 1, -top), (0, 0, 1)))
+                    transformed_boxes = transformed_boxes - torch.tensor(
+                        [left, top, left, top], dtype=transformed_boxes.dtype
+                    )
+                    self.last_scale_factor = (width / crop_w, height / crop_h)
+
+            validate_half_open_boxes(transformed_boxes, image.size)
+
         old_size = image.size
         height, width = self.output_size()
         image = TF.resize(image, [height, width], antialias=self.antialias)
+        compose(
+            (
+                (width / old_size[0], 0, 0),
+                (0, height / old_size[1], 0),
+                (0, 0, 1),
+            )
+        )
+        self.last_output_size = (width, height)
+        self.last_coordinate_matrix = coordinate_matrix
         transformed_boxes = resize_boxes(transformed_boxes, old_size, (width, height))
-        validate_half_open_boxes(transformed_boxes, (width, height))
+        if transformed_boxes.numel():
+            validate_half_open_boxes(transformed_boxes, (width, height))
         return _normalize_tensor(image, self.mean, self.std), transformed_boxes
 
 

@@ -64,6 +64,68 @@ def normalize_strokes(
     return tensor / scale
 
 
+def transform_normalized_strokes(
+    tokens: torch.Tensor,
+    coordinate_matrix: torch.Tensor,
+    input_size: Sequence[int],
+    output_size: Sequence[int],
+) -> torch.Tensor:
+    """Apply an image transform's affine map to normalized stroke tokens.
+
+    Endpoints, arc centres, radii, and arc direction vectors are updated so the
+    vector pathway stays aligned with the augmented raster image. Coordinates
+    outside a crop remain outside ``[0, 1]`` intentionally; this retains lines
+    crossing a crop boundary instead of inventing clipped SVG primitives.
+    """
+
+    if tokens.ndim != 2 or tokens.shape[1] != STROKE_FEATURE_DIM:
+        raise ValueError(
+            f"tokens must have shape [N, {STROKE_FEATURE_DIM}], got {tuple(tokens.shape)}"
+        )
+    if tokens.numel() == 0:
+        return tokens.clone()
+    if coordinate_matrix.shape != (3, 3):
+        raise ValueError("coordinate_matrix must have shape [3, 3]")
+    in_w, in_h = float(input_size[0]), float(input_size[1])
+    out_w, out_h = float(output_size[0]), float(output_size[1])
+    if min(in_w, in_h, out_w, out_h) <= 0:
+        raise ValueError("input and output dimensions must be positive")
+
+    result = tokens.clone()
+    matrix = coordinate_matrix.to(dtype=result.dtype, device=result.device)
+    arcs = result[:, 6] != 0
+
+    def mapped_points(values: torch.Tensor) -> torch.Tensor:
+        pixels = values * result.new_tensor([in_w, in_h])
+        homogeneous = torch.cat(
+            [
+                pixels,
+                torch.ones(
+                    (pixels.shape[0], 1),
+                    dtype=result.dtype,
+                    device=result.device,
+                ),
+            ],
+            dim=1,
+        )
+        return (homogeneous @ matrix.T)[:, :2] / result.new_tensor([out_w, out_h])
+
+    result[:, 0:2] = mapped_points(result[:, 0:2])
+    result[:, 2:4] = mapped_points(result[:, 2:4])
+    if bool(arcs.any()):
+        result[arcs, 4:6] = mapped_points(result[arcs, 4:6])
+        linear = matrix[:2, :2]
+        radius_scale = torch.sqrt(torch.abs(torch.linalg.det(linear)))
+        result[arcs, 6] *= (
+            math.sqrt(in_w * in_h) * radius_scale / math.sqrt(out_w * out_h)
+        )
+        for start in (7, 9):
+            directions = result[arcs, start : start + 2] @ linear.T
+            directions = directions / directions.norm(dim=1, keepdim=True).clamp_min(1e-12)
+            result[arcs, start : start + 2] = directions
+    return result
+
+
 def stroke_type_ids(strokes: Sequence[Sequence[float]]) -> torch.Tensor:
     """Return ``[N]`` long tensor of type ids (0=line, 1=arc).
 

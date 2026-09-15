@@ -25,6 +25,7 @@ from src.data.strokes import (
     normalize_strokes,
     pad_stroke_batch,
     sample_strokes,
+    transform_normalized_strokes,
 )
 from src.data.splits import (
     ImageRecord,
@@ -50,11 +51,20 @@ SPLIT_DIRS = {
 }
 
 
-def _default_transform(image_size: int = 512, split: str = "test") -> Callable[..., object]:
-    """Return paired random train or deterministic evaluation preprocessing."""
+def _default_transform(
+    image_size: int = 512,
+    split: str = "test",
+    scale_range: tuple[float, float] = (1.0, 1.0),
+) -> Callable[..., object]:
+    """Return paired random train or deterministic evaluation preprocessing.
+
+    ``scale_range`` enables zoom-crop augmentation on the training split only; it
+    is ignored for deterministic evaluation transforms. ``(1.0, 1.0)`` disables
+    it, so the default is unchanged behaviour.
+    """
 
     if split in {"train", "train_new"}:
-        return PairedTrainTransform(image_size=image_size)
+        return PairedTrainTransform(image_size=image_size, scale_range=scale_range)
     return ResizeNormalize(image_size=image_size)
 
 
@@ -138,10 +148,12 @@ class FloorPlanImageDataset(Dataset):
         records: list[ImageRecord] | None = None,
         vector_branch: bool = False,
         vector_n_max: int = 1024,
+        scale_range: tuple[float, float] = (1.0, 1.0),
     ) -> None:
         self.root = Path(root)
         self.requested_split = split
         self.image_size = int(image_size)
+        self.scale_range = (float(scale_range[0]), float(scale_range[1]))
         if self.image_size <= 0:
             raise ValueError("image_size must be positive")
         selected_manifest = resolve_split_manifest_path(self.root, manifest_path)
@@ -150,7 +162,9 @@ class FloorPlanImageDataset(Dataset):
             self.split = canonical_split_role(manifest, split)
         else:
             self.split = _canonical_split_without_manifest(split)
-        self.transform = transform or _default_transform(self.image_size, self.split)
+        self.transform = transform or _default_transform(
+            self.image_size, self.split, self.scale_range
+        )
         self.strict_metadata = strict_metadata
         self.vector_branch = vector_branch
         self.vector_n_max = int(vector_n_max)
@@ -288,10 +302,12 @@ class FloorPlanQueryDataset(Dataset):
         vector_branch: bool = False,
         vector_n_max: int = 1024,
         vector_seed: int = 0,
+        scale_range: tuple[float, float] = (1.0, 1.0),
     ) -> None:
         self.root = Path(root)
         self.requested_split = split
         self.image_size = int(image_size)
+        self.scale_range = (float(scale_range[0]), float(scale_range[1]))
         self.output_stride = int(output_stride)
         self.neg_rare_boost = bool(neg_rare_boost)
         if self.image_size <= 0:
@@ -319,7 +335,9 @@ class FloorPlanQueryDataset(Dataset):
         if self.head_stride > self.output_stride:
             raise ValueError("head_stride must be <= output_stride (a finer head upsamples the trunk)")
         self.head_size = self.image_size // self.head_stride
-        self.transform = transform or _default_transform(self.image_size, self.split)
+        self.transform = transform or _default_transform(
+            self.image_size, self.split, self.scale_range
+        )
         self.strict_metadata = strict_metadata
         self.collision_policy = collision_policy
         self.min_overlap = min_overlap
@@ -587,12 +605,34 @@ class FloorPlanQueryDataset(Dataset):
             "boxes": boxes,
             "target_stats": target_stats,
             "original_size": original_size,
+            "scale_factor": tuple(
+                float(value)
+                for value in getattr(self.transform, "last_scale_factor", (1.0, 1.0))
+            ),
+            "scale_requested": float(
+                getattr(self.transform, "last_scale_requested", 1.0)
+            ),
         }
         if self.vector_branch:
             # Stochastic per-epoch subsampling: drawings above n_max see a
             # different primitive subset each epoch (free augmentation).
+            stroke_tokens = self._load_stroke_tokens(metadata_path)
+            coordinate_matrix = getattr(self.transform, "last_coordinate_matrix", None)
+            transform_input_size = getattr(self.transform, "last_input_size", None)
+            transform_output_size = getattr(self.transform, "last_output_size", None)
+            if (
+                isinstance(coordinate_matrix, torch.Tensor)
+                and transform_input_size
+                and transform_output_size
+            ):
+                stroke_tokens = transform_normalized_strokes(
+                    stroke_tokens,
+                    coordinate_matrix,
+                    transform_input_size,
+                    transform_output_size,
+                )
             sample["stroke_tokens"] = sample_strokes(
-                self._load_stroke_tokens(metadata_path),
+                stroke_tokens,
                 self.vector_n_max,
                 generator=self._stroke_rng,
             )
@@ -618,6 +658,8 @@ def query_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "boxes": [sample["boxes"] for sample in batch],
         "target_stats": [sample["target_stats"] for sample in batch],
         "original_sizes": [sample["original_size"] for sample in batch],
+        "scale_factors": [sample.get("scale_factor", (1.0, 1.0)) for sample in batch],
+        "scales_requested": [sample.get("scale_requested", 1.0) for sample in batch],
     }
     if any("stroke_tokens" in sample for sample in batch):
         tokens, valid = pad_stroke_batch(

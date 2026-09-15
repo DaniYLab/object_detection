@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Room Gold Annotator</title>
+  <style>
+    :root { color-scheme: dark; --bg:#111827; --panel:#1f2937; --line:#374151; --text:#f3f4f6; --muted:#9ca3af; --accent:#38bdf8; --danger:#fb7185; --ok:#4ade80; }
+    * { box-sizing:border-box; }
+    body { margin:0; font:14px/1.4 system-ui,sans-serif; background:var(--bg); color:var(--text); }
+    header { height:54px; display:flex; align-items:center; gap:10px; padding:8px 14px; border-bottom:1px solid var(--line); background:#0b1220; }
+    header strong { font-size:16px; margin-right:auto; }
+    button, select, input, textarea { color:var(--text); background:#111827; border:1px solid #4b5563; border-radius:6px; padding:7px 9px; }
+    button { cursor:pointer; } button:hover { border-color:var(--accent); } button:disabled { opacity:.45; cursor:not-allowed; }
+    button.primary { background:#0369a1; border-color:#0ea5e9; } button.danger { color:#fecdd3; border-color:#9f1239; }
+    main { display:grid; grid-template-columns:minmax(500px,1fr) 390px; height:calc(100vh - 54px); }
+    .stage { display:flex; align-items:center; justify-content:center; min-width:0; overflow:auto; padding:14px; background:#0f172a; }
+    canvas { max-width:100%; max-height:calc(100vh - 82px); background:white; box-shadow:0 8px 28px #0008; cursor:crosshair; }
+    aside { overflow:auto; padding:14px; border-left:1px solid var(--line); background:var(--panel); }
+    section { padding:12px 0; border-bottom:1px solid var(--line); }
+    section:first-child { padding-top:0; }
+    h2 { margin:0 0 9px; font-size:14px; }
+    label { display:block; color:var(--muted); margin:8px 0 4px; font-size:12px; }
+    select, input, textarea { width:100%; } textarea { min-height:64px; resize:vertical; }
+    .row { display:flex; gap:8px; align-items:center; } .row > * { flex:1; }
+    .toolbar { display:flex; flex-wrap:wrap; gap:7px; margin-top:8px; }
+    .toolbar button { flex:1; min-width:95px; }
+    .small { color:var(--muted); font-size:12px; }
+    .badge { display:inline-block; padding:2px 7px; border:1px solid var(--line); border-radius:999px; color:var(--muted); }
+    .list { display:grid; gap:6px; max-height:180px; overflow:auto; }
+    .item { display:flex; align-items:center; gap:8px; padding:7px; border:1px solid var(--line); border-radius:6px; }
+    .item.selected { border-color:var(--accent); background:#0c4a6e55; }
+    .item button { margin-left:auto; padding:3px 7px; }
+    #message { min-width:240px; color:var(--muted); text-align:right; }
+    #message.ok { color:var(--ok); } #message.error { color:var(--danger); }
+    #dirty { color:#fbbf24; display:none; }
+    kbd { border:1px solid #4b5563; border-bottom-width:2px; border-radius:4px; padding:1px 4px; font-size:11px; }
+    @media (max-width:980px) { main { grid-template-columns:1fr; height:auto; } aside { border-left:0; border-top:1px solid var(--line); } .stage { min-height:60vh; } }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>Room Gold Annotator <span id="dirty">● chưa lưu</span></strong>
+    <button id="prev">← Trước</button>
+    <input id="jump" type="number" min="1" value="1" style="width:84px">
+    <span id="counter">/ 0</span>
+    <button id="next">Sau →</button>
+    <button id="save" class="primary">Lưu <kbd>Ctrl S</kbd></button>
+    <span id="message">Đang tải…</span>
+  </header>
+  <main>
+    <div class="stage"><canvas id="canvas" width="980" height="980"></canvas></div>
+    <aside>
+      <section>
+        <h2>Record</h2>
+        <div id="imageId" class="small"></div>
+        <div class="row">
+          <div><label>View type</label><select id="viewType"><option value="">— chọn —</option><option>floor_plan</option><option>non_floor_plan</option><option>ambiguous</option></select></div>
+          <div><label>Review status</label><select id="reviewStatus"><option>unreviewed</option><option>in_progress</option><option>reviewed</option><option>rejected</option></select></div>
+        </div>
+        <label>Reviewer</label><input id="reviewer" placeholder="Tên/người duyệt">
+        <label>Notes</label><textarea id="notes"></textarea>
+        <label><input id="showHints" type="checkbox" checked style="width:auto"> Hiện candidate hints <span class="badge">không phải ground truth</span></label>
+      </section>
+
+      <section>
+        <h2>Regions</h2>
+        <div class="row">
+          <select id="regionType"><option>room</option><option>corridor</option><option>vertical_core</option><option>shaft</option><option>void</option><option>other</option></select>
+          <button id="startRegion">Vẽ polygon</button>
+        </div>
+        <div class="toolbar">
+          <button id="undoPoint">Undo point</button>
+          <button id="finishRegion" class="primary">Đóng polygon</button>
+          <button id="cancelRegion">Hủy nét</button>
+        </div>
+        <p class="small">Bấm trên ảnh để thêm đỉnh. Polygon phải là free-space, không phải thân tường.</p>
+        <div id="regions" class="list"></div>
+      </section>
+
+      <section>
+        <h2>Connectivity</h2>
+        <div class="row"><select id="relSource"></select><select id="relTarget"></select></div>
+        <label>Door instance</label><select id="relDoor"></select>
+        <button id="addRelation" style="width:100%;margin-top:8px">Thêm connected_by</button>
+        <div id="relations" class="list" style="margin-top:8px"></div>
+      </section>
+
+      <section class="small">
+        <b>Quy tắc:</b> chỉ đặt <code>reviewed</code> sau khi chọn view type và điền reviewer. Cửa nối ra ngoài crop chỉ ghi notes. Server tạo backup ở lần lưu đầu và từ chối ghi đè phiên bản mới hơn.
+      </section>
+    </aside>
+  </main>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const canvas = $('canvas'), ctx = canvas.getContext('2d');
+    const state = { index:0, count:0, record:null, version:null, image:null, doors:[], drawing:false, draft:[], selected:null, dirty:false };
+    const colors = {room:'#22c55e',corridor:'#38bdf8',vertical_core:'#f59e0b',shaft:'#a78bfa',void:'#f43f5e',other:'#e5e7eb'};
+
+    function message(text, kind='') { $('message').textContent=text; $('message').className=kind; }
+    function markDirty() { state.dirty=true; $('dirty').style.display='inline'; }
+    function clean() { state.dirty=false; $('dirty').style.display='none'; }
+    function esc(text) { return String(text).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+    function annotation() { return state.record.annotation; }
+
+    async function loadRecord(index, force=false) {
+      if (!force && state.dirty && !confirm('Record hiện tại chưa lưu. Bỏ thay đổi?')) return;
+      index=Math.max(0,Math.min(state.count ? state.count-1 : index,index));
+      message('Đang tải…');
+      const response=await fetch(`/api/record/${index}`);
+      const data=await response.json();
+      if (!response.ok) { message(data.error || 'Không tải được','error'); return; }
+      state.index=data.index; state.count=data.record_count; state.record=data.record; state.version=data.version; state.doors=data.door_instance_ids;
+      state.drawing=false; state.draft=[]; state.selected=null;
+      $('jump').value=state.index+1; $('counter').textContent=`/ ${state.count}`;
+      $('imageId').textContent=state.record.image_id;
+      $('viewType').value=annotation().view_type || '';
+      $('reviewStatus').value=state.record.review_status;
+      $('reviewer').value=state.record.reviewer || '';
+      $('notes').value=annotation().notes || '';
+      state.image=new Image();
+      state.image.onload=()=>{ canvas.width=state.image.naturalWidth; canvas.height=state.image.naturalHeight; draw(); };
+      state.image.onerror=()=>message('Không tải được PNG','error');
+      state.image.src=`/api/image/${encodeURIComponent(state.record.image_id)}?v=${Date.now()}`;
+      clean(); renderLists(); message(`Đã tải #${state.index+1}`,'ok');
+    }
+
+    function syncForm() {
+      state.record.review_status=$('reviewStatus').value;
+      state.record.reviewer=$('reviewer').value.trim() || null;
+      annotation().view_type=$('viewType').value || null;
+      annotation().notes=$('notes').value;
+    }
+
+    async function save() {
+      syncForm(); message('Đang lưu…');
+      const response=await fetch(`/api/record/${state.index}`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:state.version,review_status:state.record.review_status,reviewer:state.record.reviewer,annotation:annotation()})});
+      const data=await response.json();
+      if (!response.ok) { message(data.error || 'Lưu thất bại','error'); return; }
+      state.record=data.record; state.version=data.version; clean();
+      message(`Đã lưu · reviewed ${data.summary.reviewed_count}/${data.summary.record_count}`,'ok');
+    }
+
+    function draw() {
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      if (state.image) ctx.drawImage(state.image,0,0,canvas.width,canvas.height);
+      if (!state.record) return;
+      if ($('showHints').checked) {
+        ctx.save(); ctx.strokeStyle='#f59e0b'; ctx.lineWidth=2; ctx.setLineDash([7,5]);
+        for (const hint of (state.record.preannotations?.regions || [])) { const [x0,y0,x1,y1]=hint.bbox; ctx.strokeRect(x0,y0,x1-x0,y1-y0); }
+        ctx.restore();
+      }
+      for (const region of annotation().regions) drawPolygon(region.polygon, colors[region.type] || '#fff', region.id===state.selected, region.id);
+      if (state.draft.length) drawPolygon(state.draft,'#facc15',true,'đang vẽ',false);
+    }
+
+    function drawPolygon(points,color,selected,label,closed=true) {
+      if (!points.length) return;
+      ctx.save(); ctx.beginPath(); ctx.moveTo(points[0][0],points[0][1]); for (const p of points.slice(1)) ctx.lineTo(p[0],p[1]); if (closed && points.length>2) ctx.closePath();
+      ctx.strokeStyle=color; ctx.lineWidth=selected?4:2; ctx.stroke();
+      if (closed && points.length>2) { ctx.fillStyle=color+'26'; ctx.fill(); }
+      ctx.fillStyle=color; for (const [x,y] of points) { ctx.beginPath(); ctx.arc(x,y,selected?5:3,0,Math.PI*2); ctx.fill(); }
+      ctx.font='14px system-ui'; ctx.fillText(label,points[0][0]+6,points[0][1]-6); ctx.restore();
+    }
+
+    function renderLists() {
+      if (!state.record) return;
+      $('regions').innerHTML=annotation().regions.map(r=>`<div class="item ${r.id===state.selected?'selected':''}" data-region="${esc(r.id)}"><span style="color:${colors[r.type]}">●</span><span>${esc(r.id)} · ${esc(r.type)} · ${r.polygon.length} đỉnh</span><button class="danger" data-delete-region="${esc(r.id)}">Xóa</button></div>`).join('') || '<span class="small">Chưa có region.</span>';
+      for (const element of document.querySelectorAll('[data-region]')) element.onclick=e=>{ if (e.target.dataset.deleteRegion) return; state.selected=element.dataset.region; renderLists(); draw(); };
+      for (const element of document.querySelectorAll('[data-delete-region]')) element.onclick=()=>deleteRegion(element.dataset.deleteRegion);
+      const options=annotation().regions.map(r=>`<option value="${esc(r.id)}">${esc(r.id)}</option>`).join('');
+      $('relSource').innerHTML=options; $('relTarget').innerHTML=options;
+      $('relDoor').innerHTML=state.doors.map(id=>`<option value="${esc(id)}">${esc(id)}</option>`).join('') || '<option value="">Không có door instance</option>';
+      $('relations').innerHTML=annotation().relations.map((r,i)=>`<div class="item"><span>${esc(r.source)} → ${esc(r.target)}<br><small>${esc(r.door_instance_id)}</small></span><button class="danger" data-delete-relation="${i}">Xóa</button></div>`).join('') || '<span class="small">Chưa có relation.</span>';
+      for (const element of document.querySelectorAll('[data-delete-relation]')) element.onclick=()=>{ annotation().relations.splice(Number(element.dataset.deleteRelation),1); markDirty(); renderLists(); };
+    }
+
+    function nextRegionId() {
+      const used=new Set(annotation().regions.map(r=>r.id)); let n=1; while (used.has(`region:${String(n).padStart(3,'0')}`)) n++; return `region:${String(n).padStart(3,'0')}`;
+    }
+    function deleteRegion(id) {
+      annotation().regions=annotation().regions.filter(r=>r.id!==id);
+      annotation().relations=annotation().relations.filter(r=>r.source!==id && r.target!==id);
+      if (state.selected===id) state.selected=null; markDirty(); renderLists(); draw();
+    }
+
+    canvas.addEventListener('click', event=>{
+      if (!state.drawing) return;
+      const rect=canvas.getBoundingClientRect();
+      state.draft.push([Math.round((event.clientX-rect.left)*canvas.width/rect.width),Math.round((event.clientY-rect.top)*canvas.height/rect.height)]);
+      draw();
+    });
+    $('startRegion').onclick=()=>{ if ($('viewType').value!=='floor_plan') { message('Chọn view_type=floor_plan trước','error'); return; } state.drawing=true; state.draft=[]; message('Bấm các đỉnh polygon trên ảnh'); };
+    $('undoPoint').onclick=()=>{ state.draft.pop(); draw(); };
+    $('cancelRegion').onclick=()=>{ state.drawing=false; state.draft=[]; draw(); };
+    $('finishRegion').onclick=()=>{ if (state.draft.length<3) { message('Polygon cần ít nhất 3 đỉnh','error'); return; } annotation().regions.push({id:nextRegionId(),type:$('regionType').value,polygon:state.draft}); state.drawing=false; state.draft=[]; markDirty(); renderLists(); draw(); };
+    $('addRelation').onclick=()=>{ const source=$('relSource').value,target=$('relTarget').value,door=$('relDoor').value; if (!source||!target||source===target||!door) { message('Chọn hai region khác nhau và một door instance','error'); return; } annotation().relations.push({relation:'connected_by',source,target,door_instance_id:door}); markDirty(); renderLists(); };
+    $('showHints').onchange=draw;
+    for (const id of ['viewType','reviewStatus','reviewer','notes']) $(id).addEventListener('input',markDirty);
+    $('prev').onclick=()=>loadRecord(state.index-1); $('next').onclick=()=>loadRecord(state.index+1);
+    $('jump').onchange=()=>loadRecord(Number($('jump').value)-1); $('save').onclick=save;
+    document.addEventListener('keydown',event=>{ if ((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='s') { event.preventDefault(); save(); } });
+    window.addEventListener('beforeunload',event=>{ if (state.dirty) { event.preventDefault(); event.returnValue=''; } });
+    loadRecord(0,true).catch(error=>message(error.message,'error'));
+  </script>
+</body>
+</html>

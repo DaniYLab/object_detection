@@ -13,6 +13,7 @@ from src.data.strokes import (
     pad_stroke_batch,
     sample_strokes,
     stroke_type_ids,
+    transform_normalized_strokes,
 )
 from src.models import build_model
 from src.models.config import ModelConfig, VectorBranchConfig
@@ -58,6 +59,23 @@ class TestNormalizeStrokes:
     def test_rejects_bad_image_size(self) -> None:
         with pytest.raises(ValueError):
             normalize_strokes([[0.0] * 12], (0, 100))
+
+
+def test_transform_normalized_strokes_tracks_flip_and_resize() -> None:
+    tokens = torch.tensor(
+        [[0.1, 0.2, 0.3, 0.4, 0.2, 0.3, 0.1, 1.0, 0.0, 0.0, 1.0, 0.0]]
+    )
+    # Horizontal flip in 100x100, then resize to 200x200.
+    matrix = torch.tensor(
+        [[-2.0, 0.0, 200.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+    result = transform_normalized_strokes(tokens, matrix, (100, 100), (200, 200))
+    assert torch.allclose(
+        result[0, :6], torch.tensor([0.9, 0.2, 0.7, 0.4, 0.8, 0.3])
+    )
+    assert result[0, 6] == pytest.approx(0.1)
+    assert torch.allclose(result[0, 7:9], torch.tensor([-1.0, 0.0]))
+    assert torch.allclose(result[0, 9:11], torch.tensor([0.0, 1.0]))
 
 
 class TestStrokeTypeIds:

@@ -10,6 +10,7 @@ gdown>=5.1.0              # Google Drive download
 
 # ─── Scientific Computing ─────────────────────────────────────────────────────
 numpy>=1.26.0
+scipy>=1.13.0              # connected components / morphology for structural region research
 
 # ─── Logging & Visualization ──────────────────────────────────────────────────
 matplotlib>=3.9.0

@@ -17,6 +17,12 @@ env/
 # Data — không push lên (quá lớn, hàng chục GB)
 /data/
 
+# Local research/download caches and one-off Colab recovery helpers
+/.colab/
+/note.txt
+/scripts/colab_*.py
+/docs/research/**/*.pdf
+
 # Model checkpoints
 checkpoints/
 *.pt

@@ -1,0 +1,33 @@
+from scripts.research.audit_drawing_research_gates import evaluate_gates
+
+
+def test_research_gates_require_gold_agreement_and_provenance():
+    blocked = evaluate_gates(
+        {"valid": True, "reviewed_floor_plan_count": 0},
+        {
+            "common_record_count": 40,
+            "eligible_review_pair_count": 0,
+            "agreement_gate_pass_count": 0,
+        },
+        {
+            "source_drawing_id_available": False,
+            "drawing_disjoint_split_possible": False,
+        },
+    )
+    ready = evaluate_gates(
+        {"valid": True, "reviewed_floor_plan_count": 100},
+        {
+            "common_record_count": 40,
+            "eligible_review_pair_count": 40,
+            "agreement_gate_pass_count": 40,
+        },
+        {
+            "source_drawing_id_available": True,
+            "drawing_disjoint_split_possible": True,
+        },
+    )
+
+    assert blocked["structure_bakeoff_ready"] is False
+    assert blocked["publication_evaluation_ready"] is False
+    assert ready["structure_bakeoff_ready"] is True
+    assert ready["publication_evaluation_ready"] is True
