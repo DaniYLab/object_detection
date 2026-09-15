@@ -1,5 +1,9 @@
 # ArchCAD direct-ground-truth bake-off protocol v1
 
+> **Superseded:** evaluator geometry/junction này chỉ là exploratory diagnostic.
+> Benchmark chính là primitive-level semantic/instance/panoptic protocol tại
+> `archcad_benchmark_protocol.md`; không dùng file này để chọn model.
+
 ## Scope
 
 The primary bake-off uses ground truth already present in ArchCAD:

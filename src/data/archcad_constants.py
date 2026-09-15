@@ -83,6 +83,53 @@ for raw_id, raw_name in ARCHCAD_RAW_SEMANTIC_NAMES.items():
 
 NUM_ARCHCAD_CLASSES = len(ARCHCAD_COUNTABLE_CLASSES)  # 21 classes
 
+# Official DPSS release contract (`configs/svg/svg_pointT.yaml` and
+# `svgnet/evaluation/point_wise_eval.py`).  Raw semantic 100 (``others``) is
+# mapped to the background/ignore index 30 by the benchmark adapter.
+NUM_ARCHCAD_SEMANTIC_CLASSES = 30
+ARCHCAD_IGNORE_LABEL = 30
+ARCHCAD_THING_SEMANTIC_IDS: tuple[int, ...] = (
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    14,
+    15,
+    16,
+    17,
+    18,
+    21,
+    22,
+    25,
+    27,
+    29,
+)
+ARCHCAD_STUFF_SEMANTIC_IDS: tuple[int, ...] = (
+    0,
+    12,
+    13,
+    19,
+    20,
+    23,
+    24,
+    26,
+    28,
+)
+
+if set(ARCHCAD_THING_SEMANTIC_IDS) & set(ARCHCAD_STUFF_SEMANTIC_IDS):
+    raise RuntimeError("ArchCAD thing/stuff taxonomy must be disjoint")
+if set(ARCHCAD_THING_SEMANTIC_IDS) | set(ARCHCAD_STUFF_SEMANTIC_IDS) != set(
+    range(NUM_ARCHCAD_SEMANTIC_CLASSES)
+):
+    raise RuntimeError("ArchCAD thing/stuff taxonomy must cover semantic IDs 0..29")
+
 # Native ArchCAD slice properties
 ARCHCAD_IMAGE_SIZE = (980, 980)  # Native slice resolution (W, H)
 ARCHCAD_PHYSICAL_SIZE_M = 14.0  # 14m x 14m physical chunk size

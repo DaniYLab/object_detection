@@ -1,55 +1,44 @@
-# Drawing Understanding from Floor Plans and CAD
+# ArchCAD Panoptic Symbol Spotting Research
 
-Hướng nghiên cứu chính của repository là **đọc bản vẽ thành cấu trúc có thể kiểm chứng**:
+Nghiên cứu bắt đầu từ giả thuyết **phản xạ có điều kiện và không điều kiện**:
+một pathway đọc toàn bộ bản vẽ, còn tín hiệu condition hướng sự chú ý vào class/
+đối tượng cần phân biệt. FloorPlanCAD CenterNet là bài kiểm chứng đầu tiên; mục
+tiêu dài hạn là đọc toàn bộ object trong bản vẽ và khôi phục kích thước từ
+primitive geometry.
+
+Ưu tiên hiện tại là tái lập benchmark ArchCAD-400K trước khi brainstorm kiến
+trúc mới:
 
 ```text
-PNG/SVG/CAD
-  -> geometry + symbols + text
-  -> Canonical Drawing Graph (CDG)
-  -> grounded reasoning / executable queries
-  -> answer + graph evidence
+ArchCAD raster + vector primitives
+  -> per-primitive semantic prediction
+  -> primitive-mask instance prediction
+  -> panoptic thing/stuff merge
+  -> F1/wF1 + AP50/AP75/mAP + PQ/SQ/RQ
+  -> object geometry/dimensions (downstream, deterministic)
 ```
 
-Các baseline CenterNet stride 8 trên FloorPlanCAD được giữ làm **symbol-perception baseline**, không còn là mục tiêu cuối. Đích đánh giá chính gồm structural graph, room/region, OCR grounding, relations và executable QA; AP box là một metric thành phần.
+Nguồn sự thật:
 
-Tài liệu nguồn của hướng nghiên cứu:
+- [`docs/research/README.md`](docs/research/README.md): trạng thái nghiên cứu.
+- [`docs/research/archcad_benchmark_protocol.md`](docs/research/archcad_benchmark_protocol.md): taxonomy, target và metric contract.
+- [`docs/experiments/experiment_log.md`](docs/experiments/experiment_log.md): các kết quả conditioned CenterNet đã kiểm chứng.
+- [`outputs/panoptic/archcad_oracle_benchmark_v0.json`](outputs/panoptic/archcad_oracle_benchmark_v0.json): oracle audit của benchmark adapter.
 
-- [`docs/research/README.md`](docs/research/README.md): trạng thái và thứ tự triển khai.
-- [`docs/research/drawing_understanding_direction_20260915.md`](docs/research/drawing_understanding_direction_20260915.md): đánh giá, kiến trúc và roadmap có cổng go/no-go.
-- [`outputs/drawing_graph/oracle_archcad_100_report.json`](outputs/drawing_graph/oracle_archcad_100_report.json): oracle audit đầu tiên trên dữ liệu ArchCAD thật.
-- [`outputs/drawing_graph/archcad_task_manifest.json`](outputs/drawing_graph/archcad_task_manifest.json): task-selection manifest cho toàn bộ 41.097 chunk; không phải evaluation split.
-- [`outputs/drawing_graph/room_gold_pack_v0.validation.json`](outputs/drawing_graph/room_gold_pack_v0.validation.json): trạng thái kiểm định pack room/connectivity 200 mẫu.
-- [`outputs/drawing_graph/oracle_archcad_floor_plan_100_qa.summary.json`](outputs/drawing_graph/oracle_archcad_floor_plan_100_qa.summary.json): 1.000 executable QA kèm evidence và ranh giới supervision.
-- [`outputs/drawing_graph/archcad_caption_audit.json`](outputs/drawing_graph/archcad_caption_audit.json): audit toàn bộ caption QA đi kèm release.
-- [`outputs/drawing_graph/archcad_provenance_audit.json`](outputs/drawing_graph/archcad_provenance_audit.json): bằng chứng local rằng public release thiếu chunk-to-drawing mapping.
-- [`outputs/drawing_graph/research_gates_v0.json`](outputs/drawing_graph/research_gates_v0.json): tổng hợp machine-readable của direct-GT, room extension và provenance gates.
-- [`docs/research/archcad_provenance_recovery_20260915.md`](docs/research/archcad_provenance_recovery_20260915.md): kết luận phục hồi provenance và contract cần yêu cầu upstream.
-- [`docs/research/structure_bakeoff_protocol.md`](docs/research/structure_bakeoff_protocol.md): protocol direct-GT cho primitive, instance và HEAT-style junction/incidence outputs.
+CDG, room/connectivity và executable QA là nhánh downstream exploratory, không
+phải critical path và không được dùng thay ground truth panoptic có sẵn.
 
-CDG-v0 đã có deterministic ArchCAD compiler, validator và evidence-producing query executor trong `src/drawing_graph/`. ArchCAD object detector 21 lớp vẫn là scaffold phụ; compiler graph cố ý bảo toàn cả wall, beam, grid, foundation, glass và rebar.
+## Trạng thái ưu tiên
 
-## Hướng nghiên cứu chính
+1. **P0 — Benchmark contract:** hoàn thành v0; oracle và full public-40K audit đã chạy.
+2. **P1 — Dataset pipeline:** phục hồi chính xác JSON/SVG → point/primitive tensor mapping trước khi train.
+3. **P2 — Baselines:** primitive-only, raster-only, rồi dual-pathway DPSS-style.
+4. **P3 — Conditioned Reflex:** ablate unconditioned global pass với conditioned refinement.
+5. **P4 — Dimension extraction:** chỉ bắt đầu sau khi panoptic baseline được tái lập.
 
-1. **P0 — Task/schema/protocol:** CDG-v0, validator, query contract và provenance gate.
-2. **P1 — Oracle graph:** compile semantic CAD primitives trước khi dùng ML.
-3. **P2 — Structural parser:** so sánh geometry rules, HEAT-style graph và polygon decoder.
-4. **P3 — Multitask parser:** structure + symbol + text, raster/vector fusion.
-5. **P4 — Grounded reasoning:** graph/proposal selector + frozen reasoner + deterministic executor.
-6. **P5 — Cross-domain:** FloorPlanCAD, CAD chuẩn hóa và floor plan ngoài tự nhiên/scan.
-
-Chạy oracle audit tái lập:
-
-```bash
-python scripts/research/audit_archcad_graph.py --limit 100 --sample-graphs 5
-```
-
-Không báo cáo generalization trên split ArchCAD hiện tại cho đến khi phục hồi được `source_drawing_id`/project của mỗi chunk.
-
-Mọi topology do heuristic tạo ở CDG-v0 dùng relation namespace `candidate_*`. Overlay audit đã bác bỏ việc coi enclosed wall cycles là room ground truth; chúng hiện chỉ là structural features cho bước phân loại/raster-assisted extraction tiếp theo.
-
-Raster/opening-closure baseline cũng không qua room-oracle gate (33% coverage trên 100 floor-plan candidates, không có occupied-space candidate chắc chắn). Bake-off chính vì vậy dùng trực tiếp ArchCAD primitive/semantic/instance ground truth; room annotation chỉ là extension tùy chọn và không chặn structure feasibility. Provenance vẫn phải được phục hồi trước khi báo cáo generalization.
-
-Workbench review local tại `tools/room_gold_annotator/` được giữ cho nghiên cứu room/connectivity về sau; nó không tham gia direct-GT bake-off.
+Public local hiện là initial 40K release (41.097 chunks), không phải full 413K
+paper set. Release thiếu original drawing-level split mapping, nên kết quả local
+phải ghi là replication trên public-40K cho đến khi provenance được phục hồi.
 
 ## Contracts chính
 

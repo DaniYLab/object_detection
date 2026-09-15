@@ -1,116 +1,94 @@
-# Main Research Direction: Drawing Understanding
+# Main Research Direction: ArchCAD Panoptic Symbol Spotting
 
-Đây là entry point chính cho nghiên cứu. Các tài liệu detector cũ là lịch sử/baseline trừ khi được dẫn lại tại đây hoặc trong experiment log có kiểm chứng.
+Đây là entry point chính. Nghiên cứu phải tái lập benchmark ArchCAD trước khi
+đưa thêm OCR, CDG, room reconstruction hay language reasoning.
 
-## Mục tiêu
+## Thesis
 
-Biến bản vẽ raster/vector/CAD thành **Canonical Drawing Graph (CDG)** có provenance, sau đó trả lời truy vấn bằng graph evidence. Hệ thống phải hiểu structure, symbols, text và relations; không dùng AP box làm đại diện cho toàn bộ khả năng đọc bản vẽ.
+Giả thuyết ban đầu là phản xạ không điều kiện đọc toàn cảnh và phản xạ có điều
+kiện tập trung vào đúng loại đối tượng. FloorPlanCAD CenterNet đã chứng minh
+class conditioning và vector geometry có ích cho bbox detection. Bước hiện tại
+là chuyển các insight đó sang task giàu supervision hơn mà ArchCAD thực sự định
+nghĩa: gán semantic và instance cho toàn bộ graphical primitives.
 
-## Nguồn sự thật
+```text
+raster + geometry-only primitives
+  -> semantic prediction per primitive
+  -> instance mask prediction over primitives
+  -> panoptic thing/stuff output
+  -> object reconstruction and dimensions later
+```
 
-1. `drawing_understanding_direction_20260915.md` — quyết định kiến trúc, benchmark và roadmap.
-2. `../experiments/experiment_log.md` — số liệu detector đã kiểm chứng và hạn chế leakage.
-3. `../../outputs/drawing_graph/oracle_archcad_100_report.json` — kết quả oracle graph hiện tại.
-4. `../../outputs/drawing_graph/archcad_task_manifest.json` — task selection toàn corpus.
-5. `../../outputs/drawing_graph/oracle_archcad_architectural_100_report.json` — audit trên architectural subset.
-6. `../../outputs/drawing_graph/oracle_archcad_floor_plan_100_report.json` — audit trên floor-plan candidate subset chặt hơn.
-7. `../../outputs/drawing_graph/raster_regions_floor_plan_100_high_precision_report.json` — cổng go/no-go của raster room heuristic.
-8. `../../outputs/drawing_graph/manual_overlay_audit.json` — kết luận kiểm tra trực quan.
-9. `../../outputs/drawing_graph/room_gold_pack_v0.validation.json` — tính hợp lệ và tiến độ gold annotation.
-10. `../../outputs/drawing_graph/oracle_archcad_floor_plan_100_qa.summary.json` — 1.000 executable QA và supervision boundary.
-11. `../../outputs/drawing_graph/archcad_caption_audit.json` — audit 205.479 caption QA của release.
-12. `../../outputs/drawing_graph/archcad_provenance_audit.json` — audit mapping chunk → source drawing.
-13. `../../outputs/drawing_graph/research_gates_v0.json` — trạng thái machine-readable của direct-GT, room extension và provenance gates.
-14. `../../src/drawing_graph/` — contract CDG-v0 thực thi được.
+## Sources of truth
 
-## Trạng thái
+1. `archcad_benchmark_protocol.md` — benchmark contract hiện hành.
+2. `../experiments/experiment_log.md` — kết quả Conditioned CenterNet đã kiểm chứng.
+3. `../../src/data/archcad_panoptic.py` — raw annotation → canonical panoptic GT.
+4. `../../src/evaluation/archcad_panoptic.py` — semantic/instance/panoptic metrics.
+5. `../../outputs/panoptic/archcad_oracle_benchmark_v0.json` — oracle audit.
+6. `../../outputs/panoptic/archcad_public40k_audit_v0.json` — full-corpus contract audit.
+7. `archcad_provenance_recovery_20260915.md` — giới hạn public-40K split.
 
-| Milestone | Trạng thái | Bằng chứng |
+Các tài liệu `drawing_understanding_direction_20260915.md`, CDG compiler,
+room-gold pack và executable QA là exploratory work. Chúng không được dùng làm
+trạng thái chính hoặc chặn ArchCAD benchmark.
+
+## Current status
+
+| Milestone | Status | Evidence |
 |---|---|---|
-| Chuyển hướng detector → drawing understanding | Hoàn thành | README và roadmap này |
-| CDG-v0 schema + JSON round-trip | Hoàn thành | `schema.py`, unit tests |
-| Validator + provenance gate | Hoàn thành v0 | `validation.py` |
-| ArchCAD oracle compiler giữ toàn bộ semantics | Hoàn thành v0 | `archcad.py` |
-| Evidence-producing query executor | Hoàn thành v0 | `queries.py` |
-| Audit 100 chunk | Hoàn thành | 100/100 graph valid; 966/966 contract checks đúng |
-| Direct ArchCAD GT scoreboard | Hoàn thành v1 | primitive geometry/semantic, instance bbox/class, junction và incidence |
-| Source-drawing-disjoint split | Blocked bởi dữ liệu nguồn | JSON local không có `source_drawing_id` |
-| Enclosed wall-face candidates | Hoàn thành v0 | 0.96 candidate/chunk; chưa được gọi là room |
-| Door–wall attachment candidates | Hoàn thành v0 | 1.52 candidate links/chunk, có contact-point evidence |
-| Region connectivity candidates | Baseline coverage thấp | 0.02/chunk; chỉ 2/100 mẫu có candidate |
-| Raster-assisted room oracle | No-go | Chỉ 33% coverage; phần lớn là wall-body/void/unclassified candidates |
-| Room/connectivity gold pack | Sẵn sàng để review | 200 record hợp lệ; 70 có candidate hint, không phải ground truth |
-| Blinded double-annotation pack | Sẵn sàng để review | 40 record (20%); annotation chính không được sao chép |
-| Agreement evaluator | Hoàn thành v0 | maximum polygon-IoU matching + door-aware relation F1 |
-| Local annotation workbench | Hoàn thành v0 | Canvas polygon + door relation + atomic save/backup/conflict check |
-| Executable QA feasibility | Hoàn thành v0 | 1.000 query/100 chunk; 600 raw-semantic oracle, 400 heuristic-only |
-| Released caption QA audit | Hoàn thành | 205.479 QA; chỉ 217 relation/room-like, 6 record sai kiểu |
-| OCR/dimension/legend branch | Chưa bắt đầu | Thực hiện sau structure oracle |
-| Learned structural parser | Chưa bắt đầu | Có thể bắt đầu feasibility trên direct GT; publication vẫn chờ provenance |
-| Structure bake-off evaluator | Sẵn sàng | Dùng trực tiếp primitive/semantic/instance GT, không chờ room annotation |
+| FloorPlanCAD conditioned effect | Verified in old protocol | +5.37 AP50 mean over no-condition, 3 seeds |
+| FloorPlanCAD vector-source effect | Verified in old protocol | +9.39 AP50 mean, 2 seeds |
+| Hybrid stride-4 head | Promising, needs clean replication | +2.6–3.1 AP50:95; old leaking manifest |
+| FloorPlanCAD schema-v3 dedup | Complete | cold control has not been trained |
+| ArchCAD public data | Available | 41,097 aligned PNG/SVG/JSON/point/caption chunks |
+| ArchCAD taxonomy contract | Complete v0 | 30 semantics = 21 thing + 9 stuff; raw 100 ignored |
+| Primitive/instance target parser | Complete v0 | preserves all classes and primitive order |
+| Semantic evaluator | Complete v0 | macro/micro F1 and length-weighted variants |
+| Instance evaluator | Complete v0 | primitive-mask AP50/AP75/mAP |
+| Panoptic evaluator | Complete v0 | PQ/SQ/RQ total, thing, stuff, per-class |
+| 100-sample oracle audit | Passed | all tracks = 1.0 on 24,369 primitives |
+| Public-40K full audit | Complete | 41,097 chunks / 14,392,530 entities / 500,048 segments |
+| Data anomalies | Quantified | 64,441 thing primitives missing instance; 80 zero-length; 22,323 zero-weight |
+| JSON/SVG → point tensor mapping | Open blocker | public point arrays are not 1:1 with JSON entities; upstream loader missing |
+| Panoptic PyTorch dataset/collate | Not started | current ArchCAD dataset is bbox-only |
+| Primitive-only learned baseline | Not started | first model milestone |
+| Raster/dual-pathway baseline | Not started | after primitive-only control |
+| Conditioned Reflex panoptic ablation | Not started | after benchmark baseline converges |
+| Paper-comparable reproduction | Blocked | public subset/split differs from 413K paper benchmark |
 
-## Kết quả P1 đầu tiên
+## Upstream audit
 
-Audit seed 1337 trên 100 ArchCAD chunk:
+Official ArchCAD code provides model, matcher, criterion and a partial evaluator,
+but the current public repository lacks `svgnet/data`, `dataset`, and
+`modules/pointops`. Its config establishes 30 semantic classes, 800 queries,
+class/mask/dice matching costs and the 21/9 thing/stuff split. The local adapter
+therefore reconstructs the missing data/evaluation contract without claiming
+bit-for-bit equivalence prematurely.
 
-- 100% graph qua structural validator.
-- 100% trong 966 executable checks khớp raw annotation/compiler contract. Con số này kiểm tra tính bảo toàn/thực thi, không phải độ đúng semantic của room.
-- Trung bình 381.57 nodes, 436.28 edges, 128.14 endpoint junctions và 8.78 instances/chunk.
-- Trung bình 0.96 enclosed-wall-face candidates, 1.52 door–wall candidate links, 0.09 instance–region candidates và 0.02 region-connectivity candidates/chunk.
-- Coverage: 63/100 mẫu có wall, 22/100 có door, 28/100 có enclosed face và 2/100 có connectivity candidate.
-- Bảo toàn các lớp trước đây bị detector lọc bỏ, gồm 2,854 wall primitives, 1,178 concrete-beam, 784 axis/grid, 393 rebar và 182 foundation trong mẫu.
-- 100/100 graph cảnh báo thiếu source-drawing provenance. Vì vậy kết quả này chứng minh compiler feasibility, chưa chứng minh khả năng generalization.
+## Required order
 
-## Thứ tự công việc hiện tại
+1. Resolve and test the exact JSON/SVG primitive → `point.zip` representation;
+   do not assume raw entity order matches DPSS tensor order.
+2. Freeze the public-40K development split and fingerprint; clearly mark it as
+   non-comparable to the paper split.
+3. Implement panoptic dataset/collate with aligned raster and verified primitive/point order.
+4. Train a small primitive-only control and verify non-trivial PQ.
+5. Add raster feature sampling and adaptive fusion.
+6. Reproduce the DPSS-style query/mask decoder baseline.
+7. Only then test conditioned vs unconditioned reflex mechanisms.
 
-1. Chạy oracle sanity ceiling trên direct ArchCAD GT để khóa evaluator.
-2. So sánh raster detector, raster+vector parser và HEAT-style graph parser trên primitive/instance/junction metrics.
-3. Phục hồi provenance và dựng split theo source drawing/project song song; trước đó chỉ gọi kết quả là within-release feasibility.
-4. Giữ room/connectivity annotation như extension tùy chọn, không chặn bake-off chính.
-5. Chỉ thêm RoomFormer-style polygon arm khi có dataset chứa room-polygon GT thật; không dùng wall-cycle candidates làm GT.
+## Metrics and claims
 
-Protocol direct-GT nằm tại `structure_bakeoff_protocol.md`. Protocol room annotation
-ở `room_gold_annotation_protocol.md` chỉ phục vụ scoreboard region/connectivity riêng.
+Primary metrics are F1/wF1, AP50/AP75/mAP and PQ/SQ/RQ. Bbox AP is a historical
+auxiliary metric only. Until source-drawing mapping/full data is available,
+results must be labeled `ArchCAD public-40K development protocol`, not Table
+reproduction or final generalization.
 
-Overlay audit đầu tiên cho thấy face kín có thể là lõi thang/shaft thay vì room. Vì vậy CDG-v0 cố ý dùng nhãn `enclosed_wall_face_candidate` với confidence 0.5. Không được đổi thành room ground truth nếu chưa có classification/audit.
+## Deferred work
 
-Endpoint-cycle v0 là baseline cần giữ, nhưng **không qua cổng room-oracle coverage**: chỉ 28% mẫu ngẫu nhiên có face và 2% có connectivity candidate. Không scale/training trên target này trước khi xử lý task filtering và boundary gaps.
-
-## Task selection toàn ArchCAD local
-
-Manifest fingerprint `2c83d23d7e48ea128d1e99fc5defb3e903e37e6d8747d7bccff3df2341c56670` trên 41.097 chunk:
-
-- 27.184 (66,15%) có wall.
-- 25.317 (61,60%) đủ ít nhất bốn wall primitives để thử wall graph.
-- 11.194 (27,24%) có wall graph + door evidence.
-- 14.170 (34,48%) được chọn làm architectural-reading candidates bằng wall + door/fixture evidence.
-- 9.992 (24,31%) qua bộ lọc floor-plan-reading chặt hơn.
-- 34.824 (84,74%) chứa structural-engineering semantics; các subset không loại trừ nhau.
-
-Manifest này chỉ chọn task và được đánh dấu `task_selection_only_not_an_evaluation_split`. Nó không giải quyết source-drawing leakage.
-
-Audit thêm 100 mẫu từ architectural subset cho kết quả: 61% có enclosed face, 18% có connectivity candidate, trung bình 3,08 face và 0,63 connectivity candidates/chunk. Trên floor-plan-reading subset, face coverage là 72% và connectivity-candidate coverage là 16%, trung bình 3,33 và 0,63 candidate/chunk. Coverage tăng nhưng không đồng nghĩa precision: overlay vẫn cho thấy dải giữa hai biên tường bị nhận như region. Vì vậy quan hệ dùng `candidate_bounds`, `candidate_inside`, `candidate_attached_to`, `candidate_connected_by`; không consumer nào được coi chúng là quan hệ thật nếu chưa qua semantic validator.
-
-Opening-closure + raster free-space high-precision chỉ tạo candidate trên 33/100 mẫu floor-plan; 65 region tìm được gồm 29 `unclassified`, 29 `void_or_shaft`, 5 `vertical_core`, 2 `service_space` và **0 `occupied_space`**. Đây là no-go rõ ràng cho automatic room oracle từ semantics local. Pack review thủ công 200 record đã được tạo, 70 record có preannotation hints và validator xác nhận 200/200 record hợp lệ; hiện 0/100 reviewed floor-plan gate, nên chưa được dùng làm evaluation/training labels.
-
-Chạy kiểm định gold pack:
-
-```bash
-python scripts/research/validate_room_gold_pack.py outputs/drawing_graph/room_gold_pack_v0.jsonl
-```
-
-Mở workbench để annotation:
-
-```bash
-python scripts/research/serve_room_gold_annotator.py --open-browser
-```
-
-## QA hiện có và giới hạn
-
-Bộ executable QA v0 có 1.000 câu trên 100 floor-plan candidates: 600 câu count trên semantic/instance gốc và 400 câu chỉ hỏi về `candidate_*`. Mỗi record lưu program, answer và evidence node/edge. Nó chứng minh đường graph → executor hoạt động, nhưng chưa phải reading benchmark để công bố vì thiếu source provenance và 400 câu topology chưa có human gold.
-
-Release còn có `caption.zip` với 205.479 cặp QA cho 41.097 chunk. Audit toàn bộ tìm thấy 205.473 cặp string/string hợp lệ, 6 record lỗi kiểu, và chỉ 217 câu (0,106%) mang dấu hiệu relation/room reasoning; phần lớn là count, existence hoặc localization theo tọa độ. Do đó caption chỉ là auxiliary symbol QA sau khi được đối chiếu bằng executor, không thay thế CDG/room gold.
-
-Audit provenance xác nhận cả năm archive public chứa cùng 41.097 UUID phẳng; 100/100 JSON kiểm tra chỉ có top-level key `entities`, không có parent drawing/project key. Paper nói split gốc bảo đảm mỗi drawing chỉ thuộc một split, nhưng initial 40K release và code public không kèm manifest tương ứng; README upstream vẫn liệt kê CADParser trong TODO. Vì vậy SHA-256 grouping hiện tại chỉ loại exact duplicates, không đủ thay thế drawing-disjoint split. Nguồn chính thức: [project page](https://archiai-lab.github.io/ArchCAD.github.io/), [repository](https://github.com/ArchiAI-LAB/ArchCAD), [public dataset files](https://huggingface.co/datasets/jackluoluo/ArchCAD/tree/main/data).
-
-Không ưu tiên lúc này: tăng epoch detector 21 lớp, train MLLM từ đầu, coordinate-token box generation, MoE, KV-cache compression hoặc RL reasoning không có graph verifier.
+- OCR and written dimensions.
+- CDG and executable QA.
+- Room/connectivity extraction.
+- MLLM/LLM reasoning.
+- Any model scaling before the primitive-only baseline and evaluator are stable.

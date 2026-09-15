@@ -1,5 +1,7 @@
 """Reusable decoding, metrics, and prediction interchange utilities."""
 
+from .archcad_panoptic import evaluate_archcad_panoptic
+
 from .decoder import (
     CenterNetDecoder,
     decode_centernet,
@@ -45,6 +47,7 @@ __all__ = [
     "decode_centernet",
     "decode_predictions",
     "evaluate_detections",
+    "evaluate_archcad_panoptic",
     "evaluate_predictions",
     "load_predictions",
     "local_maximum_suppression",
