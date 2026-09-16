@@ -59,11 +59,24 @@ def evaluate(model, items, truths, device):
 
 def compact(result):
     metrics = result['metrics']
+    thing = metrics['panoptic']['thing']
     return {'loss': result['loss'], 'semantic_f1_macro': metrics['semantic']['f1_macro'],
             'semantic_wf1_macro': metrics['semantic']['weighted_f1_macro'],
             'instance_ap50': metrics['instance']['ap50'], 'instance_map': metrics['instance']['map_50_95'],
             'pooled_pq': metrics['panoptic']['all']['pq'],
+            'thing_pq': thing['pq'],
+            'thing_recall': thing['tp'] / (thing['tp'] + thing['fn']) if thing['tp'] + thing['fn'] else 0.,
             'tp': metrics['panoptic']['all']['tp'], 'fp': metrics['panoptic']['all']['fp'], 'fn': metrics['panoptic']['all']['fn']}
+
+
+def checkpoint_payload(model, optimizer, epoch, config):
+    return {'format': 'archcad-primitive-pilot-v1', 'model_config': model.config,
+            'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
+            'epoch': epoch, 'run_config': config, 'torch_rng': torch.get_rng_state()}
+
+
+def evaluation_due(epoch, epochs, interval):
+    return epoch == epochs or (interval > 0 and epoch % interval == 0)
 
 
 def main():
@@ -73,6 +86,8 @@ def main():
     p.add_argument('--train-images', type=int, default=32)
     p.add_argument('--val-images', type=int, default=16)
     p.add_argument('--epochs', type=int, default=20)
+    p.add_argument('--eval-every', type=int, default=0,
+                   help='Evaluate all selected train/val images and save checkpoint every N epochs; 0 means final only.')
     p.add_argument('--max-primitives', type=int, default=1024)
     p.add_argument('--queries', type=int, default=64)
     p.add_argument('--dim', type=int, default=64)
@@ -82,6 +97,8 @@ def main():
                    help='Fixed across model seeds so replication uses identical images.')
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     args = p.parse_args()
+    if args.eval_every < 0:
+        raise ValueError('eval-every must be non-negative')
     if min(args.train_images, args.val_images, args.epochs, args.max_primitives, args.queries) <= 0:
         raise ValueError('sample budgets, queries and epochs must be positive')
     # A run is immutable once configured; never overwrite an existing run.
@@ -128,8 +145,11 @@ def main():
     start = time.monotonic()
     initial_train = evaluate(model, train, train_gt, args.device)
     initial_val = evaluate(model, val, val_gt, args.device)
+    (args.output_dir / 'evaluation_000.json').write_text(
+        json.dumps({'epoch': 0, 'train': initial_train, 'val': initial_val}, indent=2) + '\n', encoding='utf-8')
     print(json.dumps({'initial_train': compact(initial_train), 'initial_val': compact(initial_val)}), flush=True)
     history = []
+    evaluations = [{'epoch': 0, 'train': compact(initial_train), 'val': compact(initial_val)}]
     for epoch in range(1, args.epochs + 1):
         model.train()
         order = list(range(len(train)))
@@ -146,17 +166,25 @@ def main():
             optimizer.step()
             losses.append(float(loss.detach()))
         history.append({'epoch': epoch, 'training_loss': sum(losses) / len(losses)})
-        print(json.dumps(history[-1]), flush=True)
-    final_train = evaluate(model, train, train_gt, args.device)
-    final_val = evaluate(model, val, val_gt, args.device)
+        if epoch == 1 or epoch % 5 == 0 or epoch == args.epochs:
+            print(json.dumps(history[-1]), flush=True)
+        if evaluation_due(epoch, args.epochs, args.eval_every):
+            final_train = evaluate(model, train, train_gt, args.device)
+            final_val = evaluate(model, val, val_gt, args.device)
+            evaluations.append({'epoch': epoch, 'train': compact(final_train), 'val': compact(final_val)})
+            (args.output_dir / f'evaluation_{epoch:03d}.json').write_text(
+                json.dumps({'epoch': epoch, 'train': final_train, 'val': final_val}, indent=2) + '\n', encoding='utf-8')
+            (args.output_dir / 'progress.json').write_text(
+                json.dumps({'history': history, 'evaluations': evaluations}, indent=2) + '\n', encoding='utf-8')
+            torch.save(checkpoint_payload(model, optimizer, epoch, config), args.output_dir / f'epoch_{epoch:03d}.pt')
+            print(json.dumps({'evaluation': evaluations[-1]}), flush=True)
     report = {'schema_version': 'archcad-primitive-pilot-v1', 'config': config, 'history': history,
               'initial_train': initial_train, 'initial_val': initial_val,
               'final_train': final_train, 'final_val': final_val, 'elapsed_seconds': time.monotonic() - start,
+              'evaluations': evaluations,
               'interpretation': 'bounded optimization feasibility; not a converged or paper-comparable result'}
     (args.output_dir / 'report.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
-    torch.save({'format': 'archcad-primitive-pilot-v1', 'model_config': model.config, 'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(), 'epoch': args.epochs, 'run_config': config,
-                'torch_rng': torch.get_rng_state()}, args.output_dir / 'last.pt')
+    torch.save(checkpoint_payload(model, optimizer, args.epochs, config), args.output_dir / 'last.pt')
     print(json.dumps({'final_train': compact(final_train), 'final_val': compact(final_val), 'elapsed_seconds': report['elapsed_seconds']}), flush=True)
 
 
