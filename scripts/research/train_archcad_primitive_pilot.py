@@ -78,6 +78,8 @@ def main():
     p.add_argument('--dim', type=int, default=64)
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--seed', type=int, default=1337)
+    p.add_argument('--selection-seed', type=int, default=1337,
+                   help='Fixed across model seeds so replication uses identical images.')
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     args = p.parse_args()
     if min(args.train_images, args.val_images, args.epochs, args.max_primitives, args.queries) <= 0:
@@ -92,8 +94,8 @@ def main():
     torch.set_num_threads(4)
     train_ds = ArchCADPanopticDataset(args.data_root, split='train')
     val_ds = ArchCADPanopticDataset(args.data_root, split='val')
-    train, train_gt, train_skips = select_samples(train_ds, args.train_images, args.seed, args.max_primitives, args.queries)
-    val, val_gt, val_skips = select_samples(val_ds, args.val_images, args.seed + 1, args.max_primitives, args.queries)
+    train, train_gt, train_skips = select_samples(train_ds, args.train_images, args.selection_seed, args.max_primitives, args.queries)
+    val, val_gt, val_skips = select_samples(val_ds, args.val_images, args.selection_seed + 1, args.max_primitives, args.queries)
     # Check content, not only sample ID disjointness, for this actual pilot.
     from hashlib import sha256
     hashes = lambda items: {sha256((args.data_root / 'png' / (i['image_id'] + '.png')).read_bytes()).hexdigest() for i in items}
@@ -112,6 +114,16 @@ def main():
                            'scheduler': 'none; fixed pilot budget', 'loss_weights': [2, 7, 5], 'no_object_weight': .05},
               'selection_rule': 'seeded random eligibility under primitive/query caps; no target truncation',
               'metric_profile': 'local reconstruction v1; paper parity unverified', 'paper_reproduction': False}
+    config['decoder'] = {'score_threshold': .1, 'mask_threshold': .5,
+                         'assignment': 'query-score times mask-probability argmax; merge stuff'}
+    config['implementation_sha256'] = {
+        str(path): sha256(path.read_bytes()).hexdigest() for path in (
+            Path(__file__).resolve(),
+            Path('src/models/archcad_primitive_baseline.py'),
+            Path('src/data/archcad_panoptic_dataset.py'),
+            Path('src/data/archcad_panoptic.py'),
+            Path('src/evaluation/archcad_panoptic.py'),
+        )}
     (args.output_dir / 'config.json').write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8')
     start = time.monotonic()
     initial_train = evaluate(model, train, train_gt, args.device)
