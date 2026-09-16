@@ -2,6 +2,14 @@
 
 ## ArchCAD continuation — 2026-09-16
 
+**Fixed-subset replication:** preregistration `30d739f`; 256 train / 128 val,
+20 epochs, seeds 1337/2024/4242, identical selected image IDs and source/code
+hashes. Local pooled PQ = **0.11663 ± 0.01155**, semantic macro F1 =
+**0.09245 ± 0.00330**, instance AP50 = **0.007637 ± 0.001405** (sample SD).
+Thing recall = **0.09640 ± 0.00590**. This is a repeatable weak development
+control. It is not a converged baseline or paper reproduction.
+Protocol and per-seed/recall diagnosis: `docs/experiments/archcad_primitive_replication_20260916.md`.
+
 The first learned public-40K panoptic pilot completed: 149,343-parameter
 primitive-only query/mask model, seed 1337, 32 train / 16 validation chunks,
 20 epochs (640 steps), no target truncation. Local validation macro semantic

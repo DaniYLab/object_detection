@@ -33,7 +33,7 @@ phải critical path và không được dùng thay ground truth panoptic có s�
 
 1. **P0 — Benchmark contract:** local v1 implemented; exact paper metric parity still open.
 2. **P1 — Dataset pipeline:** raw-entity loader/collate implemented and checked against SVG.
-3. **P2 — Baselines:** primitive-only pilot completed; larger controlled validation is next.
+3. **P2 — Baselines:** primitive-only pilot replicated on three seeds (256/128 images); diagnose low thing recall next.
 4. **P3 — Conditioned Reflex:** ablate unconditioned global pass với conditioned refinement.
 5. **P4 — Dimension extraction:** chỉ bắt đầu sau khi panoptic baseline được tái lập.
 

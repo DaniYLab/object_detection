@@ -53,7 +53,7 @@ trạng thái chính hoặc chặn ArchCAD benchmark.
 | Data anomalies | Re-audited 2026-09-16 | 64,441 thing primitives missing instance; 80 zero-length; 22,389 zero-weight |
 | JSON/SVG entity mapping | Verified on 100 samples | 24,369 semantic/instance pairs; auxiliary point.zip is not a proven model dependency |
 | Panoptic PyTorch dataset/collate | Implemented | raw entity indices, geometry-only features, per-image masks, split fingerprint |
-| Primitive-only learned baseline | Pilot completed | 149,343 params; 32 train / 16 val; local val PQ=0.08073 after 20 epochs |
+| Primitive-only learned baseline | Three-seed pilot completed | 149,343 params; fixed 256 train / 128 val; local PQ=0.11663 ±0.01155; thing recall=0.09640 |
 | Raster/dual-pathway baseline | Not started | after primitive-only control |
 | Conditioned Reflex panoptic ablation | Not started | after benchmark baseline converges |
 | Paper-comparable reproduction | Blocked | public subset/split differs from 413K paper benchmark |
@@ -69,13 +69,16 @@ bit-for-bit equivalence prematurely.
 
 ## Required order
 
-1. Expand the fixed-budget primitive-only pilot to representative train/validation
-   samples, reporting coverage, class-wise errors and seed variance.
+1. Separate optimization/data-budget limitations from architectural limitations
+   in the primitive-only control. The completed 3-seed pilot has low thing recall;
+   inspect prespecified longer-budget curves before changing the architecture.
 2. Keep the existing public-40K split fingerprint and the local v1 metric profile
    fixed. Exact paper preprocessing/evaluator parity remains a separate open audit.
 3. Profile the long primitive-count tail before scaling; the pilot uses an
    explicit 1,024-primitive / 64-segment eligibility cap, with no target truncation.
-4. Diagnose the low instance recall before architecture ablations.
+4. Raw-query diagnosis found class-agnostic coverage 29.19%, correct-class
+   coverage 12.15%, and final thing recall 9.61% (seed 1337); thresholding alone
+   does not explain the misses. See `../experiments/archcad_primitive_replication_20260916.md`.
 5. Add raster feature sampling and adaptive fusion.
 6. Reproduce the DPSS-style query/mask decoder baseline.
 7. Only then test conditioned vs unconditioned reflex mechanisms.

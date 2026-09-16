@@ -51,4 +51,66 @@ refuses to overwrite an existing run.
 
 ## Results
 
-Pending at preregistration. Populate from saved reports after all three runs.
+Completed under preregistration commit `30d739f`. Model/input implementation
+hashes, image IDs, source hashes, optimization budget and decoder settings were
+checked identical across runs before aggregation. Scores below are on a 0–1
+scale; standard deviation uses n−1 (three seeds).
+
+| Seed | Val loss | Semantic macro F1 | Instance AP50 | Instance mAP | Pooled PQ | Thing recall |
+|---|---:|---:|---:|---:|---:|---:|
+| 1337 | 7.22942 | 0.09573 | 0.006836 | 0.002637 | 0.11936 | 0.09610 |
+| 2024 | 7.35851 | 0.08913 | 0.009260 | 0.004704 | 0.12657 | 0.10245 |
+| 4242 | 7.24594 | 0.09250 | 0.006815 | 0.003270 | 0.10396 | 0.09066 |
+| Mean | 7.27795 | 0.09245 | 0.007637 | 0.003537 | 0.11663 | 0.09640 |
+| Sample std | 0.07025 | 0.00330 | 0.001405 | 0.001059 | 0.01155 | 0.00590 |
+
+Mean thing PQ = 0.09257, mean stuff PQ = 0.18651. Every seed improves over its
+initial model but thing recall remains around 9–10%. There are 1,103 thing GT
+segments and 349 stuff GT segments in this fixed validation subset. This is a
+repeatable weak baseline, not a successful DPSS reproduction or a convergence
+result. Eligibility skipped 13 training and 5 validation candidates for the
+primitive cap, identically across runs.
+
+Artifacts:
+
+- `outputs/panoptic/primitive_256_s1337/{config.json,report.json,last.pt}`
+- `outputs/panoptic/primitive_256_s2024/{config.json,report.json,last.pt}`
+- `outputs/panoptic/primitive_256_s4242/{config.json,report.json,last.pt}`
+- `outputs/panoptic/primitive_256_replication_summary.json`
+
+Recompute the aggregate using `scripts/research/summarize_archcad_replication.py`.
+It rejects mixed data/model/code protocols and duplicate seeds.
+
+## Post-run diagnosis (seed 1337, no tuning)
+
+On the same 128 validation images, compare the maximum raw-query mask IoU for
+each thing GT, before disjoint postprocessing:
+
+| Diagnostic | Covered GT / 1,103 |
+|---|---:|
+| Any query mask, regardless of class | 322 (29.19%) |
+| A query mask with the correct predicted class | 134 (12.15%) |
+| Correct class and score >=0.1 | 134 (12.15%) |
+| Final one-to-one matches from saved evaluation | 106 (9.61%) |
+
+The first three rows are optimistic per-GT coverage, allowing a query to cover
+more than one GT; they are not AP or one-to-one recall. CPU and CUDA agree on
+these counts. The raw decoder emits 920 thing masks; 718 have positive evaluated
+weight after the local ignore/zero-weight policy. The saved evaluator reports
+106 TP + 612 FP = 718 scorable thing predictions.
+
+Thus there is evidence of both poor mask coverage and class confusion. Score
+threshold removal alone cannot recover the missing raw-query coverage in this
+run. Postprocessing also reduces matches, but the much larger losses happen
+before it. This does not identify a single architectural cause: data budget,
+training duration, features and decoder capacity are still confounded.
+
+Diagnostic report: `outputs/panoptic/query_recall_s1337_cuda.json`.
+
+## Next falsifiable experiment
+
+Keep architecture/data/decoder fixed and extend a prespecified training budget
+with full training/validation curves. Determine whether thing recall continues
+to improve before attributing failure to the primitive representation or adding
+conditioning/fusion. A separate small-set overfit test can isolate optimization
+capacity. Do not tune threshold on these validation observations.
