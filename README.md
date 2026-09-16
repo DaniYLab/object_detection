@@ -3,8 +3,8 @@
 Nghiên cứu bắt đầu từ giả thuyết **phản xạ có điều kiện và không điều kiện**:
 một pathway đọc toàn bộ bản vẽ, còn tín hiệu condition hướng sự chú ý vào class/
 đối tượng cần phân biệt. FloorPlanCAD CenterNet là bài kiểm chứng đầu tiên; mục
-tiêu dài hạn là đọc toàn bộ object trong bản vẽ và khôi phục kích thước từ
-primitive geometry.
+tiêu dài hạn là đọc trị số kích thước được ghi trong bản vẽ và gắn chúng với
+đúng object. Giai đoạn hiện tại tập trung vào benchmark panoptic ArchCAD.
 
 Ưu tiên hiện tại là tái lập benchmark ArchCAD-400K trước khi brainstorm kiến
 trúc mới:
@@ -15,13 +15,14 @@ ArchCAD raster + vector primitives
   -> primitive-mask instance prediction
   -> panoptic thing/stuff merge
   -> F1/wF1 + AP50/AP75/mAP + PQ/SQ/RQ
-  -> object geometry/dimensions (downstream, deterministic)
+  -> written-dimension reading (future research)
 ```
 
 Nguồn sự thật:
 
 - [`docs/research/README.md`](docs/research/README.md): trạng thái nghiên cứu.
 - [`docs/research/archcad_benchmark_protocol.md`](docs/research/archcad_benchmark_protocol.md): taxonomy, target và metric contract.
+- [`docs/research/archcad_benchmark_audit_20260916.md`](docs/research/archcad_benchmark_audit_20260916.md): representation audit, metric differences and first learned pilot.
 - [`docs/experiments/experiment_log.md`](docs/experiments/experiment_log.md): các kết quả conditioned CenterNet đã kiểm chứng.
 - [`outputs/panoptic/archcad_oracle_benchmark_v0.json`](outputs/panoptic/archcad_oracle_benchmark_v0.json): oracle audit của benchmark adapter.
 
@@ -30,9 +31,9 @@ phải critical path và không được dùng thay ground truth panoptic có s�
 
 ## Trạng thái ưu tiên
 
-1. **P0 — Benchmark contract:** hoàn thành v0; oracle và full public-40K audit đã chạy.
-2. **P1 — Dataset pipeline:** phục hồi chính xác JSON/SVG → point/primitive tensor mapping trước khi train.
-3. **P2 — Baselines:** primitive-only, raster-only, rồi dual-pathway DPSS-style.
+1. **P0 — Benchmark contract:** local v1 implemented; exact paper metric parity still open.
+2. **P1 — Dataset pipeline:** raw-entity loader/collate implemented and checked against SVG.
+3. **P2 — Baselines:** primitive-only pilot completed; larger controlled validation is next.
 4. **P3 — Conditioned Reflex:** ablate unconditioned global pass với conditioned refinement.
 5. **P4 — Dimension extraction:** chỉ bắt đầu sau khi panoptic baseline được tái lập.
 

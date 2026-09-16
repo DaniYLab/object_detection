@@ -94,7 +94,7 @@ def main() -> None:
     maximum_segments = 0
     fingerprint = hashlib.sha256()
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        for record, source_hash in executor.map(_scan, paths):
+        for processed, (record, source_hash) in enumerate(executor.map(_scan, paths), 1):
             semantic_counts.update(record["semantic_counts"])
             segment_counts.update(record["segment_counts"])
             primitive_types.update(record["primitive_types"])
@@ -111,6 +111,8 @@ def main() -> None:
             maximum_primitives = max(maximum_primitives, record["primitive_count"])
             maximum_segments = max(maximum_segments, record["segment_count"])
             fingerprint.update(f"{record['image_id']}:{source_hash}\n".encode("ascii"))
+            if processed % 5000 == 0:
+                print(f'audited {processed}/{len(paths)} annotations', flush=True)
 
     def semantic_table(counter: Counter[int]) -> list[dict[str, Any]]:
         return [
@@ -127,7 +129,8 @@ def main() -> None:
         ]
 
     report = {
-        "schema_version": "archcad-public40k-panoptic-audit-v0",
+        "schema_version": "archcad-public40k-panoptic-audit-v1",
+        "geometry_policy": "directed_arc_sweep_and_partial_ellipse_integral",
         "image_count": len(paths),
         "source_fingerprint": fingerprint.hexdigest(),
         "primitive_count": totals["primitive_count"],

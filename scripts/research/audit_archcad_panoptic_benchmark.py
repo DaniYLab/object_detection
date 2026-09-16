@@ -61,6 +61,8 @@ def main() -> None:
             "issue_counts": dict(sorted(issue_counts.items())),
             "sample_ids": [sample.image_id for sample in samples],
             "expected_identity_score": 1.0,
+            "identity_is_only_sanity_check": True,
+            "paper_metric_parity_verified": False,
             "official_release_notes": {
                 "semantic_classes": 30,
                 "thing_classes": 21,
@@ -83,7 +85,7 @@ def main() -> None:
                 "semantic": {
                     key: value
                     for key, value in report["semantic"].items()
-                    if key != "per_class"
+                    if key not in {"per_class", "weighted_per_class"}
                 },
                 "instance": {
                     key: value

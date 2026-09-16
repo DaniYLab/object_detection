@@ -1,5 +1,22 @@
 # Experiment Log — FloorPlanCAD Conditioned CenterNet
 
+## ArchCAD continuation — 2026-09-16
+
+The first learned public-40K panoptic pilot completed: 149,343-parameter
+primitive-only query/mask model, seed 1337, 32 train / 16 validation chunks,
+20 epochs (640 steps), no target truncation. Local validation macro semantic
+F1=0.09362, primitive-mask AP50=0.000787, mAP=0.000475, pooled PQ=0.08073
+(TP=10, FP=29, FN=154). Evaluation loss fell 14.84317 -> 8.44854 on validation
+and 14.85088 -> 6.43248 on train. These are pilot feasibility observations, not
+converged benchmarks or paper-comparable scores.
+
+Protocol, input audit and executed upstream metric differences:
+`docs/research/archcad_benchmark_audit_20260916.md`. Full report, pre-run config,
+selected sample IDs/source hashes and checkpoint:
+`outputs/panoptic/primitive_pilot_20260916_s1337/`.
+
+## Historical FloorPlanCAD experiments
+
 **Manifest:** `splits.json` fingerprint `f83fcffd294a7d536c5bad89fb132c79feaca87b250d185d6ea78d1fe5c064cc`
 **Benchmark:** stuff excluded, min_size 8, image 512, stride 8, 30 classes with GT.
 **Checkpoint selection:** `val AP50:95` (best_val_ap.pt), evaluated on val split.

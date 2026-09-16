@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 import numpy as np
+from scipy.special import ellipe, ellipeinc
 
 from src.data.archcad_constants import (
     ARCHCAD_IGNORE_LABEL,
@@ -90,9 +91,12 @@ def primitive_length(entity: Mapping[str, Any]) -> float:
         radius = float(entity.get("radius", 0.0))
         start_angle = float(entity.get("start_angle", 0.0))
         end_angle = float(entity.get("end_angle", 0.0))
-        delta = abs(end_angle - start_angle) % 360.0
-        if bool(entity.get("is_ccw")) and delta:
-            delta = 360.0 - delta
+        # Public ARC.direction=0 corresponds to SVG sweep=1, direction=1
+        # to sweep=0. Absolute angle differences break at the 0/360 seam.
+        direction = int(entity.get("direction", 0))
+        if direction not in {0, 1}:
+            raise ValueError("ARC.direction must be 0 or 1")
+        delta = ((end_angle - start_angle) * (1 if direction == 0 else -1)) % 360.0
         return max(radius, 0.0) * math.radians(delta)
     if primitive_type == "CIRCLE":
         return 2.0 * math.pi * max(float(entity.get("radius", 0.0)), 0.0)
@@ -105,12 +109,19 @@ def primitive_length(entity: Mapping[str, Any]) -> float:
         minor_radius = major_radius * ratio
         if major_radius <= 0 or minor_radius <= 0:
             return 0.0
-        h = ((major_radius - minor_radius) ** 2) / (
-            (major_radius + minor_radius) ** 2
-        )
-        return math.pi * (major_radius + minor_radius) * (
-            1.0 + 3.0 * h / (10.0 + math.sqrt(4.0 - 3.0 * h))
-        )
+        start = float(entity.get("start_param", 0.0))
+        end = float(entity.get("end_param", 2 * math.pi))
+        sign = 1 if entity.get("is_ccw", True) else -1
+        delta = (sign * (end - start)) % (2 * math.pi)
+        if math.isclose(abs(end - start), 2 * math.pi, abs_tol=1e-9):
+            return float(4 * major_radius * ellipe(1 - ratio * ratio))
+        start %= 2 * math.pi
+        # Analytic antiderivative of sqrt(sin(t)^2 + ratio^2*cos(t)^2).
+        # Stable for the very eccentric ellipses in the actual release.
+        parameter = 1 - ratio * ratio
+        a = ellipeinc(start + math.pi / 2, parameter)
+        b = ellipeinc(start + sign * delta + math.pi / 2, parameter)
+        return float(major_radius * abs(b - a))
     return 0.0
 
 
@@ -127,6 +138,10 @@ def _canonical_geometry(entity: Mapping[str, Any]) -> dict[str, Any]:
             "end_angle",
             "major_axis",
             "ratio",
+            "direction",
+            "start_param",
+            "end_param",
+            "is_ccw",
         )
         if key in entity
     }
@@ -150,15 +165,11 @@ def parse_archcad_panoptic_annotation(
     stuff_ids = set(ARCHCAD_STUFF_SEMANTIC_IDS)
     for entity_index, entity in enumerate(entities):
         if not isinstance(entity, Mapping):
-            issues.append(f"entity[{entity_index}] is not a mapping")
-            continue
+            raise TypeError(f"entity[{entity_index}] is not a mapping; cannot preserve primitive order")
         raw_semantic = entity.get("semantic")
-        semantic_id = (
-            int(raw_semantic)
-            if isinstance(raw_semantic, int)
-            and (raw_semantic in thing_ids or raw_semantic in stuff_ids)
-            else ARCHCAD_IGNORE_LABEL
-        )
+        if type(raw_semantic) is not int or raw_semantic not in {*thing_ids, *stuff_ids, 100}:
+            raise ValueError(f"entity[{entity_index}] has unknown semantic ID {raw_semantic!r}")
+        semantic_id = ARCHCAD_IGNORE_LABEL if raw_semantic == 100 else raw_semantic
         raw_instance = entity.get("instance")
         instance_key = (
             str(raw_instance) if raw_instance is not None and raw_instance != "" else None

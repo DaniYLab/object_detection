@@ -14,6 +14,7 @@ from src.data.archcad_panoptic import (
     parse_archcad_panoptic_annotation,
     primitive_length,
 )
+from src.data.archcad_panoptic_dataset import ArchCADPanopticDataset, archcad_panoptic_collate
 from src.data.dataset import (
     FloorPlanDataset,
     FloorPlanImageDataset,
@@ -74,6 +75,8 @@ from src.data.transforms import (
 __all__ = [
     "CLASS_NAMES",
     "ArchCADPanopticSample",
+    "ArchCADPanopticDataset",
+    "archcad_panoptic_collate",
     "ArchCADSegmentTarget",
     "CLASS_TO_IDX",
     "NUM_CLASSES",

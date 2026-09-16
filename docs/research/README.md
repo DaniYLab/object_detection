@@ -16,12 +16,13 @@ raster + geometry-only primitives
   -> semantic prediction per primitive
   -> instance mask prediction over primitives
   -> panoptic thing/stuff output
-  -> object reconstruction and dimensions later
+  -> written-dimension reading later
 ```
 
 ## Sources of truth
 
 1. `archcad_benchmark_protocol.md` — benchmark contract hiện hành.
+   `archcad_benchmark_audit_20260916.md` records corrections, parity limitations and the pilot.
 2. `../experiments/experiment_log.md` — kết quả Conditioned CenterNet đã kiểm chứng.
 3. `../../src/data/archcad_panoptic.py` — raw annotation → canonical panoptic GT.
 4. `../../src/evaluation/archcad_panoptic.py` — semantic/instance/panoptic metrics.
@@ -44,15 +45,15 @@ trạng thái chính hoặc chặn ArchCAD benchmark.
 | ArchCAD public data | Available | 41,097 aligned PNG/SVG/JSON/point/caption chunks |
 | ArchCAD taxonomy contract | Complete v0 | 30 semantics = 21 thing + 9 stuff; raw 100 ignored |
 | Primitive/instance target parser | Complete v0 | preserves all classes and primitive order |
-| Semantic evaluator | Complete v0 | macro/micro F1 and length-weighted variants |
-| Instance evaluator | Complete v0 | primitive-mask AP50/AP75/mAP |
-| Panoptic evaluator | Complete v0 | PQ/SQ/RQ total, thing, stuff, per-class |
+| Semantic evaluator | Local v1 tested; paper parity open | ignore handling and invalid-label regressions |
+| Instance evaluator | Local v1 tested; paper parity open | primitive-mask AP; interpolation/weight convention explicit |
+| Panoptic evaluator | Local v1 tested; upstream differs | one-to-one vs released matching; differential fixtures recorded |
 | 100-sample oracle audit | Passed | all tracks = 1.0 on 24,369 primitives |
 | Public-40K full audit | Complete | 41,097 chunks / 14,392,530 entities / 500,048 segments |
-| Data anomalies | Quantified | 64,441 thing primitives missing instance; 80 zero-length; 22,323 zero-weight |
-| JSON/SVG → point tensor mapping | Open blocker | public point arrays are not 1:1 with JSON entities; upstream loader missing |
-| Panoptic PyTorch dataset/collate | Not started | current ArchCAD dataset is bbox-only |
-| Primitive-only learned baseline | Not started | first model milestone |
+| Data anomalies | Re-audited 2026-09-16 | 64,441 thing primitives missing instance; 80 zero-length; 22,389 zero-weight |
+| JSON/SVG entity mapping | Verified on 100 samples | 24,369 semantic/instance pairs; auxiliary point.zip is not a proven model dependency |
+| Panoptic PyTorch dataset/collate | Implemented | raw entity indices, geometry-only features, per-image masks, split fingerprint |
+| Primitive-only learned baseline | Pilot completed | 149,343 params; 32 train / 16 val; local val PQ=0.08073 after 20 epochs |
 | Raster/dual-pathway baseline | Not started | after primitive-only control |
 | Conditioned Reflex panoptic ablation | Not started | after benchmark baseline converges |
 | Paper-comparable reproduction | Blocked | public subset/split differs from 413K paper benchmark |
@@ -68,12 +69,13 @@ bit-for-bit equivalence prematurely.
 
 ## Required order
 
-1. Resolve and test the exact JSON/SVG primitive → `point.zip` representation;
-   do not assume raw entity order matches DPSS tensor order.
-2. Freeze the public-40K development split and fingerprint; clearly mark it as
-   non-comparable to the paper split.
-3. Implement panoptic dataset/collate with aligned raster and verified primitive/point order.
-4. Train a small primitive-only control and verify non-trivial PQ.
+1. Expand the fixed-budget primitive-only pilot to representative train/validation
+   samples, reporting coverage, class-wise errors and seed variance.
+2. Keep the existing public-40K split fingerprint and the local v1 metric profile
+   fixed. Exact paper preprocessing/evaluator parity remains a separate open audit.
+3. Profile the long primitive-count tail before scaling; the pilot uses an
+   explicit 1,024-primitive / 64-segment eligibility cap, with no target truncation.
+4. Diagnose the low instance recall before architecture ablations.
 5. Add raster feature sampling and adaptive fusion.
 6. Reproduce the DPSS-style query/mask decoder baseline.
 7. Only then test conditioned vs unconditioned reflex mechanisms.

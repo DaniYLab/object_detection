@@ -85,7 +85,8 @@ NUM_ARCHCAD_CLASSES = len(ARCHCAD_COUNTABLE_CLASSES)  # 21 classes
 
 # Official DPSS release contract (`configs/svg/svg_pointT.yaml` and
 # `svgnet/evaluation/point_wise_eval.py`).  Raw semantic 100 (``others``) is
-# mapped to the background/ignore index 30 by the benchmark adapter.
+# mapped to background/ignore index 30 by our local adapter. The missing
+# upstream loader prevents verifying that raw-to-training-label conversion.
 NUM_ARCHCAD_SEMANTIC_CLASSES = 30
 ARCHCAD_IGNORE_LABEL = 30
 ARCHCAD_THING_SEMANTIC_IDS: tuple[int, ...] = (

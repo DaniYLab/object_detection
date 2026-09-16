@@ -31,6 +31,8 @@ def _semantic_metrics(
     *,
     weights: np.ndarray,
 ) -> dict[str, Any]:
+    valid = ground_truth != ARCHCAD_IGNORE_LABEL
+    ground_truth, prediction, weights = ground_truth[valid], prediction[valid], weights[valid]
     class_records = []
     for semantic_id in range(NUM_ARCHCAD_SEMANTIC_CLASSES):
         gt_positive = ground_truth == semantic_id
@@ -56,7 +58,8 @@ def _semantic_metrics(
         for value in range(NUM_ARCHCAD_SEMANTIC_CLASSES)
     )
     valid_weight = float(weights[ground_truth != ARCHCAD_IGNORE_LABEL].sum())
-    micro = _safe_ratio(true_positive, valid_weight)
+    predicted_weight = float(weights[prediction != ARCHCAD_IGNORE_LABEL].sum())
+    micro = _safe_ratio(2 * true_positive, valid_weight + predicted_weight)
     return {
         "macro_f1": (
             sum(record["f1"] for record in present) / len(present) if present else 0.0
@@ -77,7 +80,12 @@ def _validated_prediction(
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
     if prediction.get("image_id") != sample.image_id:
         raise ValueError("prediction image_id must match ground truth")
-    semantic = np.asarray(prediction.get("semantic_labels"), dtype=np.int64)
+    raw_semantic = np.asarray(prediction.get("semantic_labels"))
+    if raw_semantic.dtype.kind not in 'iu' or np.any(
+        (raw_semantic < 0) | (raw_semantic > ARCHCAD_IGNORE_LABEL)
+    ):
+        raise ValueError("semantic_labels must contain integer IDs 0..30")
+    semantic = raw_semantic.astype(np.int64)
     if semantic.shape != sample.semantic_labels.shape:
         raise ValueError(
             f"semantic prediction must have shape {sample.semantic_labels.shape}, "
@@ -87,10 +95,16 @@ def _validated_prediction(
     for index, instance in enumerate(prediction.get("instances", [])):
         if not isinstance(instance, Mapping):
             raise TypeError(f"instances[{index}] must be a mapping")
-        mask = np.asarray(instance.get("mask"), dtype=bool)
+        mask = np.asarray(instance.get("mask"))
+        if mask.dtype.kind not in 'biu' or not np.isin(mask, [0, 1]).all():
+            raise ValueError(f"instances[{index}].mask must be binary")
+        mask = mask.astype(bool)
         if mask.shape != sample.semantic_labels.shape:
             raise ValueError(f"instances[{index}].mask has invalid shape {mask.shape}")
-        semantic_id = int(instance.get("semantic_id"))
+        semantic_id = instance.get("semantic_id")
+        if not isinstance(semantic_id, (int, np.integer)) or isinstance(semantic_id, bool):
+            raise ValueError(f"instances[{index}].semantic_id must be an integer")
+        semantic_id = int(semantic_id)
         score = float(instance.get("score"))
         if semantic_id not in range(NUM_ARCHCAD_SEMANTIC_CLASSES):
             raise ValueError(f"instances[{index}].semantic_id is out of range")
@@ -100,6 +114,11 @@ def _validated_prediction(
             {"semantic_id": semantic_id, "score": score, "mask": mask}
         )
     return semantic, instances
+
+
+def _evaluation_weights(sample: ArchCADPanopticSample) -> np.ndarray:
+    """Local protocol: void/ignore primitives contribute no matching weight."""
+    return np.where(sample.semantic_labels != ARCHCAD_IGNORE_LABEL, sample.length_weights, 0.0)
 
 
 def _greedy_segment_matches(
@@ -141,24 +160,26 @@ def _panoptic_metrics(
     false_negative = np.zeros_like(true_positive)
     summed_iou = np.zeros_like(true_positive)
     for sample, sample_predictions in zip(samples, predictions):
+        weights = _evaluation_weights(sample)
         kept = [
             prediction
             for prediction in sample_predictions
-            if prediction["score"] >= score_threshold
+            if prediction["score"] >= score_threshold and weights[prediction["mask"]].sum() > 0
         ]
+        targets = [segment for segment in sample.segments if weights[segment.primitive_mask].sum() > 0]
         matches = _greedy_segment_matches(
-            sample.segments,
+            targets,
             kept,
-            sample.length_weights,
+            weights,
             iou_threshold=iou_threshold,
         )
         matched_gt = {match[0] for match in matches}
         matched_pred = {match[1] for match in matches}
         for gt_index, _, iou in matches:
-            semantic_id = sample.segments[gt_index].semantic_id
+            semantic_id = targets[gt_index].semantic_id
             true_positive[semantic_id] += 1
             summed_iou[semantic_id] += iou
-        for index, segment in enumerate(sample.segments):
+        for index, segment in enumerate(targets):
             if index not in matched_gt:
                 false_negative[segment.semantic_id] += 1
         for index, prediction in enumerate(kept):
@@ -226,19 +247,21 @@ def _instance_ap_at_iou(
             segment
             for segment in sample.segments
             if segment.semantic_id == semantic_id
+            and _evaluation_weights(sample)[segment.primitive_mask].sum() > 0
         ]
         for sample in samples
     }
     gt_count = sum(len(value) for value in ground_truth.values())
     if not gt_count:
         return None
-    weights = {sample.image_id: sample.length_weights for sample in samples}
+    weights = {sample.image_id: _evaluation_weights(sample) for sample in samples}
     ranked = sorted(
         [
             (sample.image_id, prediction)
             for sample, sample_predictions in zip(samples, predictions)
             for prediction in sample_predictions
             if prediction["semantic_id"] == semantic_id
+            and weights[sample.image_id][prediction["mask"]].sum() > 0
         ],
         key=lambda value: value[1]["score"],
         reverse=True,
@@ -283,6 +306,10 @@ def evaluate_archcad_panoptic(
         raise ValueError("samples and predictions must have equal length")
     if not samples:
         raise ValueError("at least one sample is required")
+    if len({sample.image_id for sample in samples}) != len(samples):
+        raise ValueError("duplicate sample image_id")
+    if not 0 <= panoptic_score_threshold <= 1 or not 0.5 <= panoptic_iou_threshold < 1:
+        raise ValueError("invalid panoptic thresholds")
     validated = [
         _validated_prediction(sample, prediction)
         for sample, prediction in zip(samples, predictions)
@@ -326,7 +353,8 @@ def evaluate_archcad_panoptic(
             }
         )
     return {
-        "schema_version": "archcad-panoptic-benchmark-v0",
+        "schema_version": "archcad-panoptic-benchmark-v1",
+        "protocol_status": "local_reconstruction_not_verified_paper_parity",
         "sample_count": len(samples),
         "primitive_count": sum(sample.primitive_count for sample in samples),
         "semantic": {
@@ -335,6 +363,7 @@ def evaluate_archcad_panoptic(
             "weighted_f1_macro": length_weighted["macro_f1"],
             "weighted_f1_micro": length_weighted["micro_f1"],
             "per_class": unweighted["per_class"],
+            "weighted_per_class": length_weighted["per_class"],
         },
         "instance": {
             "ap50": (
@@ -364,11 +393,26 @@ def evaluate_archcad_panoptic(
             iou_threshold=panoptic_iou_threshold,
         ),
         "parameters": {
+            "panoptic_aggregation": "pooled_counts; not class-macro PQ",
+            "matching_policy": "one_to_one; differs from released upstream evaluator",
+            "ignore_policy": "exclude GT ignore positions from all metrics",
+            "zero_weight_policy": "exclude masks with no positive evaluation weight",
+            "ap_interpolation": "101-point; paper parity unverified",
             "length_weight": "round(log(1 + primitive_length), 3)",
             "panoptic_score_threshold": panoptic_score_threshold,
             "panoptic_iou_threshold": panoptic_iou_threshold,
             "thing_semantic_ids": list(ARCHCAD_THING_SEMANTIC_IDS),
             "stuff_semantic_ids": list(ARCHCAD_STUFF_SEMANTIC_IDS),
             "ignore_label": ARCHCAD_IGNORE_LABEL,
+        },
+        "unscorable": {
+            "gt_segments": int(sum(
+                _evaluation_weights(s)[seg.primitive_mask].sum() <= 0
+                for s in samples for seg in s.segments
+            )),
+            "prediction_segments": int(sum(
+                _evaluation_weights(s)[p['mask']].sum() <= 0
+                for s, ps in zip(samples, instance_predictions) for p in ps
+            )),
         },
     }
