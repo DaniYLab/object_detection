@@ -14,6 +14,14 @@ import random
 import sys
 import time
 
+# cuBLAS reads CUBLAS_WORKSPACE_CONFIG when its first handle is created, and the fused
+# transformer encoder kernel refuses to run deterministically without it, so the variable
+# has to be in the environment before torch initializes CUDA. Restarting the process with
+# os.execv cannot be used for this: on Windows it spawns a replacement and exits, which
+# detaches the real work from any parent that supervises this script by exit code.
+if '--deterministic' in sys.argv:
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+
 import numpy as np
 import torch
 
@@ -88,14 +96,15 @@ def enforce_determinism():
     training kernels. The flash/mem-efficient attention backwards are not
     deterministic, so the math SDP backend is selected explicitly.
 
-    cuBLAS reads CUBLAS_WORKSPACE_CONFIG before its first handle is created and the
-    fused transformer encoder kernel refuses to run deterministically without it.
-    Setting it in-process is too late, so the process restarts once with the
-    variable already in the environment rather than silently falling back.
+    CUBLAS_WORKSPACE_CONFIG is set at import time from `sys.argv`, because the fused
+    transformer encoder kernel needs it before CUDA initializes. If it is missing here
+    the flag was abbreviated or the module was imported some other way, so this fails
+    loudly instead of silently running non-deterministically.
     """
     if not os.environ.get('CUBLAS_WORKSPACE_CONFIG'):
-        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-        os.execv(sys.executable, [sys.executable, *sys.argv])
+        raise RuntimeError(
+            'CUBLAS_WORKSPACE_CONFIG must be present before torch initializes CUDA; pass '
+            '--deterministic spelled in full, or export CUBLAS_WORKSPACE_CONFIG=:4096:8')
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     torch.backends.cuda.enable_flash_sdp(False)

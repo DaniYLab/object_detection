@@ -46,26 +46,11 @@ def test_enforce_determinism_configures_torch_and_reports_settings(monkeypatch):
         torch.backends.cuda.enable_math_sdp(saved['math_sdp'])
 
 
-def test_enforce_determinism_restarts_before_cuda_init_when_the_variable_is_absent(monkeypatch):
-    """cuBLAS must see the variable before the first handle, so in-process setting is not enough."""
+def test_enforce_determinism_fails_loudly_when_the_workspace_variable_is_absent(monkeypatch):
+    """Silently running non-deterministically would invalidate every control comparison."""
     monkeypatch.delenv('CUBLAS_WORKSPACE_CONFIG', raising=False)
-    calls = []
-
-    def fake_execv(path, argv):
-        calls.append((path, argv))
-        raise RuntimeError('re-exec requested')
-
-    monkeypatch.setattr(os, 'execv', fake_execv)
-    try:
-        with pytest.raises(RuntimeError, match='re-exec requested'):
-            enforce_determinism()
-        assert len(calls) == 1
-        assert calls[0][0] == sys.executable
-        # The variable is exported before restarting, so the child does not loop.
-        assert os.environ['CUBLAS_WORKSPACE_CONFIG'] == ':4096:8'
-        assert calls[0][1][:2] == [sys.executable, sys.argv[0]]
-    finally:
-        os.environ.pop('CUBLAS_WORKSPACE_CONFIG', None)
+    with pytest.raises(RuntimeError, match='CUBLAS_WORKSPACE_CONFIG'):
+        enforce_determinism()
 
 
 def test_capacity_flags_reach_the_resolved_model_config():
