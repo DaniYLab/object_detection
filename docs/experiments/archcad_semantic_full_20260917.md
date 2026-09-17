@@ -66,4 +66,68 @@ localises what remains.
 
 ## Results
 
-Pending at preregistration. Record outcomes and any deviations after completion.
+Completed in 2 hours 57 minutes, all of it on 27,272 images at 95,452 steps (preparation
+included). Final epoch:
+
+| Epoch | Val loss | Val pooled PQ | Val recall | Train pooled PQ |
+|---:|---:|---:|---:|---:|
+| 0 | 3.7237 | 0.00010 | 0.0002 | 0.0004 |
+| 7 | 2.0596 | 0.21324 | 0.2190 | 0.1953 |
+| 14 | 1.9056 | 0.21876 | 0.2333 | 0.2229 |
+| 21 | 1.8257 | 0.22984 | 0.2432 | 0.2416 |
+| 28 | 1.7191 | **0.246188** | 0.2679 | 0.2535 |
+
+`0.246188 > 0.227100`, so **the gains are additive**. Per-primitive accuracy **48.44%**,
+against 37.59% for the head at 4,096 images and 31.56% for the query/mask model at the same
+4,096. SQ 0.8196, RQ 0.3004.
+
+### The combination is better than the sum of its parts
+
+Taking the 4,096-image query/mask model (0.148511) as the reference point:
+
+| change | gain |
+|---|---:|
+| architecture alone (head at 4,096 images) | +0.057841 |
+| data alone (query/mask at 27,272 images) | +0.070789 |
+| sum of the two independent gains | +0.128630 |
+| **both together** | **+0.097677** |
+
+The combined gain is 76% of the sum, so the two directions are *partly* redundant rather
+than independent — but the preregistered gate was about whether the combination beats both
+arms, and it does, by 0.026890 over the best single arm. The honest description is that
+data and architecture reinforce each other with diminishing returns, not that they add.
+
+### Where the day ended up
+
+| configuration | pooled PQ (512 val) | per-primitive accuracy |
+|---|---:|---:|
+| 256 images, query/mask, the day's starting baseline | 0.124883 | 21.97% |
+| 4,096 images, query/mask | 0.148511 | 31.56% |
+| 4,096 images, semantic head | 0.206352 | 37.59% |
+| 27,272 images, query/mask | 0.219300 | — |
+| **27,272 images, semantic head** | **0.246188** | **48.44%** |
+| oracle semantics through the same grouper | 0.807876 | 100% |
+
+Roughly a doubling of pooled PQ over the day, with no new data: a 27x larger training subset
+of what was already on disk, and an architecture that stops asking instance prediction to
+carry per-primitive classification.
+
+### What remains
+
+The curve is still climbing at epoch 28 and train pooled PQ 0.2535 sits above validation
+0.2462, so neither data nor steps are exhausted. The larger term is still semantics: 48.44%
+accuracy against an oracle that scores 0.808 through the very same grouper. The next
+question is therefore what semantics needs — capacity, features (appearance re-scoped to
+semantics), or simply more of the same — and only after that a learned grouper, which the
+measurements put at roughly 7% of the remaining gap.
+
+### Deviations
+
+- Elapsed time was 2h57m against an estimate of about one hour; the estimate extrapolated
+  steps-per-minute from a smaller arm and was simply wrong. No protocol parameter changed.
+- The run shared the machine with read-only probes.
+
+### Artifacts
+
+- `outputs/panoptic/semantic_full`
+

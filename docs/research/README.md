@@ -53,12 +53,12 @@ trạng thái chính hoặc chặn ArchCAD benchmark.
 | Data anomalies | Re-audited 2026-09-16 | 64,441 thing primitives missing instance; 80 zero-length; 22,389 zero-weight |
 | JSON/SVG entity mapping | Verified on 100 samples | 24,369 semantic/instance pairs; auxiliary point.zip is not a proven model dependency |
 | Panoptic PyTorch dataset/collate | Implemented | raw entity indices, geometry-only features, per-image masks, split fingerprint |
-| Primitive-only learned baseline | Three-seed pilot completed; reproducibility caveat | 149,343 params; fixed 256 train / 128 val; local PQ=0.11663 ±0.01155; thing recall=0.09640; runs were not bit-reproducible, see `../experiments/archcad_optimization_20260917.md` |
-| Deterministic reruns and control check | Complete 2026-09-17 | repeated deterministic runs bit-identical; control vs 2026-09-16 FAILS 1e-6 (thing recall +0.014506); `--deterministic` added |
-| Primitive-only optimization checks (H1/H2) | Both preregistered gates FAILED | overfit 0.4706 recall / 0.4404 PQ vs 0.95/0.90; budget −0.020853 recall (nondeterministic) and +0.003626 (deterministic) vs +0.03 required |
-| Input/target ambiguity bound | Audited 2026-09-17 | 368 of 55,784 train primitives (0.66%) irreducible under geometry-only four-point features; 697 of 28,453 on val (2.45%) |
-| Raster/dual-pathway baseline | Not started | after primitive-only control |
-| Conditioned Reflex panoptic ablation | Not started | after benchmark baseline converges |
+| Primitive-only learned baseline | Three-seed pilot completed; superseded 2026-09-17 | the 256-image / 20-epoch control (PQ 0.11663 ± 0.01155) was not bit-reproducible and is 0.9% of the training split; current best is PQ 0.246188 |
+| Best primitive-only configuration | 2026-09-17 | per-primitive semantic head on all 27,272 eligible training images: pooled PQ 0.246188, thing PQ 0.240317, per-primitive accuracy 48.44% |
+| Lever audit 2026-09-17 | Budget, capacity, data and scale-features tested | budget PLATEAU at 50x; capacity criterion met by 2%; data live and still climbing; scale-aware input had no resolvable effect; the per-primitive semantic head (H9) and the full split (H8) both confirmed, and their combination (H10) is better than either arm |
+| Grouping vs semantics | Semantics carry the gap | a learning-free geometric grouper with oracle semantics scores 0.807876 through the frozen evaluator against 0.246188 for the best model; 92.9% of the remaining gap is per-primitive semantic error |
+| Raster/dual-pathway baseline | Not started; re-scoped | appearance is no longer the candidate fix for grouping (geometry handles it) but for semantic quality |
+| Conditioned Reflex panoptic ablation | Not started | after the semantic path is stable |
 | Paper-comparable reproduction | Blocked | public subset/split differs from 413K paper benchmark |
 
 ## Upstream audit
