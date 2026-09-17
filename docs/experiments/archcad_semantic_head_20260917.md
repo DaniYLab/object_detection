@@ -69,4 +69,54 @@ oracle ceiling are reported, so a partial result still localises what remains.
 
 ## Results
 
-Pending at preregistration. Record outcomes and any deviations after completion.
+Completed in 26 minutes. Final epoch, 4,096 training images, 28 epochs = 14,336 steps,
+512 validation images, grouper constants fitted on train.
+
+| Epoch | Val loss | Val pooled PQ | Val recall | Train pooled PQ |
+|---:|---:|---:|---:|---:|
+| 0 | 3.7237 | 0.00010 | 0.0002 | 0.0005 |
+| 7 | 2.0412 | 0.20821 | 0.1985 | 0.2060 |
+| 14 | 1.9903 | 0.20652 | 0.1994 | 0.2059 |
+| 21 | 1.9427 | 0.20655 | 0.2026 | 0.2141 |
+| 28 | 1.8979 | **0.20635** | 0.2047 | 0.2127 |
+
+| reference | pooled PQ | per-primitive accuracy |
+|---|---:|---:|
+| semantic head (this run) | **0.206352** | **37.59%** |
+| query/mask model end to end, same regime | 0.148511 | 31.56% |
+| that model's semantics through the same grouper (the arm to beat, gate 0.177516) | 0.169716 | — |
+| oracle semantics through the same grouper | 0.807876 | 100% |
+
+**Verdict: CONFIRMED.** `0.206352 > 0.177516`, by `+0.028836` over the gate and `+0.036636`
+over the arm to beat — 4.7 times the 0.0078 resolution of this validation set. Accuracy
+also improves on the reference, 37.59% against 31.56%.
+
+The head reaches this with 69,854 parameters against the query/mask model's 149,343, no
+queries, no mask head and no Hungarian matching. Dropping the entanglement of instance
+prediction and classification was worth more than any of the levers that were moved
+earlier in the day.
+
+Two features of the curve matter for what comes next:
+
+- it plateaus by epoch 7 and stays flat to epoch 28, with train pooled PQ 0.2127 against
+  validation 0.2064 — it is **not** overfitting at 4,096 images, so more data and more
+  capacity are both still available;
+- the panoptic components are SQ 0.825 and RQ 0.250, against 0.808/1.000 from the oracle
+  ceiling. The remaining loss is recall of instances, driven by semantic error: perfect
+  semantics would score 0.808 through the very same grouper.
+
+## Where this leaves the program
+
+Two independent wins now exist and have not been combined:
+
+| direction | result |
+|---|---|
+| data: full 28,771-image split, query/mask model | 0.205094 at epoch 21 of 28 (running) |
+| architecture: semantic head, 4,096 images | **0.206352** (final) |
+
+The semantic head with 14% of the data matches the query/mask model with all of it. The
+obvious next run is the head on the full split, which combines both, and then the same
+question the probes already framed: semantics are still at 37.6% accuracy against an
+oracle that scores 0.808, so the ceiling is far away and the remaining work is on
+semantic quality — capacity, features, and only then a learned grouper.
+
