@@ -85,4 +85,82 @@ variable for the next stage; otherwise the 1.1M-parameter variant is not carried
 
 ## Results
 
-Pending at preregistration. Record outcomes and any deviations after completion.
+Recorded after completion of `scale_dim64_1000`. The preregistered checks were run
+first and both passed; the decision rule was then applied to the preregistered
+endpoint.
+
+### Preregistered checks: passed
+
+- Selection is identical to the saved `primitive_256_s1337` run: 256 train / 128 val
+  image IDs, source hashes, split fingerprint `b0f01e46…5118c` and eligibility skips
+  all match, so the comparison is controlled.
+- The 20-epoch control **reproduced `det_control_a` exactly** — validation loss
+  `7.182919263839722` and all `semantic`/`instance`/`panoptic` metric blocks
+  bit-identical — even though two script revisions (the determinism restart guard and
+  the opt-in decoder parameter) landed in between. That is a second, cross-revision
+  confirmation that both changes are inert.
+
+### H3 — budget effect on the real subset: PLATEAU, not supported
+
+`scale_dim64_1000`, deterministic, seed 1337, 1000 epochs = 256,000 steps:
+
+| Epoch | Val loss | Val recall | Val pooled PQ | Train recall | Train pooled PQ |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 14.8242 | 0.0009 | 0.00077 | 0.0000 | 0.0000 |
+| 20 (control) | 7.1829 | 0.1106 | 0.11165 | 0.1517 | 0.1449 |
+| 100 | 10.0303 | 0.1142 | 0.10905 | 0.4138 | 0.3115 |
+| 200 | 14.9250 | 0.0734 | 0.10028 | 0.5185 | 0.4449 |
+| 400 | 18.4734 | 0.0771 | 0.09713 | 0.6486 | 0.5414 |
+| 600 | 20.6544 | 0.0861 | 0.10707 | 0.7019 | 0.5938 |
+| 800 | 20.6798 | 0.0780 | 0.10276 | 0.7105 | 0.6190 |
+| 1000 | 22.1765 | 0.0707 | **0.09733** | 0.7489 | **0.6503** |
+
+`delta = 0.09733211824663637 − 0.11164704552069724 = −0.014315`, which is below the
+`+0.02` threshold, and the last three evaluations span `0.007949` pooled PQ, under the
+`0.01` plateau bound. **Verdict: PLATEAU.**
+
+Reading: fifty times the budget makes the model fit its training set much better
+(train pooled PQ 0.1449 → 0.6503, train recall 0.1517 → 0.7489, train instance AP50
+0.6044) while validation degrades monotonically from epoch 200 (val loss 14.93 → 22.18,
+val pooled PQ 0.11165 at the control → 0.09733). Validation peaked early, at epoch 100
+(0.10905), and never recovered. The limitation on this subset is therefore **not**
+optimization budget: it is generalization with 256 training images, given a
+geometry-only four-point representation.
+
+**Correction to an earlier claim in this repository's working notes.** The 1000-epoch
+result falsifies the inference that the 20-epoch control was simply underfit and that
+spending GPU hours on budget would raise validation. Both statements were recorded
+before this run existed. The control sits close to the best validation performance
+this configuration reaches; the frozen pilot's numbers are not "measured on an
+unfit control" in the sense of being improvable by more epochs.
+
+`scale_dim128_1000` is the H4 arm and is reported when it completes.
+
+### What the verdict implies
+
+Per the preregistration, PLATEAU means the next step is **not** more epochs. The two
+untested levers, in the order the research plan already fixed, are:
+
+1. **Representation** — add raster feature sampling and adaptive fusion (plan step 5).
+   The model is geometry-only: 12 numbers per primitive with no image context.
+2. **Data scale** — the fixed 256-image subset is 0.9% of the 28,771 available train
+   images. Training on the full split was never attempted, and with the batched-step
+   path (`archcad_batched_step_20260917.md`, ~5.9x throughput) a full-split epoch is
+   now affordable, so this is the cheapest untested lever.
+
+### Deviations
+
+- The 20-epoch control re-runs `det_control_a` under a newer script revision; the
+  bit-exact match above is what makes it usable as a same-revision control.
+- `scale_dim64_1000` and `scale_dim128_1000` were executed while a separately
+  monitored throughput benchmark ran on the same GPU. That benchmark changes wall
+  clock only; its own runs were verified bit-identical to a sequential reference.
+- One recorded run took longer than expected: 3883 s for 1000 epochs. No protocol
+  parameter was changed in response.
+
+### Artifacts
+
+- `outputs/panoptic/scale_dim64_20_control`, `scale_dim64_1000`, `scale_dim128_1000`
+- Decision applied by `outputs/panoptic/_runs_20260917/apply_decision_rule.py`
+- Preregistered checks by `outputs/panoptic/_runs_20260917/check_scaling.py`
+
