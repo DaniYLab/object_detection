@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import json
+import os
 from pathlib import Path
 import random
 import sys
@@ -79,6 +80,33 @@ def evaluation_due(epoch, epochs, interval):
     return epoch == epochs or (interval > 0 and epoch % interval == 0)
 
 
+def enforce_determinism():
+    """Force reproducible CUDA kernels; must run before any CUDA work starts.
+
+    Seeded initialization was already bit-identical run to run; the nondeterminism
+    observed between the 2026-09-16 and 2026-09-17 seed-1337 runs is introduced by
+    training kernels. The flash/mem-efficient attention backwards are not
+    deterministic, so the math SDP backend is selected explicitly.
+
+    cuBLAS reads CUBLAS_WORKSPACE_CONFIG before its first handle is created and the
+    fused transformer encoder kernel refuses to run deterministically without it.
+    Setting it in-process is too late, so the process restarts once with the
+    variable already in the environment rather than silently falling back.
+    """
+    if not os.environ.get('CUBLAS_WORKSPACE_CONFIG'):
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+    torch.use_deterministic_algorithms(True)
+    return {'enabled': True, 'cublas_workspace_config': os.environ['CUBLAS_WORKSPACE_CONFIG'],
+            'cudnn_deterministic': True, 'deterministic_algorithms': True,
+            'flash_sdp': False, 'mem_efficient_sdp': False, 'math_sdp': True}
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data-root', type=Path, default=Path('data/ArchCAD'))
@@ -91,16 +119,24 @@ def main():
     p.add_argument('--max-primitives', type=int, default=1024)
     p.add_argument('--queries', type=int, default=64)
     p.add_argument('--dim', type=int, default=64)
+    p.add_argument('--heads', type=int, default=4)
+    p.add_argument('--encoder-layers', type=int, default=1)
+    p.add_argument('--decoder-layers', type=int, default=2)
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--seed', type=int, default=1337)
     p.add_argument('--selection-seed', type=int, default=1337,
                    help='Fixed across model seeds so replication uses identical images.')
+    p.add_argument('--deterministic', action='store_true',
+                   help='Force reproducible CUDA kernels; changes kernel selection relative to the 2026-09-16/17 runs.')
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     args = p.parse_args()
     if args.eval_every < 0:
         raise ValueError('eval-every must be non-negative')
     if min(args.train_images, args.val_images, args.epochs, args.max_primitives, args.queries) <= 0:
         raise ValueError('sample budgets, queries and epochs must be positive')
+    if args.dim % args.heads:
+        raise ValueError('dim must be divisible by heads')
+    determinism = enforce_determinism() if args.deterministic else {'enabled': False}
     # A run is immutable once configured; never overwrite an existing run.
     args.output_dir.mkdir(parents=True, exist_ok=False)
     random.seed(args.seed)
@@ -118,7 +154,9 @@ def main():
     hashes = lambda items: {sha256((args.data_root / 'png' / (i['image_id'] + '.png')).read_bytes()).hexdigest() for i in items}
     if hashes(train) & hashes(val):
         raise ValueError('pilot train/val share PNG content')
-    model = ArchCADPrimitiveBaseline(dim=args.dim, num_queries=args.queries).to(args.device)
+    model = ArchCADPrimitiveBaseline(dim=args.dim, num_queries=args.queries, heads=args.heads,
+                                     encoder_layers=args.encoder_layers,
+                                     decoder_layers=args.decoder_layers).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=.01)
     config = {**vars(args), 'data_root': str(args.data_root), 'output_dir': str(args.output_dir),
               'model': model.config, 'representation': REPRESENTATION, 'split_fingerprint': train_ds.split_fingerprint,
@@ -130,7 +168,8 @@ def main():
               'training': {'batch_images': 1, 'precision': 'fp32', 'gradient_clip': 1., 'optimizer': 'AdamW', 'weight_decay': .01,
                            'scheduler': 'none; fixed pilot budget', 'loss_weights': [2, 7, 5], 'no_object_weight': .05},
               'selection_rule': 'seeded random eligibility under primitive/query caps; no target truncation',
-              'metric_profile': 'local reconstruction v1; paper parity unverified', 'paper_reproduction': False}
+              'metric_profile': 'local reconstruction v1; paper parity unverified', 'paper_reproduction': False,
+              'determinism': determinism}
     config['decoder'] = {'score_threshold': .1, 'mask_threshold': .5,
                          'assignment': 'query-score times mask-probability argmax; merge stuff'}
     config['implementation_sha256'] = {
