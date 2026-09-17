@@ -92,6 +92,22 @@ def test_batched_loss_equals_the_frozen_loss_with_ragged_segment_counts():
     torch.testing.assert_close(combined, expected, rtol=1e-5, atol=1e-5)
 
 
+def test_pad_primitive_batch_follows_the_item_feature_width():
+    """The collate must not hardcode 12: the rich variant feeds 18 columns."""
+    narrow = _item(3, [1], [[True, False, False]])
+    wide = {'features': torch.randn(2, 18),
+            'targets': {'labels': torch.tensor([4]), 'masks': torch.ones(1, 2, dtype=torch.bool)}}
+    assert pad_primitive_batch([narrow])['features'].shape == (1, 3, 12)
+    assert pad_primitive_batch([wide])['features'].shape == (1, 2, 18)
+    torch.testing.assert_close(pad_primitive_batch([wide])['features'][0, :2], wide['features'])
+    try:
+        pad_primitive_batch([narrow, wide])
+    except ValueError as error:
+        assert 'feature width' in str(error)
+    else:
+        raise AssertionError('mixing feature widths in one batch must be rejected')
+
+
 def test_batch_items_and_padding_accounting():
     items = [_item(n, [1], [[True] * n]) for n in (10, 10, 10, 10, 4)]
     batches = batch_items(items, 2)

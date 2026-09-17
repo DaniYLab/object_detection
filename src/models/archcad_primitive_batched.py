@@ -57,9 +57,13 @@ def pad_primitive_batch(items, device='cpu'):
     sizes = [len(item['features']) for item in items]
     if min(sizes) <= 0:
         raise ValueError('every image must carry at least one primitive')
+    feature_widths = {int(item['features'].shape[1]) for item in items}
+    if len(feature_widths) != 1:
+        raise ValueError('all items in a batch must share the feature width')
+    feature_width = feature_widths.pop()
     width = max(sizes)
     batch = len(items)
-    features = torch.zeros(batch, width, 12, dtype=torch.float32)
+    features = torch.zeros(batch, width, feature_width, dtype=torch.float32)
     padding_mask = torch.ones(batch, width, dtype=torch.bool)
     target_masks, labels, widths = [], [], []
     for index, item in enumerate(items):

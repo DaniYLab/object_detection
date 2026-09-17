@@ -43,6 +43,7 @@ from scripts.research.train_archcad_primitive_pilot import (checkpoint_payload, 
                                                             enforce_determinism, evaluation_due,
                                                             select_samples)
 from src.data.archcad_panoptic_dataset import ArchCADPanopticDataset, REPRESENTATION
+from src.data.archcad_rich_features import ArchCADPrimitiveRich, augment_items
 from src.evaluation.archcad_panoptic import evaluate_archcad_panoptic
 from src.models.archcad_primitive_baseline import decode_primitive_masks, primitive_mask_loss
 from src.models.archcad_primitive_batched import (ArchCADPrimitiveBatched, batch_items,
@@ -110,6 +111,8 @@ def main():
     p.add_argument('--batch-size', type=int, default=8, help='Images per optimizer step.')
     p.add_argument('--batch-order', choices=['shuffled', 'length-grouped'], default='length-grouped')
     p.add_argument('--eval-batch-size', type=int, default=8)
+    p.add_argument('--rich-features', action='store_true',
+                   help='Append the scale-aware dimensions from src/data/archcad_rich_features.py.')
     p.add_argument('--deterministic', action='store_true',
                    help='Force reproducible CUDA kernels; changes kernel selection relative to the unbatched runs.')
     p.add_argument('--device', default=DEVICE)
@@ -132,9 +135,13 @@ def main():
     val_ds = ArchCADPanopticDataset(args.data_root, split='val')
     train, train_gt, train_skips = select_samples(train_ds, args.train_images, args.selection_seed, args.max_primitives, args.queries)
     val, val_gt, val_skips = select_samples(val_ds, args.val_images, args.selection_seed + 1, args.max_primitives, args.queries)
-    model = ArchCADPrimitiveBatched(dim=args.dim, num_queries=args.queries, heads=args.heads,
-                                    encoder_layers=args.encoder_layers,
-                                    decoder_layers=args.decoder_layers).to(args.device)
+    if args.rich_features:
+        augment_items(train)
+        augment_items(val)
+    architecture = ArchCADPrimitiveRich if args.rich_features else ArchCADPrimitiveBatched
+    model = architecture(dim=args.dim, num_queries=args.queries, heads=args.heads,
+                         encoder_layers=args.encoder_layers,
+                         decoder_layers=args.decoder_layers).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=.01)
     steps_per_epoch = int(np.ceil(len(train) / args.batch_size))
     config = {**vars(args), 'data_root': str(args.data_root), 'output_dir': str(args.output_dir),
@@ -151,20 +158,24 @@ def main():
                            'scheduler': 'none; fixed pilot budget', 'loss_weights': [2, 7, 5],
                            'no_object_weight': .05},
               'selection_rule': 'seeded random eligibility under primitive/query caps; no target truncation',
-              'protocol': 'batched_step_v1; one optimizer step per batch of images',
+              'protocol': 'batched_step_v1; one optimizer step per batch of images'
+                          + ('; scale-aware input features' if args.rich_features else ''),
+              'representation_detail': ('archcad_entity_four_points_v1' if not args.rich_features
+                                        else 'archcad_entity_four_points_v1 + scale-aware extras'),
               'metric_profile': 'local reconstruction v1; paper parity unverified', 'paper_reproduction': False,
               'determinism': determinism}
     config['decoder'] = {'score_threshold': .1, 'mask_threshold': .5,
                          'assignment': 'query-score times mask-probability argmax; merge stuff'}
-    config['implementation_sha256'] = {
-        str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in (
-            Path(__file__).resolve(),
-            Path('src/models/archcad_primitive_batched.py'),
-            Path('src/models/archcad_primitive_baseline.py'),
-            Path('src/data/archcad_panoptic_dataset.py'),
-            Path('src/data/archcad_panoptic.py'),
-            Path('src/evaluation/archcad_panoptic.py'),
-        )}
+    hashed = [Path(__file__).resolve(),
+              Path('src/models/archcad_primitive_batched.py'),
+              Path('src/models/archcad_primitive_baseline.py'),
+              Path('src/data/archcad_panoptic_dataset.py'),
+              Path('src/data/archcad_panoptic.py'),
+              Path('src/evaluation/archcad_panoptic.py')]
+    if args.rich_features:
+        hashed.append(Path('src/data/archcad_rich_features.py'))
+    config['implementation_sha256'] = {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                                       for path in hashed}
     config['padding_fraction_first_epoch'] = batch_padding(
         train, training_order(train, args.batch_size, args.seed, 1, args.batch_order == 'length-grouped'))
     (args.output_dir / 'config.json').write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8')
