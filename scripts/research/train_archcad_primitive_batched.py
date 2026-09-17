@@ -119,7 +119,9 @@ def main():
     args = p.parse_args()
     if args.eval_every < 0:
         raise ValueError('eval-every must be non-negative')
-    if min(args.train_images, args.val_images, args.epochs, args.max_primitives, args.queries, args.batch_size) <= 0:
+    if args.train_images == 0:
+        raise ValueError('train-images may be -1 (all eligible) or a positive count')
+    if min(args.val_images, args.epochs, args.max_primitives, args.queries, args.batch_size) <= 0:
         raise ValueError('sample budgets, queries, epochs and batch size must be positive')
     if args.dim % args.heads:
         raise ValueError('dim must be divisible by heads')
@@ -154,6 +156,7 @@ def main():
               'selection_skips': {'train': train_skips, 'val': val_skips},
               'training': {'batch_images': args.batch_size, 'steps_per_epoch': steps_per_epoch,
                            'total_steps': steps_per_epoch * args.epochs, 'precision': 'fp32',
+                           'train_images_resolved': len(train), 'val_images_resolved': len(val),
                            'gradient_clip': 1., 'optimizer': 'AdamW', 'weight_decay': .01,
                            'scheduler': 'none; fixed pilot budget', 'loss_weights': [2, 7, 5],
                            'no_object_weight': .05},

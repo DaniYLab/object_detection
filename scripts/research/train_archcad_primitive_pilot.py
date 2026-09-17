@@ -33,6 +33,13 @@ from src.models.archcad_primitive_baseline import ArchCADPrimitiveBaseline, prim
 
 
 def select_samples(dataset, count, seed, max_primitives, num_queries):
+    """Collect `count` eligible samples, or every eligible sample when count is negative.
+
+    Selection is a prefix of one seeded shuffle, so a larger `count` yields a superset of
+    a smaller one. That is what makes the data-scale arms nested, and it is why the
+    resolved count must be recorded: with a negative count the caller cannot know how many
+    images exist until selection has run.
+    """
     order = list(range(len(dataset)))
     random.Random(seed).shuffle(order)
     selected, truths, skips = [], [], Counter()
@@ -50,8 +57,10 @@ def select_samples(dataset, count, seed, max_primitives, num_queries):
         item.pop('image')  # The declared primitive-only control does not consume pixels.
         selected.append(item)
         truths.append(truth)
-        if len(selected) == count:
+        if 0 <= count == len(selected):
             return selected, truths, dict(skips)
+    if count < 0 and selected:
+        return selected, truths, dict(skips)
     raise ValueError(f'only {len(selected)} eligible samples; requested {count}')
 
 

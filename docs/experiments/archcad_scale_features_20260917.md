@@ -106,4 +106,52 @@ hyperparameter is changed in response to validation observations.
 
 ## Results
 
-Pending at preregistration. Record outcomes and any deviations after completion.
+Both arms completed at the amended regime: 4,096 training images, 28 epochs = 14,336
+steps, 512 validation images, batched B=8, deterministic, seed 1337.
+
+| Arm | Input | Val loss | Val pooled PQ | Val recall | Train pooled PQ |
+|---|---|---:|---:|---:|---:|
+| A′ | frozen 12-dim | 6.1376 | 0.14851 | 0.2335 | 0.1481 |
+| B′ | rich 18-dim | 5.7802 | **0.15321** | 0.2181 | 0.1560 |
+
+`delta = 0.15321 − 0.14851 = +0.00470`, below the preregistered `+0.0078` threshold.
+
+**Verdict: NO RESOLVABLE EFFECT.** H7 is not supported.
+
+Within the run, the rich input does lower validation loss (5.7802 versus 6.1376) but the
+panoptic metric does not follow, and validation recall is if anything slightly lower
+(0.2181 versus 0.2335). Train and validation pooled PQ coincide in both arms (0.1481 /
+0.14851 and 0.1560 / 0.15321), so neither arm is overfitting — the measured difference is
+an input-representation difference at a converged-ish operating point, and it is inside the
+resolution of the metric.
+
+Per the preregistered rule, the consequence is that **local packing scale is not the
+missing information** for the instances the probe identified as separable, and the
+appearance branch (raster feature sampling, plan step 5) becomes the primary path rather
+than the deferred one.
+
+### Cross-checks
+
+- Arm A′ is the same configuration as `scaleData_4096x4` re-evaluated on 512 validation
+  images: 0.14851 here against 0.14486 on the 128-image subset. Consistent, and it shows
+  the larger validation set shifts the value by less than the floor as expected.
+- Both arms ran to the preregistered endpoint with no protocol changes after the
+  amendment.
+
+### Artifacts
+
+- `outputs/panoptic/val512_frozen_4096`, `outputs/panoptic/val512_rich_4096`
+
+### Follow-up implied
+
+Two things now point the same way, and neither is the input's scale information:
+
+1. the separable-but-missed third of instances (34.8%) is not recovered by adding local
+   scale, step size and size ratio to the input;
+2. the third that no proximity rule can separate (35.8%) needs appearance by construction.
+
+Both are addressed by raster feature sampling, which the research plan already lists as
+step 5 and which this pair of results moves from "next in the plan" to "the measured
+bottleneck". The data lever from H6 remains open and is being tested separately at the
+full training split.
+
