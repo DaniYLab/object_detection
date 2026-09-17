@@ -75,13 +75,15 @@ bit-for-bit equivalence prematurely.
 1. Separate optimization/data-budget limitations from architectural limitations
    in the primitive-only control. The completed 3-seed pilot has low thing recall;
    inspect prespecified longer-budget curves before changing the architecture.
-   Done 2026-09-17: the prespecified checks failed their gates and the baseline was
-   found not bit-reproducible. At 8 training images, longer budgets raise recall
-   (0.3529 → 0.7255 → 0.8824 → 0.9608 at 200/600/1200/3000 epochs) while SQ reaches
-   0.927, so the earlier shortfall was budget-limited, not architectural: the recall
-   half of the overfit gate is met from epoch 2000, and only PQ ≥ 0.90 is unmet
-   (0.8706 at 3000 epochs, best 0.8896). Fix determinism before comparing anything
-   further.
+   Done 2026-09-17, answer: budget is NOT the constraint on the real subset. At 8
+   training images longer budgets do raise recall (0.3529 → 0.7255 → 0.8824 → 0.9608
+   at 200/600/1200/3000 epochs), but on the fixed 256/128 subset a 50x budget
+   (`scale_dim64_1000`, 1000 epochs) returns PLATEAU under the preregistered rule:
+   train pooled PQ 0.1449 → 0.6503 and train recall 0.1517 → 0.7489 while validation
+   degrades from epoch 200 (val loss 14.93 → 22.18, val PQ 0.09733 versus 0.11165 for
+   the 20-epoch control). The untested levers are representation (plan step 5) and
+   data scale: the subset is 256 of 28,771 train images. See
+   `../experiments/archcad_baseline_scaling_20260917.md`.
 2. Keep the existing public-40K split fingerprint and the local v1 metric profile
    fixed. Exact paper preprocessing/evaluator parity remains a separate open audit.
 3. Profile the long primitive-count tail before scaling; the pilot uses an
