@@ -109,14 +109,19 @@ Two features of the curve matter for what comes next:
 
 Two independent wins now exist and have not been combined:
 
-| direction | result |
-|---|---|
-| data: full 28,771-image split, query/mask model | 0.205094 at epoch 21 of 28 (running) |
-| architecture: semantic head, 4,096 images | **0.206352** (final) |
+| direction | pooled PQ (512 val) |
+|---|---:|
+| architecture: semantic head, 4,096 images | **0.206352** |
+| data: full 27,272-image split, query/mask model | **0.219300** |
 
-The semantic head with 14% of the data matches the query/mask model with all of it. The
-obvious next run is the head on the full split, which combines both, and then the same
-question the probes already framed: semantics are still at 37.6% accuracy against an
-oracle that scores 0.808, so the ceiling is far away and the remaining work is on
+At epoch 21 of the full-split run the two were level (0.20509 against 0.20635), and this
+document was first written on that reading; at its endpoint the full-split query/mask model
+pulls ahead, so the honest statement is that the head wins **at matched data** (0.20635
+against 0.14851 at 4,096 images) and that the full split is worth more than the architecture
+change on its own. Neither has been tested together.
+
+The obvious next run is therefore the head on the full split. After that, the same question
+the probes already framed: semantics sit at 37.6% accuracy against an oracle that scores
+0.808 through the very same grouper, so the ceiling is far away and the remaining work is
 semantic quality — capacity, features, and only then a learned grouper.
 

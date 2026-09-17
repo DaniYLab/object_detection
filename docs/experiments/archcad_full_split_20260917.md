@@ -72,4 +72,50 @@ that only overfits less is also informative.
 
 ## Results
 
-Pending at preregistration. Record outcomes and any deviations after completion.
+Completed in 92 minutes, of which roughly 25 were preparation (parsing and decoding 27,272
+drawings). The eligible count is **27,272** of the 28,771 training images — 1,499 are
+excluded by the 1..1024 primitive and 1..64 segment caps, which is the first time that
+number has been measured. 3,409 steps per epoch, 95,452 steps total.
+
+| Epoch | Val loss | Val pooled PQ | Val recall | Train pooled PQ |
+|---:|---:|---:|---:|---:|
+| 0 | 14.8207 | 0.00020 | 0.0002 | 0.0001 |
+| 7 | 6.2734 | 0.15917 | 0.2522 | 0.1502 |
+| 14 | 5.8919 | 0.19959 | 0.3105 | 0.1908 |
+| 21 | 5.6830 | 0.20509 | 0.3187 | 0.1989 |
+| 28 | 5.4262 | **0.21930** | **0.3330** | 0.2188 |
+
+`delta = 0.21930 − 0.14851 = +0.070790`, far above the 0.0078 resolution.
+
+**Verdict: DATA STILL LIVE.** H8 is supported, and the dose-response is still climbing
+steeply rather than bending: 256 → 4,096 images was worth +0.025 at an equal step budget,
+and 4,096 → 27,272 is worth +0.0708 here.
+
+Train pooled PQ 0.2188 against validation 0.21930 — there is no generalisation gap left at
+this data scale. The model is not overfitting; it is still underfitting, so both more data
+and more steps remain available.
+
+### What this changes
+
+The data lever answered the question the 2×2 raised, and it did so decisively: this is the
+largest single improvement measured for the query/mask architecture all day, obtained by
+using the data that was already on disk. The earlier sessions' 256-image subset was 0.9% of
+the training split and every result before today was measured there.
+
+It also resets what "the model" means for the next comparison. The query/mask architecture
+at 27,272 images scores 0.21930, which is above the per-primitive semantic head at 4,096
+images (0.20635). The head still wins at matched data — 0.20635 against 0.14851 at 4,096 —
+so the two are independent wins that have not been combined.
+
+### Deviations
+
+- Preparation took about 25 minutes, longer than the estimate, and is included in the
+  elapsed time. No protocol parameter was changed.
+- The run shared the machine with read-only probes and a concurrent semantic-head run. That
+  affects wall clock only.
+
+### Artifacts
+
+- `outputs/panoptic/scaleData_full` with `progress.json`
+- Resolved counts in `config.training.train_images_resolved` / `val_images_resolved`
+
