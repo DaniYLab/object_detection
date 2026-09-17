@@ -53,7 +53,10 @@ trạng thái chính hoặc chặn ArchCAD benchmark.
 | Data anomalies | Re-audited 2026-09-16 | 64,441 thing primitives missing instance; 80 zero-length; 22,389 zero-weight |
 | JSON/SVG entity mapping | Verified on 100 samples | 24,369 semantic/instance pairs; auxiliary point.zip is not a proven model dependency |
 | Panoptic PyTorch dataset/collate | Implemented | raw entity indices, geometry-only features, per-image masks, split fingerprint |
-| Primitive-only learned baseline | Three-seed pilot completed | 149,343 params; fixed 256 train / 128 val; local PQ=0.11663 ±0.01155; thing recall=0.09640 |
+| Primitive-only learned baseline | Three-seed pilot completed; reproducibility caveat | 149,343 params; fixed 256 train / 128 val; local PQ=0.11663 ±0.01155; thing recall=0.09640; runs were not bit-reproducible, see `../experiments/archcad_optimization_20260917.md` |
+| Deterministic reruns and control check | Complete 2026-09-17 | repeated deterministic runs bit-identical; control vs 2026-09-16 FAILS 1e-6 (thing recall +0.014506); `--deterministic` added |
+| Primitive-only optimization checks (H1/H2) | Both preregistered gates FAILED | overfit 0.4706 recall / 0.4404 PQ vs 0.95/0.90; budget −0.020853 recall (nondeterministic) and +0.003626 (deterministic) vs +0.03 required |
+| Input/target ambiguity bound | Audited 2026-09-17 | 368 of 55,784 train primitives (0.66%) irreducible under geometry-only four-point features; 697 of 28,453 on val (2.45%) |
 | Raster/dual-pathway baseline | Not started | after primitive-only control |
 | Conditioned Reflex panoptic ablation | Not started | after benchmark baseline converges |
 | Paper-comparable reproduction | Blocked | public subset/split differs from 413K paper benchmark |
@@ -72,6 +75,13 @@ bit-for-bit equivalence prematurely.
 1. Separate optimization/data-budget limitations from architectural limitations
    in the primitive-only control. The completed 3-seed pilot has low thing recall;
    inspect prespecified longer-budget curves before changing the architecture.
+   Done 2026-09-17: the prespecified checks failed their gates and the baseline was
+   found not bit-reproducible. At 8 training images, longer budgets raise recall
+   (0.3529 → 0.7255 → 0.8824 → 0.9608 at 200/600/1200/3000 epochs) while SQ reaches
+   0.927, so the earlier shortfall was budget-limited, not architectural: the recall
+   half of the overfit gate is met from epoch 2000, and only PQ ≥ 0.90 is unmet
+   (0.8706 at 3000 epochs, best 0.8896). Fix determinism before comparing anything
+   further.
 2. Keep the existing public-40K split fingerprint and the local v1 metric profile
    fixed. Exact paper preprocessing/evaluator parity remains a separate open audit.
 3. Profile the long primitive-count tail before scaling; the pilot uses an
@@ -79,6 +89,10 @@ bit-for-bit equivalence prematurely.
 4. Raw-query diagnosis found class-agnostic coverage 29.19%, correct-class
    coverage 12.15%, and final thing recall 9.61% (seed 1337); thresholding alone
    does not explain the misses. See `../experiments/archcad_primitive_replication_20260916.md`.
+   Extended 2026-09-17: 24 of the 28 segments lost between 12.15% and 9.61% (86%)
+   are lost inside the decoder's own disjoint assignment and mask binarisation, not
+   in the evaluator's one-to-one matching. See
+   `../experiments/archcad_optimization_20260917.md` section E3.
 5. Add raster feature sampling and adaptive fusion.
 6. Reproduce the DPSS-style query/mask decoder baseline.
 7. Only then test conditioned vs unconditioned reflex mechanisms.

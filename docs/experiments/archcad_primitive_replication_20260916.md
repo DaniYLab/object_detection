@@ -114,3 +114,18 @@ with full training/validation curves. Determine whether thing recall continues
 to improve before attributing failure to the primitive representation or adding
 conditioning/fusion. A separate small-set overfit test can isolate optimization
 capacity. Do not tune threshold on these validation observations.
+
+## Post-hoc note (2026-09-17): these runs are not bit-reproducible
+
+The three runs above were trained before the training path was made deterministic.
+Rerunning the seed-1337 configuration at the same budget and seed does not reproduce
+the saved epoch-20 result: thing recall `0.096102 → 0.110607`, pooled PQ
+`0.119358 → 0.111647`, i.e. outside any numerical tolerance. The spread across three
+identical-protocol seed-1337 runs is 0.014506 in thing recall, comparable to the
+sample standard deviation reported below, so `± 0.00590` understates the true
+variation and the mean should not be quoted as a reproducible baseline.
+
+Seeded initialization, sample selection and evaluation are reproducible (epoch-0
+metrics were bit-identical); the divergence is introduced by training kernels. Two
+independent reruns with `--deterministic` are bit-identical to each other. Full
+evidence and the protocol deviations are in `archcad_optimization_20260917.md`.
