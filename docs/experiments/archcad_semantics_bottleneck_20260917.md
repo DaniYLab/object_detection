@@ -77,12 +77,27 @@ Read as a decomposition: replacing the learned mask head with the geometric grou
 +38% PQ without any training; replacing the model's semantics with the oracle gains +405%.
 **Roughly 85% of the lost PQ is per-primitive semantic error, not instance grouping.**
 
-### Caveat on the reference
+### Caveat on the reference, and its resolution
 
 The grouper's two thresholds (proximity 0.1, connectivity 0.01) were chosen by sweeping on
-this validation subset, so 0.830832 is optimistic. They must be re-derived on the training
-split before the number is quoted as a ceiling; the ordering of the three rows does not
-depend on that, since all three share the same grouper.
+this validation subset, so the table above is optimistic. Re-fitting them on 256 **training**
+images (`src/data/archcad_geometric_grouping.py::fit_thresholds`) selects proximity 0.020
+and connectivity 0.010, which reaches pairwise F1 0.9107 on train, and gives a lower and
+attributable validation reference:
+
+| configuration, train-fitted constants | pooled PQ | thing PQ |
+|---|---:|---:|
+| model semantics + model instances | 0.119358 | 0.093355 |
+| model semantics + geometric grouping | 0.164135 | 0.159962 |
+| oracle semantics + geometric grouping | **0.751385** | 0.683065 |
+
+Proximity alone at 0.1, with connectivity disabled, gives 0.749670 — so the reference sits
+near 0.75 whether or not connectivity is used, and the earlier 0.831 was 0.080 of tuning
+optimism.
+
+Decomposition against the honest reference: the gap from ceiling to model is 0.632026, of
+which **0.587250 (92.9%) is semantic error** and 0.044776 (7.1%) is the mask head. The
+conclusion is unchanged, which is the point of having fitted the constants on train.
 
 ## What this says about the architecture
 
