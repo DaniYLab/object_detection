@@ -89,7 +89,7 @@ Recorded after completion of `scale_dim64_1000`. The preregistered checks were r
 first and both passed; the decision rule was then applied to the preregistered
 endpoint.
 
-### Preregistered checks: passed
+### H3 — budget effect on the real subset: PLATEAU, not supported
 
 - Selection is identical to the saved `primitive_256_s1337` run: 256 train / 128 val
   image IDs, source hashes, split fingerprint `b0f01e46…5118c` and eligibility skips
@@ -134,7 +134,37 @@ before this run existed. The control sits close to the best validation performan
 this configuration reaches; the frozen pilot's numbers are not "measured on an
 unfit control" in the sense of being improvable by more epochs.
 
-`scale_dim128_1000` is the H4 arm and is reported when it completes.
+### H4 — capacity at the long budget: criterion met by a 2% margin
+
+`scale_dim128_1000` (1,107,231 parameters, same protocol, 1000 epochs):
+
+| Epoch | Val loss | Val recall | Val pooled PQ | Train pooled PQ |
+|---:|---:|---:|---:|---:|
+| 100 | 9.5110 | 0.0970 | 0.11257 | 0.2781 |
+| 200 | 11.1149 | 0.0988 | 0.12252 | 0.3622 |
+| 400 | 12.8983 | 0.1170 | 0.13205 | 0.4679 |
+| 500 | 13.4466 | 0.1160 | 0.13793 | 0.5291 |
+| 700 | 14.0522 | 0.1106 | 0.13094 | 0.5509 |
+| 900 | 12.4010 | 0.1079 | 0.11010 | 0.5035 |
+| 1000 | 12.2715 | 0.1061 | **0.11412** | 0.4781 |
+
+The preregistered H4 criterion was that `dim128` beat `dim64` at the final epoch by more
+than the noise floor. `0.11412 − 0.09733 = +0.016784` against a floor of `0.016429`: the
+criterion is met, by `0.000355`, about 2% of the threshold. **Recorded as met, and not
+treated as a finding** — a margin that size cannot carry a recommendation either way.
+
+What is not marginal is robustness. Over 1000 epochs `dim128` holds validation pooled PQ
+between 0.110 and 0.138 and its validation loss rises from 9.51 to only 12.27, while
+`dim64` falls to 0.093–0.109 with validation loss rising to 22.18. Capacity delays the
+overfitting substantially without moving the endpoint.
+
+Applied to `scale_dim128_1000`, the H3 rule (written for the `dim64` run) would return
+INCONCLUSIVE: `delta = +0.002469` is under `+0.02` and the last three evaluations span
+`0.015919`, above the `0.01` plateau bound. That is an unplanned secondary computation
+and is labelled as such.
+
+**Both capacities land near the 20-epoch control after 50x the training.** Neither budget
+nor capacity moves validation beyond ~0.11–0.14.
 
 ### What the verdict implies
 

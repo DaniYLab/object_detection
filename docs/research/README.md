@@ -75,15 +75,15 @@ bit-for-bit equivalence prematurely.
 1. Separate optimization/data-budget limitations from architectural limitations
    in the primitive-only control. The completed 3-seed pilot has low thing recall;
    inspect prespecified longer-budget curves before changing the architecture.
-   Done 2026-09-17, answer: budget is NOT the constraint on the real subset. At 8
-   training images longer budgets do raise recall (0.3529 → 0.7255 → 0.8824 → 0.9608
-   at 200/600/1200/3000 epochs), but on the fixed 256/128 subset a 50x budget
-   (`scale_dim64_1000`, 1000 epochs) returns PLATEAU under the preregistered rule:
-   train pooled PQ 0.1449 → 0.6503 and train recall 0.1517 → 0.7489 while validation
-   degrades from epoch 200 (val loss 14.93 → 22.18, val PQ 0.09733 versus 0.11165 for
-   the 20-epoch control). The untested levers are representation (plan step 5) and
-   data scale: the subset is 256 of 28,771 train images. See
-   `../experiments/archcad_baseline_scaling_20260917.md`.
+   Answered 2026-09-17: budget is NOT the constraint. Four levers were moved on the
+   fixed split — budget 20 → 1000 epochs (PLATEAU), capacity 149K → 1.1M parameters
+   (criterion met by a 2% margin), data 256 → 4,096 images (INCONCLUSIVE), and each
+   landed in the same validation band as the 20-epoch control (`0.11165`), none
+   exceeding it beyond the `0.016429` noise floor. Adding data does remove the
+   overfitting (train/val PQ gap `+0.1092` → `−0.0034`) without improving validation,
+   which points at the geometry-only representation rather than at optimization.
+   See `../experiments/archcad_optimization_20260917.md` §E5 and
+   `../experiments/archcad_data_scale_20260917.md`.
 2. Keep the existing public-40K split fingerprint and the local v1 metric profile
    fixed. Exact paper preprocessing/evaluator parity remains a separate open audit.
 3. Profile the long primitive-count tail before scaling; the pilot uses an

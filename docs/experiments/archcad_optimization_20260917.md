@@ -271,6 +271,36 @@ bit-identical before/after the change by comparing per-image prediction digests 
   taken on the pre-edit code, after the opt-in parameter was added, and after the final
   dtype fix. All three agree.
 
+### E5 — every lever tested today lands in the same validation band
+
+Four separate levers were moved on the fixed public-40K split, all deterministic, seed
+1337, and all reported at their preregistered endpoint:
+
+| Lever | Range tested | Best final val pooled PQ | Verdict |
+|---|---|---:|---|
+| Budget (`dim64`) | 20 → 1000 epochs (50x) | 0.09733 | PLATEAU |
+| Budget (`dim128`) | 20 → 1000 epochs | 0.11412 | ≥ control, inside the floor |
+| Capacity | 149K → 1.1M params (7.4x) | 0.13793 best epoch, 0.11412 final | criterion met by 2% |
+| Data | 256 → 4,096 images (16x) | 0.12490 | INCONCLUSIVE |
+
+Reference: the frozen deterministic 20-epoch control at validation pooled PQ
+`0.11165`. Every lever lands in roughly `0.095–0.138`, and nothing exceeds the control
+by more than the `0.016429` noise floor of this 128-image validation subset.
+
+What did change is the *train/val gap*, which is not a lever effect but a regime
+indicator: `+0.1092` at 256 images, `+0.0152` at 1,024, `−0.0034` at 4,096. Overfitting
+can be switched off by adding data, and validation does not improve when it is.
+
+That combination — a lever that removes overfitting without moving validation, and three
+other levers that also do not move it — is what points at the **representation** rather
+than at optimization, capacity or data volume. The model sees twelve numbers per
+primitive and no image content, so the information needed to separate `wall` from
+`concrete_column` may simply not be present in its input.
+
+None of these runs tests that hypothesis. It is the next preregistration, not a
+conclusion from the evidence above, and each individual verdict above is the one its own
+preregistration returned, not the synthesis.
+
 ### What would change these conclusions
 
 1. Re-run the three-seed replication with `--deterministic` before treating

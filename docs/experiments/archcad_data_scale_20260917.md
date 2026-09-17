@@ -84,4 +84,53 @@ non-result is still informative.
 
 ## Results
 
-Pending at preregistration. Record outcomes and any deviations after completion.
+All three arms completed. Batched B=8, length-grouped, deterministic, seed 1337,
+3,584 optimizer steps each (28,672 images seen), identical validation images.
+
+| Arm | Images | Epochs | Val loss | Val pooled PQ | Val recall | Train pooled PQ | Train recall | Train−val PQ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| A | 256 | 112 | 8.1191 | 0.09973 | 0.0825 | 0.2089 | 0.2328 | **+0.1092** |
+| B | 1,024 | 28 | 6.9775 | 0.09491 | 0.0943 | 0.1102 | 0.1250 | **+0.0152** |
+| C | 4,096 | 7 | 6.8765 | **0.12490** | 0.1224 | 0.1215 | 0.1195 | **−0.0034** |
+
+Applied mechanically by `outputs/panoptic/_runs_20260917/apply_data_scale_rule.py`:
+
+- val pooled PQ sequence `0.099732 → 0.094908 → 0.124905` is **not monotone** (arm B
+  sits below arm A), so the `data-limited` branch does not apply;
+- the arms are not within the noise floor of each other either (`C − A = +0.025173`
+  against a floor of `0.016429`), so the `not-data-limited` branch does not apply.
+
+**Verdict: INCONCLUSIVE.** Per the preregistration this means record the curves and do
+not switch direction on this evidence alone.
+
+### What the arms actually show
+
+The train/val gap is the informative column. It collapses from `+0.1092` at 256 images
+to `−0.0034` at 4,096: the overfitting that dominated every earlier experiment ends once
+the training set is large enough, and at 4,096 images train and validation pooled PQ are
+the same number (0.1215 versus 0.12490). Validation loss falls monotonically across arms
+(8.12 → 6.98 → 6.88).
+
+That is a regime change, but it did not buy validation quality: arm C's `0.12490` is
+`+0.0133` above the frozen 20-epoch control (`0.11165`) and inside the noise floor.
+
+### Limitation of this design, identified after running it
+
+The arms are matched on **optimizer steps and images seen**, which necessarily means the
+larger-data arms see each drawing fewer times: 112 passes over 256 drawings versus 7
+passes over 4,096. Data quantity is therefore entangled with repetition count, and arm C
+is plausibly **step-limited** rather than at its ceiling: it has stopped overfitting
+without having converged. The `inconclusive` verdict is a real limitation of the design,
+not only of the data.
+
+The cheapest closable follow-up is the same 4,096-image arm at matched *exposure* rather
+than matched steps, for example 28 epochs (14,336 steps, about 32 minutes at the
+measured batched rate). That would separate "more data does not help" from "more data
+helps but needs more steps", which this run cannot decide.
+
+### Artifacts
+
+- `outputs/panoptic/scaleData_{256,1024,4096}` with `progress.json` curves
+- Rule applied by `outputs/panoptic/_runs_20260917/apply_data_scale_rule.py`
+- Aggregate of all 2026-09-17 evidence in `archcad_optimization_20260917.md`
+
