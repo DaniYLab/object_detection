@@ -73,20 +73,35 @@ def primitive_mask_loss(output, target):
 
 
 @torch.no_grad()
-def decode_primitive_masks(output, image_id, score_threshold=.1):
-    """Emit semantic labels and disjoint panoptic masks with merged stuff."""
+def decode_primitive_masks(output, image_id, score_threshold=.1, mask_threshold=.5,
+                           consistent_semantic_thresholds=False):
+    """Emit semantic labels and disjoint panoptic masks with merged stuff.
+
+    The instance path keeps only queries that pass the no-object and score gates,
+    with a binarised mask. The semantic map does not, by default: it lets every
+    query vote with its raw mask probability. `consistent_semantic_thresholds`
+    applies the same gates to that vote and marks primitives with no surviving
+    vote as ignore (30). It is opt-in because the default is the frozen decoder of
+    the 2026-09-16/17 runs, and it can only move the semantic F1/wF1: instances
+    are built from query class scores, never from the semantic map.
+    """
     cls = output['class_logits'].softmax(-1)
     masks = output['mask_logits'].sigmoid()
-    semantic = (cls[:, :30].T @ masks).argmax(0).cpu().numpy()
     scores, labels = cls.max(-1)
     keep = (labels != 30) & (scores >= score_threshold)
+    if consistent_semantic_thresholds:
+        votes = cls[keep][:, :30].T @ (masks[keep] >= mask_threshold).to(cls.dtype)
+        semantic = votes.argmax(0).cpu().numpy()
+        semantic[votes.sum(0).cpu().numpy() == 0] = 30
+    else:
+        semantic = (cls[:, :30].T @ masks).argmax(0).cpu().numpy()
     scores, labels, masks = scores[keep], labels[keep], masks[keep]
     instances = []
     if len(scores):
         assigned = (scores[:, None] * masks).argmax(0)
         stuff = {}
         for i, (score, label, mask) in enumerate(zip(scores, labels, masks)):
-            selected = ((assigned == i) & (mask >= .5)).cpu().numpy()
+            selected = ((assigned == i) & (mask >= mask_threshold)).cpu().numpy()
             if not selected.any():
                 continue
             label = int(label)

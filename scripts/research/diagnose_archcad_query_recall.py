@@ -18,10 +18,12 @@ from src.models.archcad_primitive_baseline import ArchCADPrimitiveBaseline, deco
 
 
 @torch.no_grad()
-def diagnose(checkpoint, device='cpu'):
+def diagnose(checkpoint, device='cpu', split='val'):
     saved = torch.load(checkpoint, map_location='cpu', weights_only=True)
     cfg = saved['run_config']
-    ds = ArchCADPanopticDataset(cfg['data_root'], split='val')
+    if split not in {'train', 'val'}:
+        raise ValueError('diagnostic split must be train or val')
+    ds = ArchCADPanopticDataset(cfg['data_root'], split=split)
     if ds.split_fingerprint != cfg['split_fingerprint']:
         raise ValueError('split fingerprint drift')
     lookup = {image_id: i for i, image_id in enumerate(ds.image_ids)}
@@ -29,7 +31,7 @@ def diagnose(checkpoint, device='cpu'):
     model.load_state_dict(saved['model'])
     torch.set_num_threads(4)
     counts = Counter()
-    for reference in cfg['val']:
+    for reference in cfg[split]:
         item = ds[lookup[reference['image_id']]]
         if item['provenance']['raw_sha256'] != reference['raw_sha256']:
             raise ValueError('source annotation drift')
@@ -56,7 +58,7 @@ def diagnose(checkpoint, device='cpu'):
             p['semantic_id'] in ARCHCAD_THING_SEMANTIC_IDS and float(weights[p['mask']].sum()) > 0
             for p in final['instances'])
     return {'schema_version': 'archcad-query-recall-diagnostic-v1', 'checkpoint': str(checkpoint),
-            'seed': cfg['seed'], 'device': device, 'validation_images': len(cfg['val']), 'counts': dict(counts),
+            'seed': cfg['seed'], 'device': device, 'split': split, 'image_count': len(cfg[split]), 'counts': dict(counts),
             'coverage': {k: v / counts['thing_gt'] for k, v in counts.items() if k.endswith('_covered')},
             'interpretation': 'optimistic raw-query per-GT coverage, not one-to-one recall; fixed IoU>0.5, score>=0.1, mask>=0.5'}
 
@@ -66,8 +68,9 @@ def main():
     p.add_argument('checkpoint', type=Path)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--device', default='cpu')
+    p.add_argument('--split', choices=['train', 'val'], default='val')
     args = p.parse_args()
-    report = diagnose(args.checkpoint, args.device)
+    report = diagnose(args.checkpoint, args.device, args.split)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
     print(json.dumps(report, indent=2))
