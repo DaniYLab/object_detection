@@ -198,6 +198,25 @@ one-to-one matching. The score gate costs nothing, confirming the earlier diagno
 The semantic map cannot move any of these rows: instances are built from query class
 scores, never from the semantic map.
 
+**Correction: that loss is a property of an under-trained model, not of the decoder.**
+The same script on the converged 3000-epoch overfit checkpoint
+(`cap_dim64_3000/last.pt`, train split, 51 thing GT segments) gives a flat ladder:
+
+| Stage | Under-trained (20 epochs, val) | Converged (3000 epochs, train) |
+|---|---:|---:|
+| correct class | 134 / 1,103 (12.15%) | 49 / 51 (96.08%) |
+| plus decoder disjoint assignment and binarisation | 110 / 1,103 (9.97%) | 49 / 51 (96.08%) |
+| plus class-conditional one-to-one matching | 106 / 1,103 (9.61%) | 49 / 51 (96.08%) |
+
+At convergence the decoder and the matcher together cost nothing; on the 20-epoch model
+they cost 28 segments. Mask probabilities near 0.5 make the binarisation and the
+`argmax` assignment noisy, so this cost tracks training progress rather than decoder
+design. The earlier suggestion that the decoder assignment is "the first thing to
+change" is withdrawn: the decoder is not the binding constraint, and the priority
+returns to optimization budget. A 64-query cap was also ruled out as the cause — the
+selected subsets peak at 52 (train) and 44 (val) target segments, with p95 at 28 and 27,
+so no image comes near the cap.
+
 **E4 — applying the decoder thresholds consistently to the semantic map.** The
 semantic map is the only part of the decoder that votes with raw mask probabilities
 instead of the gated, binarised masks. Making it consistent changes labels for 9,319 of
@@ -261,7 +280,7 @@ bit-identical before/after the change by comparing per-image prediction digests 
    gate is reachable: PQ was 0.8706 at epoch 3000 with a best of 0.8896 at epoch 2250,
    so the remaining gap is about one point and may close with budget rather than with a
    different decoder or representation.
-3. The decoder's disjoint assignment accounts for 86% of the measured postprocessing
-   loss (E3) and is also the cheapest lever on PQ, so it is the first thing to change
-   before attributing the remaining gap to the evaluator or to the representation.
+3. The decoder is not the lever it first appeared to be: on a converged checkpoint its
+   assignment and binarisation cost nothing (E3 correction). Spend the next GPU hours on
+   optimization budget for the real subset, not on decoder redesign.
 

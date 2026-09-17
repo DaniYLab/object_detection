@@ -43,11 +43,13 @@ def _truth(data_root, reference):
 
 
 @torch.no_grad()
-def diagnose(checkpoint, device='cpu'):
+def diagnose(checkpoint, device='cpu', split='val'):
     saved = torch.load(checkpoint, map_location='cpu', weights_only=True)
     cfg = saved['run_config']
+    if split not in {'train', 'val'}:
+        raise ValueError('diagnostic split must be train or val')
     data_root = Path(cfg['data_root'])
-    ds = ArchCADPanopticDataset(data_root, split='val')
+    ds = ArchCADPanopticDataset(data_root, split=split)
     if ds.split_fingerprint != cfg['split_fingerprint']:
         raise ValueError('split fingerprint drift')
     lookup = {image_id: i for i, image_id in enumerate(ds.image_ids)}
@@ -58,7 +60,7 @@ def diagnose(checkpoint, device='cpu'):
     counts = Counter()
     truths, default_predictions, consistent_predictions = [], [], []
     semantic_digests = []
-    for reference in cfg['val']:
+    for reference in cfg[split]:
         item = ds[lookup[reference['image_id']]]
         truth = _truth(data_root, reference)
         truths.append(truth)
@@ -119,7 +121,7 @@ def diagnose(checkpoint, device='cpu'):
         for a, b in zip(q['semantic_labels'], r['semantic_labels']))
     primitives = sum(len(q['semantic_labels']) for q in default_predictions)
     return {
-        'schema_version': SCHEMA, 'checkpoint': str(checkpoint), 'split': 'val',
+        'schema_version': SCHEMA, 'checkpoint': str(checkpoint), 'split': split,
         'seed': cfg['seed'], 'device': device, 'image_count': len(truths),
         'gates': {'iou': IOU_GATE, 'score': SCORE_GATE, 'mask': MASK_GATE},
         'counts': dict(counts),
@@ -148,8 +150,9 @@ def main():
     p.add_argument('checkpoint', type=Path)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--device', default='cpu')
+    p.add_argument('--split', choices=['train', 'val'], default='val')
     args = p.parse_args()
-    report = diagnose(args.checkpoint, args.device)
+    report = diagnose(args.checkpoint, args.device, args.split)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
     print(json.dumps(report, indent=2))

@@ -90,8 +90,10 @@ bit-for-bit equivalence prematurely.
    coverage 12.15%, and final thing recall 9.61% (seed 1337); thresholding alone
    does not explain the misses. See `../experiments/archcad_primitive_replication_20260916.md`.
    Extended 2026-09-17: 24 of the 28 segments lost between 12.15% and 9.61% (86%)
-   are lost inside the decoder's own disjoint assignment and mask binarisation, not
-   in the evaluator's one-to-one matching. See
+   are lost inside the decoder's disjoint assignment and mask binarisation — but only
+   on an under-trained model. On a converged checkpoint the same stages cost nothing
+   (49 → 49 → 49 of 51), so that loss tracks optimization progress, not decoder
+   design, and the decoder is not the binding constraint. See
    `../experiments/archcad_optimization_20260917.md` section E3.
 5. Add raster feature sampling and adaptive fusion.
 6. Reproduce the DPSS-style query/mask decoder baseline.
