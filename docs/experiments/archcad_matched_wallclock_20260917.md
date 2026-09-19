@@ -59,4 +59,46 @@ exposure response at batch 32 becomes known and not only its endpoint.
 
 ## Results
 
-Pending at preregistration. Record outcomes and any deviations after completion.
+| run | batch | epochs | steps | val pooled PQ | val accuracy | train − val | elapsed |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `semantic_full_56ep` | 8 | 56 | 190,904 | 0.273106 | 0.5254 | +0.006158 | 3,555 s |
+| `semantic_full_112ep` | 8 | 112 | 381,808 | 0.304004 | 0.5662 | +0.004368 | 3,762 s |
+| **`semantic_full_b32_280ep`** | **32** | **280** | 238,840 | **0.305800** | **0.5727** | **+0.001543** | **3,002 s** |
+
+`0.305800 > 0.273106`, by `+0.032694`.
+
+**Verdict: batching wins per minute.** Batch 32 at 280 epochs also edges past the 112-epoch
+batch-8 run — `+0.001796`, which is inside the 0.0078 resolution and therefore a tie on
+quality — while costing **20% less wall clock** (3,002 s against 3,762 s). Per the
+preregistered rule, a tie is settled in favour of whichever is cheaper to run.
+
+### Correcting the size of that win
+
+`archcad_batched_step_20260917.md` said batching was 5.3x cheaper, measured per epoch at
+matched exposure. End to end it is not: batch 32 needs roughly 2.5 times the epochs to reach
+the same validation quality, because fewer and larger updates are less effective per unit of
+exposure — the same fact that made it lose at matched exposure. The net saving at equal
+quality is **about 20%**, not 5.3x, and that is the number to use when planning runs.
+
+What remains true is that batch 32 is the cheaper configuration to run and should be the
+default for scaling from here.
+
+### Where the exposure curve now sits
+
+| run | epochs | val pooled PQ at each evaluated point |
+|---|---|---|
+| batch 8 | 28/56/84/112 | 0.24619, 0.27311, 0.29126, 0.304004 |
+| batch 32 | 28/56/84/112/140/168/196/224/252/280 | 0.22294, 0.24403, 0.26208, 0.27420, 0.28653, 0.28801, 0.29301, 0.30001, 0.30397, **0.30580** |
+
+Both curves are decelerating and converging near **0.305**: the last batch-8 interval adds
+`+0.0127` while the last batch-32 interval adds `+0.0018`. Exposure is close to exhausted by
+this pipeline, which makes the measured grouping lever the one worth building next: perfect
+grouping at today's semantics is worth `+0.207062` by the oracle measurement in
+`archcad_full_exposure_20260917.md`, against the `+0.002` to `+0.013` that another exposure
+doubling now buys.
+
+## Artifacts
+
+- `outputs/panoptic/semantic_full_b32_280ep`
+- Gate applied by `outputs/panoptic/_runs_20260917/apply_h15_rule.py`
+
