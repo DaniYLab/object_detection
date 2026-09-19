@@ -54,10 +54,11 @@ trạng thái chính hoặc chặn ArchCAD benchmark.
 | JSON/SVG entity mapping | Verified on 100 samples | 24,369 semantic/instance pairs; auxiliary point.zip is not a proven model dependency |
 | Panoptic PyTorch dataset/collate | Implemented | raw entity indices, geometry-only features, per-image masks, split fingerprint |
 | Primitive-only learned baseline | Three-seed pilot completed; superseded 2026-09-17 | the 256-image / 20-epoch control (PQ 0.11663 ± 0.01155) was not bit-reproducible and is 0.9% of the training split; current best is PQ 0.246188 |
-| Best primitive-only configuration | 2026-09-17 | per-primitive semantic head on all 27,272 eligible training images: pooled PQ 0.246188, thing PQ 0.240317, per-primitive accuracy 48.44% |
-| Lever audit 2026-09-17 | Budget, capacity, data and scale-features tested | budget PLATEAU at 50x; capacity criterion met by 2%; data live and still climbing; scale-aware input had no resolvable effect; the per-primitive semantic head (H9) and the full split (H8) both confirmed, and their combination (H10) is better than either arm |
-| Grouping vs semantics | Semantics carry the gap | a learning-free geometric grouper with oracle semantics scores 0.807876 through the frozen evaluator against 0.246188 for the best model; 92.9% of the remaining gap is per-primitive semantic error |
-| Raster/dual-pathway baseline | Not started; re-scoped | appearance is no longer the candidate fix for grouping (geometry handles it) but for semantic quality |
+| Best primitive-only configuration | 2026-09-20 | per-primitive semantic head on all 27,272 eligible training images with per-class grouping radii: pooled PQ 0.331524, thing PQ 0.334900, per-primitive accuracy 57.3% |
+| Grouping rule | Per-class radii adopted 2026-09-20 | `PER_CLASS_PROXIMITY` in `src/data/archcad_geometric_grouping.py`, fitted on train by train PQ: +0.025724 over the uniform radius, 3.3x the resolution. Fitted against today's predicted classes, so refit after the semantics improve |
+| Grouping ceiling | Measured | with today's semantics, oracle grouping scores 0.480167 and oracle semantics with the fixed grouper 0.807876, against 0.331524 for the adopted pipeline |
+| Lever audit 2026-09-17/20 | Budget, capacity, data, scale features, exposure, learned grouping | budget PLATEAU at 50x; capacity criterion met by 2%; data live; exposure exhausted at 4,096 images but still climbing at the full split; scale-aware input no resolvable effect; learned edge pruning and connectivity-only grouping both worse; per-class radii the first win |
+| Raster/dual-pathway baseline | Not started; motivation closed | the raw entities carry no styling channel: `rgb` is `[0,0,0]` for every entity, so appearance cannot separate classes that geometry cannot |
 | Conditioned Reflex panoptic ablation | Not started | after the semantic path is stable |
 | Paper-comparable reproduction | Blocked | public subset/split differs from 413K paper benchmark |
 
