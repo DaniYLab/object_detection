@@ -32,11 +32,13 @@ class ArchCADPrimitiveSemantic(nn.Module):
     """Transformer encoder over primitive tokens with a 30-way head per primitive."""
 
     def __init__(self, in_features=12, dim=64, heads=4, encoder_layers=2,
-                 classes=NUM_ARCHCAD_SEMANTIC_CLASSES):
+                 classes=NUM_ARCHCAD_SEMANTIC_CLASSES, architecture='per_primitive_semantic'):
         super().__init__()
+        # `config` must stay constructor-compatible: checkpoints store it as
+        # `model_config`, and consumers rebuild the model with `Model(**model_config)`.
         self.config = dict(in_features=in_features, dim=dim, heads=heads,
                            encoder_layers=encoder_layers, classes=classes,
-                           architecture='per_primitive_semantic')
+                           architecture=architecture)
         self.embedding = nn.Sequential(nn.Linear(in_features, dim), nn.GELU(), nn.LayerNorm(dim))
         self.encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(dim, heads, dim * 2, dropout=0., batch_first=True),

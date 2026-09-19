@@ -35,6 +35,17 @@ def test_semantic_head_reports_its_input_contract_and_shapes():
         raise AssertionError('a wrong feature width must be rejected')
 
 
+def test_model_config_rebuilds_the_model_so_checkpoints_stay_loadable():
+    """Every consumer rebuilds with Model(**checkpoint['model_config']); keep it valid."""
+    model = ArchCADPrimitiveSemantic(in_features=12, dim=16, heads=4, encoder_layers=1)
+    rebuilt = ArchCADPrimitiveSemantic(**model.config)
+    assert list(rebuilt.state_dict()) == list(model.state_dict())
+    rebuilt.load_state_dict(model.state_dict())
+    features = torch.randn(1, 5, 12)
+    torch.testing.assert_close(model(features, None)['semantic_logits'],
+                               rebuilt(features, None)['semantic_logits'])
+
+
 def test_padding_marks_positions_as_ignore_with_zero_weight():
     batch = pad_semantic_batch([_item(3, [1, 2, 30]), _item(5, [4, 5, 6, 7, 8])])
     assert batch['sizes'] == [3, 5] and batch['features'].shape == (2, 5, 12)
