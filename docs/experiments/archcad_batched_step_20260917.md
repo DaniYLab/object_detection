@@ -67,7 +67,50 @@ batching (~2.2x) and concurrency (~2.7x at K=8) combine to roughly **5.9x** tota
 throughput on this workload. Concurrency alone, measured separately on the frozen
 path, saturated at 2.3x.
 
-## Using it for results
+## Update 2026-09-17: the bottleneck moved to evaluation, and batching costs quality
+
+Two measurements after the batched step was in use, both on the semantic head rather than
+the original query/mask model.
+
+### Evaluation, not training, was the largest cost
+
+Per evaluation call, on real drawings:
+
+| component | 1,024 drawings | 512 drawings |
+|---|---:|---:|
+| model forward | 0.6 s | 0.3 s |
+| **geometric grouper** | **11.3 s** | 6.2 s |
+| frozen evaluator | — | 1.5 s |
+
+The grouper costs nineteen times the model forward because grouping runs per drawing.
+Extrapolated to the full split that is about **5.3 minutes per evaluation**, and the trainer
+evaluated both the training split and validation at every point. A 112-epoch run at
+`--eval-every 14` therefore spent roughly forty minutes producing a diagnostic train number
+that no gate uses.
+
+`--eval-train-images` now caps that diagnostic evaluation to a prefix of 2,048 selected
+images (0 keeps everything). The cap is a prefix of the same seeded selection, so the subset
+is identical across runs and train numbers stay comparable. Validation is never capped.
+
+### Batching trades quality for wall clock
+
+At matched exposure — 56 epochs over the full split — batch 32 is 5.3x faster and worse:
+
+| configuration | steps | val pooled PQ | val accuracy | elapsed |
+|---|---:|---:|---:|---:|
+| batch 8 | 190,904 | **0.273106** | 0.525435 | 59 min |
+| batch 32 | 47,768 | 0.244025 | 0.477389 | **11.2 min** |
+
+`−0.029081`, which is 3.7 times the 0.0078 resolution: **not quality-neutral**. The same gap
+is present at epoch 28 (0.22294 against 0.24619), so it is a consistent deficit rather than a
+late-run effect, and it is what the 2x2 already implied — the model is step-limited, and
+batch 32 buys the same exposure with four times fewer updates.
+
+The wall-clock question is therefore open rather than settled: batch 32 is 5.3x cheaper per
+epoch, and exposure doublings have been worth about +0.027 each, so whether it wins per
+minute is an empirical question with two plausible answers. It is preregistered separately
+as `archcad_matched_wallclock_20260917.md`.
+
 
 This is a different optimization protocol: one optimizer step now covers a batch of
 images, so steps per epoch, the effective gradient batch and the loss normalization
