@@ -38,8 +38,8 @@ from src.data.archcad_geometric_grouping import (DEFAULT_CONNECTIVITY, DEFAULT_P
 from src.data.archcad_panoptic_dataset import ArchCADPanopticDataset
 from src.data.archcad_rich_features import augment_items
 from src.evaluation.archcad_panoptic import evaluate_archcad_panoptic
-from src.models.archcad_semantic_head import (ArchCADPrimitiveSemantic, pad_semantic_batch,
-                                              semantic_classification_loss)
+from src.models.archcad_semantic_head import (ArchCADPrimitiveNoContext, ArchCADPrimitiveSemantic,
+                                              pad_semantic_batch, semantic_classification_loss)
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -96,8 +96,11 @@ def main():
     p.add_argument('--max-primitives', type=int, default=1024)
     p.add_argument('--queries', type=int, default=64,
                    help='Only used for selection eligibility, so the subset matches the baseline runs.')
+    p.add_argument('--architecture', choices=['transformer', 'no_context'], default='transformer',
+                   help='no_context classifies each primitive from its own features alone.')
     p.add_argument('--dim', type=int, default=64)
     p.add_argument('--heads', type=int, default=4)
+    p.add_argument('--width', type=int, default=256, help='Hidden width for --architecture no_context.')
     p.add_argument('--encoder-layers', type=int, default=2)
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--seed', type=int, default=1337)
@@ -118,7 +121,7 @@ def main():
         raise ValueError('train-images may be -1 (all eligible) or a positive count')
     if min(args.val_images, args.epochs, args.max_primitives, args.batch_size) <= 0:
         raise ValueError('sample budgets, epochs and batch size must be positive')
-    if args.dim % args.heads:
+    if args.architecture != "no_context" and args.dim % args.heads:
         raise ValueError('dim must be divisible by heads')
     determinism = enforce_determinism() if args.deterministic else {'enabled': False}
     args.output_dir.mkdir(parents=True, exist_ok=False)
@@ -138,8 +141,11 @@ def main():
         augment_items(train)
         augment_items(val)
     in_features = int(train[0]['features'].shape[1])
-    model = ArchCADPrimitiveSemantic(in_features=in_features, dim=args.dim, heads=args.heads,
-                                     encoder_layers=args.encoder_layers).to(args.device)
+    if args.architecture == 'no_context':
+        model = ArchCADPrimitiveNoContext(in_features=in_features, width=args.width).to(args.device)
+    else:
+        model = ArchCADPrimitiveSemantic(in_features=in_features, dim=args.dim, heads=args.heads,
+                                         encoder_layers=args.encoder_layers).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=.01)
     steps_per_epoch = int(np.ceil(len(train) / args.batch_size))
     config = {**vars(args), 'data_root': str(args.data_root), 'output_dir': str(args.output_dir),
