@@ -68,6 +68,40 @@ The semantic head is trained with per-primitive cross-entropy, which never touch
 grouping: instances are built only at decode time. So better grouping constants improve the
 pipeline's output without retraining, and they apply to every checkpoint already on disk.
 
+## Full two-pass fit over every class, and adoption
+
+The eight-class fit above was extended to a two-pass coordinate descent over all 30 classes
+present in the fit set, 10,145 seconds of compute. It found a better optimum and it is now the
+module default:
+
+| | pooled PQ | thing PQ |
+|---|---:|---:|
+| uniform proximity 0.1, pre-2026-09-20 behaviour | 0.305800 | 0.300241 |
+| **per-class radii, two-pass fit (module default)** | **0.331524** | **0.334900** |
+| difference | **+0.025724** | +0.034659 |
+
+`+0.025724` is 3.3 times the 0.0078 resolution. The fit-set PQ moved from 0.308225 to
+0.337188, so the validation gain is 89% of the fit gain.
+
+The fitted table is in `src/data/archcad_geometric_grouping.py` as `PER_CLASS_PROXIMITY`, with
+`proximity_for(semantic, override)`; `group_instances(proximity=None)` uses it and passing a
+float restores the uniform behaviour for comparison. Verified by reconstruction: the module
+default reproduces `0.331524` exactly on the same checkpoint and validation set.
+
+Two fitted values carry most of it and both match the diagnosis:
+
+| class | radius | note |
+|---|---:|---|
+| `pile` | 0.02 | tightened; the single largest contribution, +0.0201 on the fit set |
+| `single_door` | 0.05 | tightened |
+| `urinal` | 0.01 | tightened |
+| `staircase`, `hole`, `parking_space`, `elevator`, `toilet`, `bathtub`, and the furniture | 0.20 | widened, they need to be joined at all |
+| everything else | 0.10 | unchanged |
+
+Note that coordinate descent is path dependent: the eight-class fit had chosen 0.05 for
+`concrete_column`, and the full fit reverted it to 0.10 while still reaching a better overall
+optimum. The reported number is the validation score of the final set, not of a path.
+
 ## Status of the lever
 
 | approach | pooled PQ |
@@ -75,16 +109,19 @@ pipeline's output without retraining, and they apply to every checkpoint already
 | fixed uniform rule | 0.305800 |
 | learned pruning of candidate edges | 0.291465 |
 | connectivity only | 0.221738 |
-| **per-class radii fitted on train** | **0.327670** |
+| **per-class radii, two-pass, adopted** | **0.331524** |
 | oracle grouping at the same semantics | 0.480167 |
 
-Roughly an eighth of the prize has been taken, and the direction that took it — per-class
-structure in the grouping rule — is the one the input-side probes pointed at all along. A
-two-pass fit over every class present is running; per-class connectivity tolerances are the
-natural extension after it.
+About a seventh of the prize has been taken, and the direction that took it — per-class
+structure in the grouping rule — is the one the input-side probes pointed at all along. The
+natural extensions, in order: per-class **connectivity** tolerances, which the fit held fixed
+at 0.01 throughout; and re-fitting after the semantics improve, since the radii were fitted
+against today's predicted classes.
 
 ## Artifacts
 
 - `outputs/panoptic/_runs_20260917/probe_grouping_variants.py` (the refutation)
 - `outputs/panoptic/_runs_20260917/fit_per_class_radii.py` (the eight-class fit)
 - `outputs/panoptic/_runs_20260917/fit_per_class_radii_full.py` (two passes, all classes)
+- `outputs/panoptic/_runs_20260917/verify_per_class_default.py` (the adoption check)
+

@@ -31,6 +31,25 @@ DEFAULT_PROXIMITY = 0.1
 DEFAULT_CONNECTIVITY = 0.01
 CLOSED_TYPES = (CIRCLE, ELLIPSE)
 
+# Per-class proximity radii, fitted by coordinate descent on 1,024 training images with the
+# frozen evaluator's pooled PQ as the objective, two passes over every class present
+# (`docs/experiments/archcad_per_class_grouping_20260920.md`). A single radius cannot serve
+# every class: `pile` needs 0.02 to stop merging adjacent piles while `staircase`, `hole` and
+# `parking_space` need 0.20 to be connected at all. Validation pooled PQ 0.331524 against
+# 0.305800 for the uniform 0.1, which is 3.3 times the resolution of that set.
+PER_CLASS_PROXIMITY: dict[int, float] = {
+    0: 0.1, 1: 0.05, 2: 0.1, 3: 0.1, 4: 0.2, 5: 0.2, 6: 0.2, 7: 0.1, 8: 0.01, 9: 0.2,
+    10: 0.2, 11: 0.1, 12: 0.1, 13: 0.1, 14: 0.2, 15: 0.2, 16: 0.2, 17: 0.2, 18: 0.2, 19: 0.1,
+    20: 0.1, 21: 0.1, 22: 0.1, 23: 0.1, 24: 0.1, 25: 0.2, 26: 0.1, 27: 0.02, 28: 0.1, 29: 0.1,
+}
+
+
+def proximity_for(semantic, proximity=None):
+    """The proximity radius for one class: an explicit override, else the fitted table."""
+    if proximity is not None:
+        return proximity
+    return PER_CLASS_PROXIMITY.get(int(semantic), DEFAULT_PROXIMITY)
+
 
 def endpoint_pairs(points, types):
     """Left and right endpoints; closed primitives have none (NaN rows)."""
@@ -77,12 +96,14 @@ def _endpoint_edges(left, right, tolerance, block=256):
     return edges
 
 
-def group_instances(points, types, semantics, *, proximity=DEFAULT_PROXIMITY,
+def group_instances(points, types, semantics, *, proximity=None,
                     connectivity=DEFAULT_CONNECTIVITY):
     """Return a list of (semantic_id, boolean primitive mask) instance candidates.
 
     `semantics` may come from ground truth (to measure grouping alone) or from a model
-    (to measure an end-to-end pipeline).
+    (to measure an end-to-end pipeline). `proximity=None` uses the per-class fitted radii;
+    passing a float forces one radius for every class, which is what the pre-2026-09-20 runs
+    did and what the fitting experiments compare against.
     """
     points = np.asarray(points, dtype=np.float64)
     types = np.asarray(types)
@@ -101,11 +122,12 @@ def group_instances(points, types, semantics, *, proximity=DEFAULT_PROXIMITY,
         if semantic in ARCHCAD_STUFF_SEMANTIC_IDS:
             instances.append((int(semantic), mask))
             continue
+        radius = proximity_for(semantic, proximity)
         local_points = points[members]
         centres = local_points.mean(axis=1)
         distance = np.linalg.norm(centres[:, None, :] - centres[None, :, :], axis=-1)
         edges = {(int(i), int(j)) for i in range(len(members))
-                 for j in np.flatnonzero(distance[i] < proximity) if j > i}
+                 for j in np.flatnonzero(distance[i] < radius) if j > i}
         if connectivity > 0:
             edges |= _endpoint_edges(left[members], right[members], connectivity)
         labels = _components(len(members), sorted(edges))

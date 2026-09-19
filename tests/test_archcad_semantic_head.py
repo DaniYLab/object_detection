@@ -9,8 +9,9 @@ import numpy as np
 import torch
 
 from src.data.archcad_constants import ARCHCAD_IGNORE_LABEL, ARCHCAD_STUFF_SEMANTIC_IDS
-from src.data.archcad_geometric_grouping import (fit_thresholds, group_instances, pairwise_f1,
-                                                predictions_from_semantics)
+from src.data.archcad_geometric_grouping import (DEFAULT_PROXIMITY, PER_CLASS_PROXIMITY,
+                                                fit_thresholds, group_instances, pairwise_f1,
+                                                predictions_from_semantics, proximity_for)
 from scripts.research.train_archcad_semantic import capped_evaluation_set
 from src.models.archcad_semantic_head import (ArchCADPrimitiveNoContext, ArchCADPrimitiveSemantic,
                                              pad_semantic_batch, semantic_classification_loss)
@@ -156,6 +157,32 @@ def test_capped_evaluation_set_takes_a_prefix_and_keeps_everything_when_disabled
     assert capped_evaluation_set(items, truths, 10) == (items, truths)
     capped_items, capped_truths = capped_evaluation_set(items, truths, 4)
     assert capped_items == items[:4] and capped_truths == truths[:4]
+
+
+def test_per_class_proximity_table_covers_every_class_and_can_be_overridden():
+    """A single radius cannot serve every class, so the table is the default and a float is
+    the explicit override the fitting experiments compare against."""
+    assert sorted(PER_CLASS_PROXIMITY) == list(range(30)), 'every class needs a fitted radius'
+    assert all(0.0 < radius <= 0.5 for radius in PER_CLASS_PROXIMITY.values())
+    assert proximity_for(27) == PER_CLASS_PROXIMITY[27] != DEFAULT_PROXIMITY
+    assert proximity_for(27, 0.1) == 0.1, 'an explicit radius must win'
+    assert proximity_for(999) == DEFAULT_PROXIMITY, 'an unknown class falls back'
+
+
+def test_fitted_radii_change_which_primitives_group_together():
+    """Two primitives 0.05 apart: joined for a wall, kept apart for a pile."""
+    def pair():
+        return np.array([[[0.0, 0.0], [0.01, 0.0], [0.02, 0.0], [0.03, 0.0]],
+                         [[0.05, 0.0], [0.06, 0.0], [0.07, 0.0], [0.08, 0.0]]])
+
+    types = np.zeros(2, dtype=np.int64)
+    pile = group_instances(pair(), types, np.full(2, 27, dtype=np.int64), connectivity=0.0)
+    wall = group_instances(pair(), types, np.full(2, 20, dtype=np.int64), connectivity=0.0)
+    assert len(pile) == 2, 'the fitted pile radius 0.02 must keep them apart'
+    assert len(wall) == 1, 'the fitted wall radius 0.1 must join them'
+    forced = group_instances(pair(), types, np.full(2, 27, dtype=np.int64),
+                             proximity=0.1, connectivity=0.0)
+    assert len(forced) == 1, 'an explicit radius overrides the table'
 
 
 def test_grouper_matches_a_brute_force_reference_when_one_class_holds_everything():
