@@ -117,6 +117,66 @@ def test_predictions_from_semantics_uses_only_the_given_labels():
     assert all(1.0 == instance['score'] for instance in predictions[0]['instances'])
 
 
+def _brute_force_groups(points, types, semantics, proximity, connectivity):
+    """Independent reference: union-find over proximity and endpoint edges."""
+    parent = list(range(len(points)))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            if semantics[i] != semantics[j]:
+                continue
+            near = float(np.linalg.norm(points[i].mean(0) - points[j].mean(0))) < proximity
+            closed = {2, 3}
+            if not near and types[i] not in closed and types[j] not in closed:
+                near = any(float(np.linalg.norm(a - b)) < connectivity
+                           for a in (points[i][0], points[i][3])
+                           for b in (points[j][0], points[j][3]))
+            if near:
+                parent[find(i)] = find(j)
+    groups = {}
+    for i in range(len(points)):
+        groups.setdefault(find(i), []).append(i)
+    return sorted(tuple(sorted(members)) for members in groups.values())
+
+
+def test_grouper_matches_a_brute_force_reference_when_one_class_holds_everything():
+    """The pathological case that stalled a run: an untrained model predicts one class.
+
+    The vectorised endpoint search must still produce exactly the groupings a naive
+    union-find produces, including for closed shapes that carry no endpoints.
+    """
+    rng = np.random.default_rng(5)
+    points = rng.random((60, 4, 2))
+    # Three pairs that share endpoints, so only connectivity can join them.
+    for target, source in ((1, 0), (5, 4), (3, 2)):
+        points[target][0], points[target][3] = points[source][3], points[source][0]
+    types = np.zeros(60, dtype=np.int64)
+    types[7] = 2  # a circle: no endpoints, so only proximity can join it
+    points[7] = points[6].mean(0) + 1e-6
+    semantics = np.full(60, 1, dtype=np.int64)
+    produced = group_instances(points, types, semantics, proximity=0.02, connectivity=0.01)
+    got = sorted(tuple(sorted(np.flatnonzero(mask).tolist())) for _, mask in produced)
+    assert got == _brute_force_groups(points, types, semantics, 0.02, 0.01)
+
+
+def test_grouper_handles_a_thousand_primitives_in_one_class_promptly():
+    """Guards the quadratic-in-Python regression: it stalled a 4,096-image run entirely."""
+    import time
+
+    rng = np.random.default_rng(6)
+    points = rng.random((1000, 4, 2))
+    types = np.zeros(1000, dtype=np.int64)
+    start = time.perf_counter()
+    group_instances(points, types, np.full(1000, 1, dtype=np.int64), proximity=0.02, connectivity=0.01)
+    assert time.perf_counter() - start < 5.0, 'grouping must not be quadratic in Python'
+
+
 def test_no_context_model_ignores_every_other_primitive_in_the_batch():
     """The defining property: a primitive's logits depend on that primitive alone."""
     torch.manual_seed(11)

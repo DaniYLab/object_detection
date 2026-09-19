@@ -51,6 +51,32 @@ def _components(count, edges):
     return connected_components(graph, directed=False)[1]
 
 
+def _endpoint_edges(left, right, tolerance, block=256):
+    """Edges between primitives whose endpoints coincide within `tolerance`.
+
+    Vectorised: the previous Python double loop was O(n^2) per class and became a real
+    bottleneck whenever one class held most of a drawing's primitives — which is exactly
+    what an untrained model produces, because it predicts the same class everywhere. A
+    single training step then took minutes instead of milliseconds.
+
+    Closed primitives have no endpoints (NaN rows) and take part in no edge, as before.
+    """
+    usable = np.flatnonzero(np.isfinite(left).all(axis=1) & np.isfinite(right).all(axis=1))
+    edges = set()
+    for start in range(0, len(usable), block):
+        rows = usable[start:start + block]
+        anchor_left, anchor_right = left[rows], right[rows]
+        near = ((np.linalg.norm(anchor_left[:, None] - left[None], axis=-1) < tolerance)
+                | (np.linalg.norm(anchor_left[:, None] - right[None], axis=-1) < tolerance)
+                | (np.linalg.norm(anchor_right[:, None] - left[None], axis=-1) < tolerance)
+                | (np.linalg.norm(anchor_right[:, None] - right[None], axis=-1) < tolerance))
+        for row, i in enumerate(rows):
+            for j in np.flatnonzero(near[row]):
+                if j > i:
+                    edges.add((int(i), int(j)))
+    return edges
+
+
 def group_instances(points, types, semantics, *, proximity=DEFAULT_PROXIMITY,
                     connectivity=DEFAULT_CONNECTIVITY):
     """Return a list of (semantic_id, boolean primitive mask) instance candidates.
@@ -81,19 +107,7 @@ def group_instances(points, types, semantics, *, proximity=DEFAULT_PROXIMITY,
         edges = {(int(i), int(j)) for i in range(len(members))
                  for j in np.flatnonzero(distance[i] < proximity) if j > i}
         if connectivity > 0:
-            local_left, local_right = left[members], right[members]
-            usable = np.isfinite(local_left).all(axis=1)
-            for i in range(len(members)):
-                if not usable[i]:
-                    continue
-                for j in range(i + 1, len(members)):
-                    if not usable[j]:
-                        continue
-                    if (np.linalg.norm(local_left[i] - local_left[j]) < connectivity
-                            or np.linalg.norm(local_left[i] - local_right[j]) < connectivity
-                            or np.linalg.norm(local_right[i] - local_left[j]) < connectivity
-                            or np.linalg.norm(local_right[i] - local_right[j]) < connectivity):
-                        edges.add((i, j))
+            edges |= _endpoint_edges(left[members], right[members], connectivity)
         labels = _components(len(members), sorted(edges))
         for group in sorted(set(labels.tolist())):
             group_mask = np.zeros(count, dtype=bool)
