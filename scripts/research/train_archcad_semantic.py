@@ -71,6 +71,17 @@ def evaluate_semantic(model, items, truths, batch_size, proximity, connectivity,
             'accuracy': correct / max(total, 1), 'primitives': total}
 
 
+def capped_evaluation_set(items, truths, cap):
+    """Prefix subset for the diagnostic train-side evaluation; cap <= 0 keeps everything.
+
+    A prefix of the seeded selection, so the subset is identical across runs and a train
+    metric is comparable between them even when it covers only part of the split.
+    """
+    if cap <= 0:
+        return items, truths
+    return items[:cap], truths[:cap]
+
+
 def compact(result):
     metrics = result['metrics']
     thing = metrics['panoptic']['thing']
@@ -93,6 +104,9 @@ def main():
     p.add_argument('--val-images', type=int, default=512)
     p.add_argument('--epochs', type=int, default=28)
     p.add_argument('--eval-every', type=int, default=7)
+    p.add_argument('--eval-train-images', type=int, default=2048,
+                   help='Cap the diagnostic train-side evaluation to this many selected images; '
+                        '0 evaluates every training image. The validation set is never capped.')
     p.add_argument('--max-primitives', type=int, default=1024)
     p.add_argument('--queries', type=int, default=64,
                    help='Only used for selection eligibility, so the subset matches the baseline runs.')
@@ -148,6 +162,11 @@ def main():
                                          encoder_layers=args.encoder_layers).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=.01)
     steps_per_epoch = int(np.ceil(len(train) / args.batch_size))
+    # The train-side metric is diagnostic; the gate is on validation. Evaluating it over the
+    # whole split costs minutes per point because the geometric grouper runs per drawing
+    # (measured: 11.3 s per 1,024 drawings, against 0.6 s for the model forward). The cap is
+    # a prefix of the same seeded selection, so the subset is identical across runs.
+    train_eval, train_eval_gt = capped_evaluation_set(train, train_gt, args.eval_train_images)
     config = {**vars(args), 'data_root': str(args.data_root), 'output_dir': str(args.output_dir),
               'device': args.device, 'model': model.config, 'split_fingerprint': train_ds.split_fingerprint,
               'parameter_count': sum(x.numel() for x in model.parameters()),
@@ -159,6 +178,7 @@ def main():
               'training': {'batch_images': args.batch_size, 'steps_per_epoch': steps_per_epoch,
                            'total_steps': steps_per_epoch * args.epochs, 'precision': 'fp32',
                            'train_images_resolved': len(train), 'val_images_resolved': len(val),
+                           'train_eval_images': len(train_eval),
                            'gradient_clip': 1., 'optimizer': 'AdamW', 'weight_decay': .01,
                            'scheduler': 'none; fixed budget', 'loss': 'length-weighted cross entropy'},
               'selection_rule': 'seeded random eligibility under primitive/query caps; no target truncation',
@@ -182,7 +202,7 @@ def main():
                                        for path in hashed}
     (args.output_dir / 'config.json').write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8')
     start = time.monotonic()
-    initial_train = evaluate_semantic(model, train, train_gt, args.eval_batch_size,
+    initial_train = evaluate_semantic(model, train_eval, train_eval_gt, args.eval_batch_size,
                                       args.proximity, args.connectivity, args.device)
     initial_val = evaluate_semantic(model, val, val_gt, args.eval_batch_size,
                                     args.proximity, args.connectivity, args.device)
@@ -213,7 +233,7 @@ def main():
         if epoch == 1 or epoch % 5 == 0 or epoch == args.epochs:
             print(json.dumps(history[-1]), flush=True)
         if evaluation_due(epoch, args.epochs, args.eval_every):
-            final_train = evaluate_semantic(model, train, train_gt, args.eval_batch_size,
+            final_train = evaluate_semantic(model, train_eval, train_eval_gt, args.eval_batch_size,
                                             args.proximity, args.connectivity, args.device)
             final_val = evaluate_semantic(model, val, val_gt, args.eval_batch_size,
                                           args.proximity, args.connectivity, args.device)

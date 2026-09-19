@@ -11,6 +11,7 @@ import torch
 from src.data.archcad_constants import ARCHCAD_IGNORE_LABEL, ARCHCAD_STUFF_SEMANTIC_IDS
 from src.data.archcad_geometric_grouping import (fit_thresholds, group_instances, pairwise_f1,
                                                 predictions_from_semantics)
+from scripts.research.train_archcad_semantic import capped_evaluation_set
 from src.models.archcad_semantic_head import (ArchCADPrimitiveNoContext, ArchCADPrimitiveSemantic,
                                              pad_semantic_batch, semantic_classification_loss)
 
@@ -143,6 +144,18 @@ def _brute_force_groups(points, types, semantics, proximity, connectivity):
     for i in range(len(points)):
         groups.setdefault(find(i), []).append(i)
     return sorted(tuple(sorted(members)) for members in groups.values())
+
+
+def test_capped_evaluation_set_takes_a_prefix_and_keeps_everything_when_disabled():
+    """The grouper costs ~19x the model forward per image, so the diagnostic train-side
+    evaluation is capped; the cap must be a stable prefix, not a random sample."""
+    items = [{'i': index} for index in range(10)]
+    truths = [index for index in range(10)]
+    assert capped_evaluation_set(items, truths, 0) == (items, truths)
+    assert capped_evaluation_set(items, truths, -1) == (items, truths)
+    assert capped_evaluation_set(items, truths, 10) == (items, truths)
+    capped_items, capped_truths = capped_evaluation_set(items, truths, 4)
+    assert capped_items == items[:4] and capped_truths == truths[:4]
 
 
 def test_grouper_matches_a_brute_force_reference_when_one_class_holds_everything():
