@@ -60,4 +60,54 @@ than inferred from the endpoint.
 
 ## Results
 
-Pending at preregistration. Record outcomes and any deviations after completion.
+| Epoch | Val loss | Val pooled PQ | Val accuracy | Train pooled PQ | train − val |
+|---:|---:|---:|---:|---:|---:|
+| 28 | 1.7191 | 0.24619 | — | 0.2495 | +0.0033 |
+| 56 | 1.6024 | 0.27311 | 0.5254 | 0.2743 | +0.0012 |
+| 84 | 1.4959 | 0.29126 | — | 0.2963 | +0.0050 |
+| 112 | 1.4183 | **0.304004** | **0.56624** | 0.308372 | +0.004368 |
+
+`0.304004 > 0.280906`, by `+0.023098`.
+
+**Verdict: still climbing.** H14 is supported. The increments decelerate —
+`+0.02692`, `+0.01815`, `+0.01274` — but none of them is near zero, and the train−validation
+gap stays at `+0.004368`, so the run is still converting passes into validation quality
+rather than memorising.
+
+This is the new best: **pooled PQ 0.304004**, thing PQ 0.303521, per-primitive accuracy
+56.62%. It crosses 0.30 for the first time.
+
+## The evaluation cap made the doubling nearly free
+
+| run | epochs | steps | elapsed |
+|---|---:|---:|---:|
+| `semantic_full_56ep` | 56 | 190,904 | 3,555 s (59.3 min) |
+| `semantic_full_112ep` | 112 | 381,808 | 3,762 s (62.7 min) |
+
+Twice the steps for 5.8% more wall clock, because the diagnostic train-side evaluation is
+now capped at 2,048 images instead of 27,272. The cap costs nothing that any gate uses:
+validation is still the full 512 images and the train number remains a fixed prefix, so it is
+comparable across runs.
+
+## What this means for the next step
+
+The preregistered rule for a still-climbing result says the scale lever is not close to
+exhausted and the next work is throughput, so that scaling stops being a multi-hour
+commitment per doubling. That arm is already running: batch 32 at 280 epochs, which costs
+about the same wall clock as the 56-epoch batch-8 reference while seeing five times the
+exposure (`archcad_matched_wallclock_20260917.md`).
+
+The exposure ladder at batch 8 so far: 0.2064 (4,096 images, 28 epochs), 0.2462, 0.2731,
+0.2913, **0.3040** at 28/56/84/112 epochs on the full split — a decelerating but persistent
+response to exposure, with no sign of a ceiling yet.
+
+## Deviation
+
+None. The run used the constants stated in the preregistration (proximity 0.1 /
+connectivity 0.01) and the capped train-side evaluation introduced in the same commit.
+
+## Artifacts
+
+- `outputs/panoptic/semantic_full_112ep`
+- Gate applied by `outputs/panoptic/_runs_20260917/apply_h14_rule.py`
+
