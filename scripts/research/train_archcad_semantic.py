@@ -164,7 +164,11 @@ def main():
               'selection_rule': 'seeded random eligibility under primitive/query caps; no target truncation',
               'protocol': 'per_primitive_semantic_v1; instances from geometric grouping',
               'grouping': {'proximity': args.proximity, 'connectivity': args.connectivity,
-                           'fitted_on': 'train split, 256 images, by pairwise F1 (see the bottleneck doc)'},
+                           'provenance': ('the module defaults unless --proximity/--connectivity are '
+                                          'passed; fit_thresholds on 256 training images selects '
+                                          '0.020/0.010, which scores 0.231259 against 0.246187 for '
+                                          '0.1/0.01 on the same checkpoint - state the choice '
+                                          'explicitly in preregistrations')},
               'determinism': determinism}
     hashed = [Path(__file__).resolve(),
               Path('src/models/archcad_semantic_head.py'),

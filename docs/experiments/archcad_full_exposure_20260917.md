@@ -61,4 +61,75 @@ of the saturation is recorded and not only its endpoint.
 
 ## Results
 
-Pending at preregistration. Record outcomes and any deviations after completion.
+Completed in 59 minutes rather than six hours. |Epoch | Val loss | Val pooled PQ | Val accuracy | Train pooled PQ |
+|---:|---:|---:|---:|---:|
+| 7 | — | 0.21324 | — | 0.1953 |
+| 28 (reference) | 1.8979 | 0.24619 | 0.4844 | 0.2535 |
+| 56 | 1.6024 | **0.273106** | **0.525435** | 0.279264 |
+
+`0.273106 > 0.253987`, and by `+0.019119` over the gate.
+
+**Verdict: exposure still helps at the full split.** The train−validation gap stayed put —
+`+0.007280` at 28 epochs against `+0.006157` at 56 — so this is not overfitting; the run is
+still converting passes into validation quality. Per the preregistered rule the pipeline is
+**data-scale limited rather than structurally limited**, and the next work is scale before
+anything is redesigned.
+
+This is the new best result: **pooled PQ 0.273106**, thing PQ 0.267180, per-primitive
+accuracy 52.54%.
+
+## The value of better grouping, at the new best
+
+One cell of the semantic-versus-grouping decomposition was still unmeasured, and it decides
+how much a learned grouping is worth. Filled in here for this checkpoint, using the same
+grouping constants the runs used, through the frozen evaluator:
+
+| configuration | pooled PQ | thing PQ | thing RQ |
+|---|---:|---:|---:|
+| model semantics + geometric grouping (this run) | 0.273106 | 0.267180 | 0.312223 |
+| **model semantics + oracle grouping** | **0.480167** | 0.539573 | 0.539573 |
+| oracle semantics + geometric grouping | 0.807876 | 0.748993 | 0.794937 |
+| oracle semantics + oracle grouping | 1.0 | 1.0 | 1.0 |
+
+The oracle-grouping cell is a construction: one predicted instance per ground-truth segment,
+carrying that segment's mask and the model's majority predicted class over its primitives.
+
+**Perfect grouping at today's semantic quality scores 0.480167, which is +0.207062 over what
+the pipeline achieves.** That is 39% of the distance from the head to the oracle-semantics
+ceiling of 0.807876. Grouping is therefore a large lever, comparable to semantic quality
+rather than a rounding error, which is the strongest argument yet for training the assignment
+jointly instead of using a fixed geometric rule.
+
+## Deviation: the runs did not use the preregistered grouping constants
+
+The preregistration specified proximity 0.020 and connectivity 0.010, fitted on the training
+split. Every semantic-head run, including this one, actually used **proximity 0.1 and
+connectivity 0.01** — the trainer's argparse defaults — because the launch commands did not
+pass `--proximity`. Measured on the `semantic_full` checkpoint, the same validation set:
+
+| constants | pooled PQ |
+|---|---:|
+| 0.1 / 0.01, what the runs used | 0.246187 |
+| 0.020 / 0.010, what was preregistered | **0.231259** |
+
+So the reported levels are about `0.0149` optimistic relative to the preregistered
+configuration, and that difference is resolvable against the 0.0078 floor. Two consequences:
+
+- **Comparisons between arms are unaffected**: all five semantic-head runs used 0.1, so the
+  H9, H12 and H13 verdicts stand as measured.
+- **The absolute levels are not the preregistered ones.** Where this document and
+  `archcad_semantic_head_20260917.md` quote 0.246187 for the 28-epoch full-split run, the
+  preregistered-constant value is 0.231259. The 0.1 value is not wrong, but it is a
+  validation-tuned constant from the probe sweeps rather than the train-fitted one, and the
+  config's `grouping.fitted_on` note describes provenance the value does not have.
+
+The default is left unchanged, because changing it now would silently break comparability
+with the five runs already on record; the provenance note in the trainer is corrected instead
+and the choice must be stated explicitly in future preregistrations.
+
+## Artifacts
+
+- `outputs/panoptic/semantic_full_56ep`
+- Decomposition: `outputs/panoptic/_runs_20260917/probe_grouping_value.py`
+- Constants audit: `outputs/panoptic/_runs_20260917/check_grouping_constants.py`
+
