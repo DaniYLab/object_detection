@@ -95,3 +95,34 @@ def semantic_classification_loss(output, batch):
     losses = F.cross_entropy(logits[valid], labels[valid], reduction='none')
     kept = weights[valid]
     return (losses * kept).sum() / kept.sum().clamp_min(1e-6)
+
+
+class ArchCADPrimitiveNoContext(nn.Module):
+    """Classify a primitive from its own features only, with no access to the drawing.
+
+    The reference point for how much the drawing's context is worth. kNN over the same
+    input scores 19.78% (below a constant "wall" prediction) and the context transformer
+    reaches 48.44%, so a trained classifier without context localises the gap between
+    "what the primitive looks like" and "what the drawing says it is".
+
+    Capacity is set to match the transformer head's parameter count closely, so the
+    comparison is about context rather than about size.
+    """
+
+    def __init__(self, in_features=12, width=256, classes=NUM_ARCHCAD_SEMANTIC_CLASSES,
+                 architecture='per_primitive_no_context'):
+        super().__init__()
+        self.config = dict(in_features=in_features, width=width, classes=classes,
+                           architecture=architecture)
+        self.network = nn.Sequential(
+            nn.Linear(in_features, width), nn.GELU(), nn.LayerNorm(width),
+            nn.Linear(width, width), nn.GELU(), nn.LayerNorm(width),
+            nn.Linear(width, classes))
+
+    def forward(self, features, padding_mask=None):
+        if features.ndim != 3 or features.shape[2] != self.config['in_features'] or not features.shape[1]:
+            raise ValueError('expected non-empty [B,N,{}] features'.format(self.config['in_features']))
+        if padding_mask is not None and padding_mask.shape != features.shape[:2]:
+            raise ValueError('padding mask must be [B,N]')
+        # Padding is ignored on purpose: every primitive is classified on its own.
+        return {'semantic_logits': self.network(features)}

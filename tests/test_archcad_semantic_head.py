@@ -11,8 +11,8 @@ import torch
 from src.data.archcad_constants import ARCHCAD_IGNORE_LABEL, ARCHCAD_STUFF_SEMANTIC_IDS
 from src.data.archcad_geometric_grouping import (fit_thresholds, group_instances, pairwise_f1,
                                                 predictions_from_semantics)
-from src.models.archcad_semantic_head import (ArchCADPrimitiveSemantic, pad_semantic_batch,
-                                             semantic_classification_loss)
+from src.models.archcad_semantic_head import (ArchCADPrimitiveNoContext, ArchCADPrimitiveSemantic,
+                                             pad_semantic_batch, semantic_classification_loss)
 
 
 def _item(n, labels, weights=None, width=12):
@@ -115,3 +115,35 @@ def test_predictions_from_semantics_uses_only_the_given_labels():
     assert predictions[0]['image_id'] == 'x'
     assert predictions[0]['semantic_labels'].tolist() == [1, 1, 2, 2]
     assert all(1.0 == instance['score'] for instance in predictions[0]['instances'])
+
+
+def test_no_context_model_ignores_every_other_primitive_in_the_batch():
+    """The defining property: a primitive's logits depend on that primitive alone."""
+    torch.manual_seed(11)
+    model = ArchCADPrimitiveNoContext(in_features=12, width=32)
+    alone = torch.randn(1, 5, 12)
+    padded = torch.cat([alone, torch.randn(1, 7, 12)], dim=1)
+    with torch.no_grad():
+        single = model(alone, None)['semantic_logits']
+        many = model(padded, None)['semantic_logits']
+        other_image = model(torch.randn(1, 5, 12), None)['semantic_logits']
+    torch.testing.assert_close(single, many[:, :5], rtol=0, atol=0), 'appending primitives must change nothing'
+    assert not torch.allclose(single, other_image), 'different primitives must give different logits'
+
+
+def test_no_context_model_ignores_the_padding_mask():
+    torch.manual_seed(12)
+    model = ArchCADPrimitiveNoContext(in_features=12, width=32)
+    features = torch.randn(2, 6, 12)
+    mask = torch.zeros(2, 6, dtype=torch.bool)
+    mask[0, 4:] = True
+    with torch.no_grad():
+        torch.testing.assert_close(model(features, None)['semantic_logits'],
+                                   model(features, mask)['semantic_logits'])
+
+
+def test_no_context_model_config_rebuilds_the_model():
+    model = ArchCADPrimitiveNoContext(in_features=12, width=16)
+    rebuilt = ArchCADPrimitiveNoContext(**model.config)
+    assert list(rebuilt.state_dict()) == list(model.state_dict())
+    assert model(torch.randn(1, 3, 12), None)['semantic_logits'].shape == (1, 3, 30)
