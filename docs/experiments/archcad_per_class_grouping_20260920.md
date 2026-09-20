@@ -102,6 +102,26 @@ Note that coordinate descent is path dependent: the eight-class fit had chosen 0
 `concrete_column`, and the full fit reverted it to 0.10 while still reaching a better overall
 optimum. The reported number is the validation score of the final set, not of a path.
 
+## The other axis: per-class connectivity tolerances buy nothing
+
+The fit held connectivity fixed at 0.01 throughout, so the same coordinate descent was run
+over connectivity alone, with proximity left at the adopted per-class table: 11,696 seconds,
+five tolerances per class, two passes over all 30 classes.
+
+| | pooled PQ | thing PQ |
+|---|---:|---:|
+| connectivity 0.01 for every class | 0.331524 | 0.334900 |
+| per-class tolerances fitted on train | 0.331860 | 0.335359 |
+| difference | **+0.000336** | +0.000458 |
+
+`+0.000336` is twenty-three times smaller than the 0.0078 resolution, and the fit-set PQ moved
+by the same negligible amount (0.337188 → 0.337567). **Not adopted**: the fitted tolerances
+are noise, and adding a 30-entry table for them would be fitting noise.
+
+The asymmetry is interpretable and worth keeping. Connectivity is an *exact* rule — endpoints
+either coincide or they do not — so a per-class tolerance has almost no room to matter.
+Proximity is a *fuzzy* rule, which is exactly why per-class tuning paid there.
+
 ## Status of the lever
 
 | approach | pooled PQ |
@@ -109,19 +129,25 @@ optimum. The reported number is the validation score of the final set, not of a 
 | fixed uniform rule | 0.305800 |
 | learned pruning of candidate edges | 0.291465 |
 | connectivity only | 0.221738 |
-| **per-class radii, two-pass, adopted** | **0.331524** |
+| per-class proximity radii, adopted | **0.331524** |
+| plus per-class connectivity tolerances | 0.331860 (noise, not adopted) |
 | oracle grouping at the same semantics | 0.480167 |
 
-About a seventh of the prize has been taken, and the direction that took it — per-class
-structure in the grouping rule — is the one the input-side probes pointed at all along. The
-natural extensions, in order: per-class **connectivity** tolerances, which the fit held fixed
-at 0.01 throughout; and re-fitting after the semantics improve, since the radii were fitted
-against today's predicted classes.
+About a seventh of the prize has been taken, on the one axis where it was available. Both
+axes of the rule have now been swept, so the remaining grouping work is not more tuning of
+this rule: it would have to be a different rule, and the four earlier attempts suggest the
+missing information is the boundary between two adjacent identical symbols, which the
+geometry does not carry.
+
+The radii were fitted against today's predicted classes, so they need refitting whenever the
+semantics change; that is recorded in the milestone table so it is not forgotten.
 
 ## Artifacts
 
 - `outputs/panoptic/_runs_20260917/probe_grouping_variants.py` (the refutation)
 - `outputs/panoptic/_runs_20260917/fit_per_class_radii.py` (the eight-class fit)
 - `outputs/panoptic/_runs_20260917/fit_per_class_radii_full.py` (two passes, all classes)
+- `outputs/panoptic/_runs_20260917/fit_per_class_connectivity.py` (the refuted axis)
 - `outputs/panoptic/_runs_20260917/verify_per_class_default.py` (the adoption check)
+
 
