@@ -12,7 +12,7 @@ from src.data.archcad_constants import ARCHCAD_IGNORE_LABEL, ARCHCAD_STUFF_SEMAN
 from src.data.archcad_geometric_grouping import (DEFAULT_PROXIMITY, PER_CLASS_PROXIMITY,
                                                 fit_thresholds, group_instances, pairwise_f1,
                                                 predictions_from_semantics, proximity_for)
-from scripts.research.train_archcad_semantic import capped_evaluation_set
+from scripts.research.train_archcad_semantic import capped_evaluation_set, learning_rate_at
 from src.models.archcad_semantic_head import (ArchCADPrimitiveNoContext, ArchCADPrimitiveSemantic,
                                              pad_semantic_batch, semantic_classification_loss)
 
@@ -247,3 +247,21 @@ def test_no_context_model_config_rebuilds_the_model():
     rebuilt = ArchCADPrimitiveNoContext(**model.config)
     assert list(rebuilt.state_dict()) == list(model.state_dict())
     assert model(torch.randn(1, 3, 12), None)['semantic_logits'].shape == (1, 3, 30)
+
+
+def test_learning_rate_schedule_constant_matches_every_run_so_far():
+    """constant must reproduce the 560-epoch run exactly, whatever the step index."""
+    assert learning_rate_at(0, 10_000, 3e-4, 'constant') == 3e-4
+    assert learning_rate_at(9_999, 10_000, 3e-4, 'constant') == 3e-4
+
+
+def test_learning_rate_schedule_cosine_anneals_to_the_final_fraction():
+    base, steps = 3e-4, 1000
+    rates = [learning_rate_at(step, steps, base, 'cosine') for step in range(steps + 1)]
+    assert rates[0] == base, 'the schedule starts at the requested rate'
+    assert abs(rates[steps]) < 1e-12, 'the schedule ends at zero by default'
+    assert abs(rates[steps // 2] - base / 2) < 1e-9, 'the midpoint is half the rate'
+    assert all(later <= earlier for earlier, later in zip(rates, rates[1:])), 'monotone decay'
+    tail = learning_rate_at(999, steps, base, 'cosine', final_fraction=0.1)
+    assert abs(tail - base * 0.1) < 1e-9, 'a non-zero final fraction leaves a floor'
+    assert learning_rate_at(2 * steps, steps, base, 'cosine') == rates[steps], 'clamped past the end'

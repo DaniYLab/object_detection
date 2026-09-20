@@ -44,6 +44,20 @@ from src.models.archcad_semantic_head import (ArchCADPrimitiveNoContext, ArchCAD
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
+def learning_rate_at(step, total_steps, base_lr, schedule, final_fraction=0.0):
+    """Learning rate for a global step index (0-based).
+
+    The 560-epoch run held the rate fixed and its last third oscillated by 0.013 pooled PQ
+    between adjacent checkpoints while the train-validation gap widened fivefold, which is what
+    a constant rate looks like from the outside. `cosine` anneals to `final_fraction * base_lr`
+    over the budget so the endpoint is a settled point rather than a sample from a moving one.
+    """
+    if schedule == 'constant':
+        return base_lr
+    progress = min(1.0, max(0.0, step / max(1, total_steps)))
+    return base_lr * (final_fraction + (1.0 - final_fraction) * 0.5 * (1.0 + float(np.cos(np.pi * progress))))
+
+
 @torch.no_grad()
 def evaluate_semantic(model, items, truths, batch_size, proximity, connectivity, device=DEVICE):
     """Semantic accuracy, semantic F1/wF1 and panoptic PQ for the full pipeline."""
@@ -117,6 +131,11 @@ def main():
     p.add_argument('--width', type=int, default=256, help='Hidden width for --architecture no_context.')
     p.add_argument('--encoder-layers', type=int, default=2)
     p.add_argument('--lr', type=float, default=3e-4)
+    p.add_argument('--lr-schedule', choices=['constant', 'cosine'], default='constant',
+                   help='constant reproduces every run up to 2026-09-20; cosine anneals per step '
+                        'from --lr to --lr-final over the whole budget.')
+    p.add_argument('--lr-final', type=float, default=0.0,
+                   help='End learning rate of --lr-schedule cosine, as a fraction of --lr.')
     p.add_argument('--seed', type=int, default=1337)
     p.add_argument('--selection-seed', type=int, default=1337)
     p.add_argument('--batch-size', type=int, default=8)
@@ -182,7 +201,10 @@ def main():
                            'train_images_resolved': len(train), 'val_images_resolved': len(val),
                            'train_eval_images': len(train_eval),
                            'gradient_clip': 1., 'optimizer': 'AdamW', 'weight_decay': .01,
-                           'scheduler': 'none; fixed budget', 'loss': 'length-weighted cross entropy'},
+                           'scheduler': ('constant; fixed budget' if args.lr_schedule == 'constant' else
+                                         'cosine per step from {:.2g} to {:.2g}'.format(
+                                             args.lr, args.lr * args.lr_final)),
+                           'loss': 'length-weighted cross entropy'},
               'selection_rule': 'seeded random eligibility under primitive/query caps; no target truncation',
               'protocol': 'per_primitive_semantic_v1; instances from geometric grouping',
               'grouping': {'proximity': args.proximity, 'connectivity': args.connectivity,
@@ -214,6 +236,8 @@ def main():
                       'val_images': len(val), 'in_features': in_features}), flush=True)
     history = []
     evaluations = [{'epoch': 0, 'train': compact(initial_train), 'val': compact(initial_val)}]
+    total_steps = steps_per_epoch * args.epochs
+    step = 0
     for epoch in range(1, args.epochs + 1):
         model.train()
         batches = training_order(train, args.batch_size, args.seed, epoch, args.batch_order == 'length-grouped')
@@ -221,6 +245,10 @@ def main():
         for batch_indices in batches:
             chunk = [train[index] for index in batch_indices]
             batch = pad_semantic_batch(chunk, args.device)
+            if args.lr_schedule != 'constant':
+                optimizer.param_groups[0]['lr'] = learning_rate_at(
+                    step, total_steps, args.lr, args.lr_schedule, args.lr_final)
+            step += 1
             optimizer.zero_grad(set_to_none=True)
             loss = semantic_classification_loss(model(batch['features'], batch['padding_mask']), batch)
             if not torch.isfinite(loss):

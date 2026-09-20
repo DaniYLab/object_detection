@@ -54,11 +54,11 @@ trạng thái chính hoặc chặn ArchCAD benchmark.
 | JSON/SVG entity mapping | Verified on 100 samples | 24,369 semantic/instance pairs; auxiliary point.zip is not a proven model dependency |
 | Panoptic PyTorch dataset/collate | Implemented | raw entity indices, geometry-only features, per-image masks, split fingerprint |
 | Primitive-only learned baseline | Three-seed pilot completed; superseded 2026-09-17 | the 256-image / 20-epoch control (PQ 0.11663 ± 0.01155) was not bit-reproducible and is 0.9% of the training split; current best is PQ 0.246188 |
-| Best primitive-only configuration | 2026-09-20 | per-primitive semantic head on all 27,272 eligible training images with per-class grouping radii: pooled PQ 0.331524, thing PQ 0.334900, per-primitive accuracy 57.3% |
-| Grouping rule | Per-class radii adopted 2026-09-20 | `PER_CLASS_PROXIMITY` in `src/data/archcad_geometric_grouping.py`, fitted on train by train PQ: +0.025724 over the uniform radius, 3.3x the resolution. Fitted against today's predicted classes, so refit after the semantics improve |
-| Grouping ceiling | Measured | with today's semantics, oracle grouping scores 0.480167 and oracle semantics with the fixed grouper 0.807876, against 0.331524 for the adopted pipeline |
-| Lever audit 2026-09-17/20 | Budget, capacity, data, scale features, exposure, learned grouping | budget PLATEAU at 50x; capacity criterion met by 2%; data live; exposure exhausted at 4,096 images but still climbing at the full split; scale-aware input no resolvable effect; learned edge pruning and connectivity-only grouping both worse; per-class radii the first win |
-| Raster/dual-pathway baseline | Not started; motivation closed | the raw entities carry no styling channel: `rgb` is `[0,0,0]` for every entity, so appearance cannot separate classes that geometry cannot |
+| Best primitive-only configuration | 2026-09-20 | per-primitive semantic head on all 27,272 eligible training images, 560 epochs at batch 32, with per-class grouping radii: pooled PQ 0.343485, thing PQ 0.346674, per-primitive accuracy 59.4% |
+| Grouping rule | Per-class radii adopted 2026-09-20 | `PER_CLASS_PROXIMITY` in `src/data/archcad_geometric_grouping.py`, fitted on train by train PQ: +0.025724 over the uniform radius, 3.3x the resolution. Refitted on the 560-epoch checkpoint it moves two classes and +0.000078, and it scores within 0.001 of the checkpoint-specific table at all eleven checkpoints of that run, so it transfers rather than needing a refit |
+| Grouping ceiling | Measured with the 280-epoch semantics | oracle grouping scores 0.480167 and oracle semantics with the fixed grouper 0.807876, against 0.331524 for the pipeline those were measured with |
+| Lever audit 2026-09-17/20 | Budget, capacity, data, scale features, exposure, learned grouping, weight averaging | budget PLATEAU at 50x; capacity criterion met by 2% (query/mask pilot, not this head); data live; exposure exhausted at 4,096 images; scale-aware input no resolvable effect; learned edge pruning and connectivity-only grouping both worse; per-class radii the first win; a 560-epoch doubling bought +0.011961 at the gate but its last 140 epochs +0.0004, and checkpoint averaging does not beat the endpoint, so exposure is saturating |
+| Raster/dual-pathway baseline | Not started; motivation closed by measurement 2026-09-20 | the raster is monochrome (all 16 quantised colours have r=g=b) and `line_width` is 0.25 for 99.2% of entities, with `linetype` a casing variant; 0 of the 181 identical-geometry label conflicts are separated by any styling field, and the coverage-width estimate spreads 0.845 px within class against 0.530 px between classes |
 | Conditioned Reflex panoptic ablation | Not started | after the semantic path is stable |
 | Paper-comparable reproduction | Blocked | public subset/split differs from 413K paper benchmark |
 
@@ -98,7 +98,10 @@ bit-for-bit equivalence prematurely.
    (49 → 49 → 49 of 51), so that loss tracks optimization progress, not decoder
    design, and the decoder is not the binding constraint. See
    `../experiments/archcad_optimization_20260917.md` section E3.
-5. Add raster feature sampling and adaptive fusion.
+5. Add raster feature sampling and adaptive fusion. Answered 2026-09-20 for this release: the
+   raster is monochrome, the annotation's `line_width`/`linetype` are constant, and 0 of the 181
+   identical-geometry label conflicts are separated by any styling field, so raster fusion is not
+   the binding step here. See `../experiments/archcad_longer_training_20260920.md`.
 6. Reproduce the DPSS-style query/mask decoder baseline.
 7. Only then test conditioned vs unconditioned reflex mechanisms.
 
