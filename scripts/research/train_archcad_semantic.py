@@ -124,7 +124,9 @@ def main():
     p.add_argument('--eval-batch-size', type=int, default=8)
     p.add_argument('--rich-features', action='store_true',
                    help='Append the scale-aware dimensions before classification.')
-    p.add_argument('--proximity', type=float, default=DEFAULT_PROXIMITY)
+    p.add_argument('--proximity', type=float, default=None,
+                   help='Force one proximity radius for every class. Default uses the fitted '
+                        'per-class table in src/data/archcad_geometric_grouping.py.')
     p.add_argument('--connectivity', type=float, default=DEFAULT_CONNECTIVITY)
     p.add_argument('--deterministic', action='store_true')
     p.add_argument('--device', default=DEVICE)
@@ -184,11 +186,10 @@ def main():
               'selection_rule': 'seeded random eligibility under primitive/query caps; no target truncation',
               'protocol': 'per_primitive_semantic_v1; instances from geometric grouping',
               'grouping': {'proximity': args.proximity, 'connectivity': args.connectivity,
-                           'provenance': ('the module defaults unless --proximity/--connectivity are '
-                                          'passed; fit_thresholds on 256 training images selects '
-                                          '0.020/0.010, which scores 0.231259 against 0.246187 for '
-                                          '0.1/0.01 on the same checkpoint - state the choice '
-                                          'explicitly in preregistrations')},
+                           'provenance': ('proximity None means the fitted per-class table in '
+                                          'src/data/archcad_geometric_grouping.py, adopted '
+                                          '2026-09-20; a float forces one radius for every class '
+                                          'and reproduces the pre-2026-09-20 behaviour')},
               'determinism': determinism}
     hashed = [Path(__file__).resolve(),
               Path('src/models/archcad_semantic_head.py'),
