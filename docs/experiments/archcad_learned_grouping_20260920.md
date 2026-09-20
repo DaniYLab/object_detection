@@ -63,9 +63,30 @@ Both were caught because the numbers contradicted the checkpoint's reported 56.6
 and that contradiction was checked rather than explained away. The corrected probes are the
 ones cited here; the artifacts are corrected in place.
 
+## The prize, restated later the same day
+
+Both bounds in this document were measured with the uniform-radius grouper and the semantics of
+the checkpoint that scored 0.304004. The pipeline has since moved to 0.343407 (per-class radii,
+560 epochs), so both were re-measured on the same 512 validation images with the adopted
+per-class table (`refresh_oracle_grouping.py`, `refresh_oracle_semantics.py`):
+
+| configuration | pooled PQ | thing PQ |
+|---|---|---|
+| the adopted pipeline (560-epoch semantics, per-class radii) | 0.343407 | 0.346588 |
+| oracle grouping, same semantics | 0.582606 | 0.644438 |
+| oracle semantics, adopted grouper | 0.841391 | 0.782920 |
+
+Two things follow. The grouping prize **grew**, from +0.174 to **+0.239198**: better semantics
+put more primitives in the right class, which exposes more of the grouping rule's merges. And
+the semantic ceiling rose from 0.807876 to 0.841391 purely by changing the grouper under
+perfect semantics, which is the same statement from the other side.
+
+So the largest single unclaimed lever in the pipeline is still grouping, and it is now larger
+than when the attempts below were run against it.
+
 ## Where this leaves the grouping lever
 
-The prize is real — oracle grouping at today's semantics is worth +0.174 — but it has now
+The prize is real — oracle grouping at today's semantics is worth +0.239 — but it has now
 survived four attempts to approach it:
 
 | approach | result |
