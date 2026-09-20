@@ -169,15 +169,30 @@ vectors.** The coverage-based width estimate over 14,497 primitives in 48 drawin
 within-class sd of 0.845 px. The estimator cannot separate stroke width from local ink density
 (hatching and parallel lines inside the window both raise it), and whatever it does measure is
 produced by the same entities the model already receives, so it cannot separate primitives whose
-geometry is identical — which is exactly the ambiguity the audit recorded. The like-for-like
-nearest-centroid comparison attempted for this doc was uninformative and is not reported as
-evidence: on raw position-dominated tokens it scored 0.0393 for geometry and 0.0268 for width
-against a 0.1914 majority baseline, i.e. the rule is worse than the baseline for both inputs and
-says nothing about either.
+geometry is identical — which is exactly the ambiguity the audit recorded.
 
-Conclusion: no raster branch is justified on this release. The appearance channel is empty, and
-the two places it could have paid — breaking identical-geometry ties and adding colour — do not
-exist here.
+**A classifier test agrees.** Multinomial logistic regression on standardised features, fitted
+on 128 training drawings and scored on 64 validation drawings (20,905 training and 12,534
+validation primitives, 29 classes, majority-class accuracy 0.1778 and macro F1 0.0345):
+
+| input | accuracy | macro F1 | balanced accuracy |
+|---|---|---|---|
+| the model's own geometry token | 0.1633 | 0.0505 | 0.0735 |
+| the raster width estimate alone | 0.1489 | 0.0090 | 0.0345 |
+| geometry token + raster width | 0.1666 | 0.0591 | 0.0778 |
+
+Width alone is *below* the trivial baseline on macro F1 (0.0090 against 0.0345). Adding it to
+the geometry token moves accuracy by +0.0033 and macro F1 by +0.0087. That comparison is
+deliberately read in one direction only: a linear read-out of this token extracts a fraction of
+what the token supports — 0.1633 accuracy here against 0.594 in the trained model — so it
+bounds the raster's marginal signal, not the geometry's value. An earlier version of this probe
+that scored both inputs far below the majority baseline is not reported as evidence; it treated
+the raw ignore bucket (semantic 100, 48% of primitives) as a class, which made the rule
+degenerate.
+
+Conclusion: no raster branch is justified on this release. The two places appearance could have
+paid — colour and identical-geometry ties — are both empty: the raster is monochrome and no
+styling field separates any of the 181 conflicting groups.
 
 ### Verdict, and the departure from the rule's prescription
 
