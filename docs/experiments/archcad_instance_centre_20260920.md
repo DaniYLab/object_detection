@@ -135,6 +135,42 @@ pushed to carry instance structure, and only joint training can answer it. And t
 that run should require a margin — the measured proximity baseline is 0.6893, so a joint run that
 lands below ~0.75 has not produced a usable signal.
 
+### Step 3 — run, and it also fails
+
+That cheap joint probe was run rather than the full build: the same encoder plus the offset head,
+initialised from the 560-epoch weights, trained for 28 epochs on 2,048 training drawings with
+`semantic CE + 20 × smooth-L1 offset` (`h19_step3_joint_probe.py`). Gates fixed before running:
+AUC at least 0.75 for a usable signal, end-to-end val PQ above 0.351207 for a working mechanism.
+
+| quantity, 512 validation images | value |
+|---|---|
+| pair separation AUC, raw centre distance | 0.6738 |
+| pair separation AUC, jointly trained predicted centres | **0.6732** |
+| pair separation AUC, ground-truth centres | 1.0000 |
+| semantic accuracy after joint training | 0.5995 (560-epoch model: 0.5944) |
+| end-to-end pooled PQ, τ fitted on train PQ | 0.329560 (adopted rule 0.343407) |
+
+Both gates fail. Joint training did not damage the semantics — accuracy rose slightly — but it did
+not move the pair separation at all, in either direction (−0.0006), and the pipeline is worse than
+the rule it would replace. The τ sweep on train PQ (0.083652 at 0.005 rising to 0.417965 at 0.08)
+is still climbing at the grid edge, which is the same defect the H18 sweep had: the fit did not
+bracket its optimum, because centres this coarse can only be merged aggressively. The direction of
+that sweep is the diagnosis — the learned centres are too noisy to separate anything, so the best
+use of them is to merge.
+
+**What this does not settle.** The probe is 28 epochs on 2,048 of 27,272 drawings with a 70K
+parameter model, so it rules out "a small head on this representation, briefly trained" rather
+than the mechanism in general. The residual possibility is that instance structure needs the
+model scaled with the budget and the full split, which is the same commitment the capacity arm of
+H17 tests for semantics. What it does establish is that the offset target is not learnable for
+free: the loss curve is uninformative (0.00653 → 0.00200 in seven epochs, because most
+single-primitive instances have an exactly zero offset), and the metric that matters does not
+move.
+
+So the grouping lever stands as it did: a +0.239198 prize, three mechanisms tried against it
+(radii exhausted, pruning refuted, instance centres without signal), and no measured way to claim
+it at this scale.
+
 ## Artifacts
 
 - `outputs/panoptic/_runs_20260917/h19_step1_ceiling.py`, `outputs/panoptic/h19_step1_ceiling.json`
