@@ -65,4 +65,45 @@ oscillation and a widening gap — are visible well before 140 epochs in the exi
 
 ## Results
 
-Pending at preregistration. Record outcomes and any deviations after completion.
+### The annealing arm wins
+
+Control and arm, both scored under the adopted protocol on the same 512 validation images
+(control is the 560-epoch run's own checkpoints, which are bit-identical to a constant-rate
+140-epoch run):
+
+| epoch | 28 | 56 | 84 | 112 | 140 |
+|---|---|---|---|---|---|
+| control, constant rate | 0.238057 | 0.266697 | 0.287463 | 0.301038 | 0.310439 |
+| arm B, cosine to zero | 0.239988 | 0.269423 | 0.282346 | 0.304830 | **0.337864** |
+
+Per-interval gains for the arm are `+0.029435`, `+0.012923`, `+0.022484`, `+0.033034`: the last
+interval is the largest of the run, and the control's is `+0.009401`. That is the annealing
+signature — as the rate goes to zero the model stops orbiting and settles — and it is the same
+pathology the 560-epoch constant-rate run showed from the other side, where the endpoint was the
+top of a 0.013361 oscillation.
+
+At 140 epochs the arm is **+0.027425** above the control, 3.5x the resolution. Per-primitive
+accuracy rises with it (0.5578 against 0.5385). The arm also ends close to the constant-rate
+560-epoch endpoint (0.343407) at a quarter of the epochs, which is worth noting for budgeting:
+annealing buys in 140 epochs what the constant schedule needed 560 for.
+
+**Rule application: a lever is live.** The arm clears the 0.318239 gate, so the winning change is
+promoted to a 560-epoch run, preregistered in `archcad_annealed_560_20260920.md`, where only a
+result above the current best 0.343485 counts as an improvement.
+
+### The capacity arm was stopped, and that is a deviation
+
+Arm C (`--dim 128 --heads 8 --encoder-layers 4`) ran for about 50 minutes without completing its
+first evaluation interval: the larger model under two-way concurrency was several times slower
+per epoch than the screen assumed, and it had not produced a single measurement. It was stopped
+when the annealing arm won, so that the promoted run could have the machine to itself, and its
+question — does capacity move this head at all — is left open and cheap to re-run later. Arm D
+(capacity plus annealing) was never started.
+
+Two smaller deviations are recorded for the same reason. The three arms were launched
+concurrently as designed and the machine ran out of memory (three ~4 GB processes plus the
+host's own 20 GB service): the cosine arm survived, the capacity and combined arms died at their
+initial evaluation and were relaunched one at a time. And the run was interrupted once by a
+session suspension, after which the cosine arm was restarted from scratch; its reproduced
+epoch-28 and epoch-56 values match the pre-interruption run exactly (0.239988 and 0.269423), so
+the restart did not change the trajectory.
