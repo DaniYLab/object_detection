@@ -54,4 +54,40 @@ semantics or grouping.
 
 ## Results
 
-Pending at preregistration. Record outcomes and any deviations after completion.
+Completed, ~100 minutes. The run clears the gate decisively:
+
+| epoch | 28 | 140 | 280 | 392 | 448 | 504 | 532 | 560 |
+|---|---|---|---|---|---|---|---|---|
+| val pooled PQ | 0.238664 | 0.297976 | 0.328674 | 0.345477 | 0.361328 | 0.377160 | 0.385246 | **0.391101** |
+| val thing PQ | 0.235612 | 0.291648 | 0.326062 | 0.345952 | 0.362141 | 0.379570 | 0.388323 | 0.396052 |
+| per-primitive accuracy | 0.4290 | 0.5268 | 0.5594 | 0.5805 | 0.5993 | 0.6183 | 0.6290 | 0.6299 |
+
+**0.391101** pooled PQ against the 0.351285 gate — cleared by `+0.039816`, 5.1x the resolution —
+and `+0.047616` over the previous best 0.343485. Per-primitive accuracy rises from 0.5944 to
+0.6299, so the gain is semantic, not a grouping artefact.
+
+Two checks were run on the finished checkpoint, outside the training process
+(`score_run_checkpoint.py`): the adopted-protocol number reproduces exactly (0.391101 pooled,
+0.396052 thing, 0.6299 accuracy), and the radii fitted on the *previous* checkpoint score
+0.392015 on this one — the transfer result holds again, within 0.001, on a checkpoint produced by
+a different schedule.
+
+**The curve has not flattened.** Per-interval gains over the last four intervals are `+0.005479`,
+`+0.010353`, `+0.008086`, `+0.005855`; the run ends still climbing, at a rate far above the
+0.0078 resolution per 28 epochs. This is the preregistered "annealing holds at scale" branch, and
+it reopens the exposure question exactly as that branch anticipated: the constant-rate schedule
+had flattened by 420 epochs, but a schedule that settles is still paying at 560.
+
+Two consequences, and the first is the next experiment:
+
+1. **The schedule length is now the binding constraint, not the epoch count.** Cosine-to-zero over
+   560 epochs means the endpoint is fully annealed; asking for more requires a longer schedule,
+   not more epochs of this one. A 1,120-epoch cosine is preregistered in
+   `archcad_annealed_1120_20260920.md` with a gate of 0.398901.
+2. The screen's 140-epoch result (0.337864) now reads differently from how it was promoted: it was
+   not that annealing reaches the old 560-epoch quality in a quarter of the time, it is that
+   annealing changes where the curve goes. Four times the epochs of the same schedule add
+   `+0.053237`, which is more than any lever has produced since the per-class radii.
+
+Deviations: none beyond those already recorded for the screen. The run was launched alone, so its
+timings are not comparable to the concurrent-screen numbers.
