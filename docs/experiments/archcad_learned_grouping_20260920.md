@@ -84,6 +84,13 @@ perfect semantics, which is the same statement from the other side.
 So the largest single unclaimed lever in the pipeline is still grouping, and it is now larger
 than when the attempts below were run against it.
 
+Measured a third time, on the annealed checkpoint that scores 0.391101
+(`archcad_annealed_560_20260920.md`), the same construction gives **0.649563** for oracle grouping
+against 0.391101 for the adopted rule: a prize of **+0.258462**. The progression is monotone in
+semantic quality — +0.174, then +0.239, now +0.258 — because every semantic improvement puts more
+primitives in the right class and therefore exposes more of the grouper's merges. A rising prize
+under a lever with no working mechanism is the defining tension of this project's current state.
+
 ## Where this leaves the grouping lever
 
 The prize is real — oracle grouping at today's semantics is worth +0.239 — but it has now
