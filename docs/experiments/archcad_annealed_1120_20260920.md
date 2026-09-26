@@ -51,4 +51,38 @@ says whether the extra epochs bought anything or only moved where the anneal hap
 
 ## Results
 
-Pending at preregistration. Record outcomes and any deviations after completion.
+Completed. The run clears its gate:
+
+| epoch | 140 | 280 | 560 | 700 | 840 | 980 | 1064 | 1092 | 1120 |
+|---|---|---|---|---|---|---|---|---|---|
+| val pooled PQ | 0.311393 | 0.333730 | 0.341974 | 0.353733 | 0.370307 | 0.384293 | 0.401889 | 0.406749 | **0.405821** |
+| per-primitive accuracy | 0.5449 | 0.5745 | 0.5916 | 0.6062 | 0.6290 | 0.6397 | 0.6512 | 0.6529 | 0.6516 |
+
+Endpoint **0.405821** pooled PQ (thing 0.407331, accuracy 0.6516) against the 0.398901 gate —
+cleared, with an improvement of `+0.014720` over the 560-epoch run's 0.391101, which is 1.9x the
+resolution. Independently re-scored outside the training process the numbers reproduce exactly,
+and the radii fitted on the previous checkpoint score 0.406305 here, so the transfer result holds
+on a third checkpoint.
+
+**But the return per doubling has collapsed.** The 140→560 doubling bought `+0.053237`; the
+560→1120 doubling bought `+0.014720`, a factor of 3.6 less, and the last two intervals are
+`+0.004860` and `−0.000928` — the final interval is negative and below the resolution. The best
+checkpoint is epoch 1092 (0.406749), not the endpoint, by 0.000928, which is the same
+endpoint-is-a-sample-of-an-oscillation pattern the constant-rate run showed, now much smaller.
+
+So the rule's first branch applies — longer anneal still pays — while its second branch's
+description ("the anneal has flattened") is what the marginal intervals say. The honest reading is
+that the schedule lever is close to exhausted: another doubling costs ~6 hours and, on the trend
+of `+0.053237 → +0.014720`, is expected to buy less than one resolution. That is why the next
+experiment is not a third doubling. The capacity arm of the H17 screen was never measured — it is
+the one semantic axis still untested, and it is cheap — so it is run under the adopted schedule
+first (`archcad_capacity_annealed_20260920.md`); the doubling stays available if capacity fails.
+
+Two things are worth noting for the record. The epoch-matched comparison shows what the longer
+schedule actually does: at epoch 560 of the 1,120-epoch cosine the run is at 0.341974, well below
+the 560-epoch cosine's endpoint of 0.391101, because its rate is still at half. The gain is
+therefore not "more epochs" but "a longer anneal", exactly as the design note said. And the
+per-primitive accuracy now stands at 0.6529 at the best checkpoint, against 0.6299 for the
+560-epoch schedule and 0.5944 for the constant rate.
+
+Deviations: none. The run was launched alone, as designed.
